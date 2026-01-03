@@ -12,7 +12,6 @@ from torch.autograd import Variable
 import Constants
 import pickle
 
-
 class Options(object):
 
     def __init__(self, data_name='douban'):
@@ -22,6 +21,8 @@ class Options(object):
         self.save_path = ''
         self.net_data = 'data/' + data_name + '/edges.txt'
         self.embed_dim = 64
+
+        self.difficult_file = 'data/' + data_name + '/difficulty.csv'
 
 
 def Split_data(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_dict=True, with_EOS=True):

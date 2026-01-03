@@ -16,7 +16,7 @@ from dataLoader import Split_data, DataLoader
 from Metrics import Metrics, KTLoss
 from HGAT import MSHGAT
 from Optim import ScheduledOptim
-
+from calculate_muti_obj import gain_test_model
 
 torch.backends.cudnn.deterministic = True
 torch.manual_seed(0)
@@ -256,6 +256,8 @@ def test_model(MSHGAT, data_path):
 
 if __name__ == "__main__":
     model = MSHGAT
-    train_model(model, opt.data_name)
+    # train_model(model, opt.data_name)
     # test_model(model, opt.data_name)
     # test_model(model, opt.data_name)
+    gain_test_model(model, opt.data_name, opt)
+
