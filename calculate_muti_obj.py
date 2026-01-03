@@ -259,8 +259,8 @@ def gain_test_model(model, data_path, opt):
     )
 
     print('  - (Test--scores_single) ')
-    for metric in scores.keys():
-        print(metric + ' ' + str(scores[metric]))
+    for metric in scores_single.keys():
+        print(metric + ' ' + str(scores_single[metric]))
 
     # 打印结果
     print('\n===== 综合指标 =====')
