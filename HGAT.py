@@ -267,7 +267,7 @@ class MSHGAT(nn.Module):
         hidden = self.dropout(self.gnn(graph))
 
         # 使用DKT模型获取知识追踪结果
-        pred_res, kt_mask = self.ktmodel(hidden, original_input, ans)
+        pred_res, kt_mask, yt, _ = self.ktmodel(hidden, original_input, ans)
 
         # 直接使用图神经网络的输出作为序列嵌入
         batch_size, max_len = input.size()
@@ -294,7 +294,7 @@ class MSHGAT(nn.Module):
         pred = self.pred(trm_output)
         mask = get_previous_user_mask(input.cpu(), self.n_node)
 
-        return (pred + mask).view(-1, pred.size(-1)).cuda(), pred_res, kt_mask
+        return (pred + mask).view(-1, pred.size(-1)).cuda(), pred_res, kt_mask, yt, hidden
 
 # 单独知识追踪模块用于有效性评价指标计算
 class KTOnlyModel(nn.Module):
