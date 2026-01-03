@@ -260,14 +260,14 @@ class MSHGAT(nn.Module):
         input_timestamp = input_timestamp[:, :-1]  # 保持原始处理方式
         
         # 从original_input中提取对应的ans部分
-        original_ans = ans
-        ans = ans[:, :-1] if ans.size(1) > input.size(1) else ans
+        # original_ans = ans
+        # ans = ans[:, :-1] if ans.size(1) > input.size(1) else ans
 
         # 仅使用图神经网络获取节点嵌入
         hidden = self.dropout(self.gnn(graph))
 
         # 使用DKT模型获取知识追踪结果
-        pred_res, kt_mask = self.ktmodel(hidden, input, ans)
+        pred_res, kt_mask = self.ktmodel(hidden, original_input, ans)
 
         # 直接使用图神经网络的输出作为序列嵌入
         batch_size, max_len = input.size()
