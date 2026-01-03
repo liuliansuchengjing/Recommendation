@@ -10,7 +10,6 @@ import Constants
 from TransformerBlock import TransformerBlock
 from torch.autograd import Variable
 from DKT import DKT
-from rl_adjuster import LearningPathRLAdjuster
 
 class HGNN_conv(nn.Module):
     def __init__(self, in_ft, out_ft, bias=True):  #
