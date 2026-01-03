@@ -255,8 +255,13 @@ class MSHGAT(nn.Module):
 
     def forward(self, input, input_timestamp, input_idx, ans, graph, hypergraph_list):
         # 只使用图神经网络部分，跳过超图处理
+        original_input = input
         input = input[:, :-1]  # 保持原始处理方式
         input_timestamp = input_timestamp[:, :-1]  # 保持原始处理方式
+        
+        # 从original_input中提取对应的ans部分
+        original_ans = ans
+        ans = ans[:, :-1] if ans.size(1) > input.size(1) else ans
 
         # 仅使用图神经网络获取节点嵌入
         hidden = self.dropout(self.gnn(graph))
