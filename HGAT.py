@@ -10,7 +10,7 @@ import Constants
 from TransformerBlock import TransformerBlock
 from torch.autograd import Variable
 from DKT import DKT
-
+from rl_adjuster import LearningPathRLAdjuster
 
 class HGNN_conv(nn.Module):
     def __init__(self, in_ft, out_ft, bias=True):  #
@@ -235,6 +235,8 @@ class MSHGAT(nn.Module):
 
         self.num_skills = num_skills
         self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
+
+        self.rl_adjuster = LearningPathRLAdjuster(self.hidden_size, self.hidden_size, learning_rate=1e-3)
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.hidden_size)

@@ -17,6 +17,7 @@ from Metrics import Metrics, KTLoss
 from HGAT import MSHGAT
 from Optim import ScheduledOptim
 
+
 torch.backends.cudnn.deterministic = True
 torch.manual_seed(0)
 torch.cuda.manual_seed_all(0)
@@ -230,7 +231,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
 
 
 def test_model(MSHGAT, data_path):
-    kt_loss = KTLoss()  # ===================================================================================================
+    kt_loss = KTLoss()
     user_size, total_cascades, timestamps, train, valid, test = Split_data(data_path, opt.train_rate, opt.valid_rate,
                                                                            load_dict=True)
 
@@ -244,8 +245,7 @@ def test_model(MSHGAT, data_path):
     model = MSHGAT(user_size, opt, dropout=opt.dropout)
     model.load_state_dict(torch.load(opt.save_path))
     model.cuda()
-    kt_loss = kt_loss.cuda()  # ===================================================================================================
-
+    kt_loss = kt_loss.cuda()
     scores, auc_test, acc_test = test_epoch(model, test_data, relation_graph, hypergraph_list, kt_loss, k_list=[5, 10, 20, 30, 40, 50])
     print('  - (Test) ')
     for metric in scores.keys():
@@ -256,6 +256,6 @@ def test_model(MSHGAT, data_path):
 
 if __name__ == "__main__":
     model = MSHGAT
-    # train_model(model, opt.data_name)
-    test_model(model, opt.data_name)
+    train_model(model, opt.data_name)
+    # test_model(model, opt.data_name)
     # test_model(model, opt.data_name)
