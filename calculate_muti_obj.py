@@ -110,6 +110,11 @@ def gain_test_epoch(model, kt_model, test_data, graph, hypergraph_list, kt_loss,
         'diversity': 0.0,
         'preference': 0.0
     }
+    n_total_words = 0
+    scores_single = {}
+    for k in k_list:
+        scores_single['hits@' + str(k)] = 0
+        scores_single['map@' + str(k)] = 0
 
     with torch.no_grad():    # 不进行梯度计算
         for i, batch in enumerate(test_data):  # 遍历测试数据的每个批次
@@ -184,6 +189,17 @@ def gain_test_epoch(model, kt_model, test_data, graph, hypergraph_list, kt_loss,
             total_metrics['diversity'] += result['diversity']
             total_metrics['preference'] +=result['preference']
 
+            # 单独计算hit和map指标
+            scores_batch_single, scores_len_single = metric.compute_metric(y_pred, y_gold, k_list)
+            n_total_words += scores_len_single
+            for k in k_list:
+                scores_single['hits@' + str(k)] += scores_batch_single['hits@' + str(k)] * scores_len_single
+                scores_single['map@' + str(k)] += scores_batch_single['map@' + str(k)] * scores_len_single
+
+    for k in k_list:
+        scores_single['hits@' + str(k)] = scores_single['hits@' + str(k)] / n_total_words
+        scores_single['map@' + str(k)] = scores_single['map@' + str(k)] / n_total_words
+
     # 计算全局均值
     for k in k_list:
         if total_valid_samples > 0:
@@ -205,7 +221,7 @@ def gain_test_epoch(model, kt_model, test_data, graph, hypergraph_list, kt_loss,
         for k, v in total_metrics.items()
     }
 
-    return scores, auc_test, acc_test, E_p, Adaptivity, Diversity, final_metrics
+    return scores, auc_test, acc_test, E_p, Adaptivity, Diversity, final_metrics, scores_single
 
 
 def gain_test_model(model, data_path, opt):
@@ -238,9 +254,13 @@ def gain_test_model(model, data_path, opt):
     kt_model = KTOnlyModel(model)
 
     # 运行测试流程
-    scores, auc_test, acc_test, E_p, Adaptivity, Diversity, final_metrics = gain_test_epoch(
+    scores, auc_test, acc_test, E_p, Adaptivity, Diversity, final_metrics, scores_single = gain_test_epoch(
         model, kt_model, test_data, relation_graph, hypergraph_list, kt_loss, data_path
     )
+
+    print('  - (Test--scores_single) ')
+    for metric in scores.keys():
+        print(metric + ' ' + str(scores[metric]))
 
     # 打印结果
     print('\n===== 综合指标 =====')
