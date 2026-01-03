@@ -28,7 +28,7 @@ metric = Metrics()
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-data_name', default='MOO')
-parser.add_argument('-epoch', type=int, default=60)
+parser.add_argument('-epoch', type=int, default=90)
 parser.add_argument('-batch_size', type=int, default=64)
 parser.add_argument('-d_model', type=int, default=64)
 parser.add_argument('-initialFeatureSize', type=int, default=64)
@@ -127,7 +127,7 @@ def train_model(MSHGAT, data_path):
     opt.user_size = user_size
 
     # ========= Preparing Model =========#
-    model = MSHGAT(user_size, opt, dropout=opt.dropout)
+    model = MSHGAT(opt, dropout=opt.dropout)
     loss_func = nn.CrossEntropyLoss(size_average=False, ignore_index=Constants.PAD)
     kt_loss = KTLoss()
 
@@ -242,7 +242,7 @@ def test_model(MSHGAT, data_path):
 
     opt.user_size = user_size
 
-    model = MSHGAT(user_size, opt, dropout=opt.dropout)
+    model = MSHGAT(opt, dropout=opt.dropout)
     model.load_state_dict(torch.load(opt.save_path))
     model.cuda()
     kt_loss = kt_loss.cuda()
