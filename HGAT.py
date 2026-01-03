@@ -296,6 +296,7 @@ class MSHGAT(nn.Module):
 
         return (pred + mask).view(-1, pred.size(-1)).cuda(), pred_res, kt_mask
 
+# 单独知识追踪模块用于有效性评价指标计算
 class KTOnlyModel(nn.Module):
     def __init__(self, original_model):
         super(KTOnlyModel, self).__init__()

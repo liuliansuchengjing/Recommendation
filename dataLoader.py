@@ -22,6 +22,7 @@ class Options(object):
         self.net_data = 'data/' + data_name + '/edges.txt'
         self.embed_dim = 64
 
+        # 资源难度数据用于适应性评价指标计算
         self.difficult_file = 'data/' + data_name + '/difficulty.csv'
 
 

@@ -53,6 +53,7 @@ class Metrics(object):
         scores = {k: np.mean(v) for k, v in scores.items()}
         return scores, scores_len
 
+    # 多目标评价指标计算
     # --------------------计算击中率和排名质量指标-------------------------------------
     def gaintest_compute_metric(self, y_prob, y_true, batch_size, seq_len, k_list=[10, 50, 100], topnum=5):
         # 初始化所有指标字典，用于存储hits@k和map@k的累积值
