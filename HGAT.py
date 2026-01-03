@@ -191,7 +191,7 @@ class MLPReadout(nn.Module):
 
 
 class MSHGAT(nn.Module):
-    def __init__(self, num_skills, opt, dropout=0.3):
+    def __init__(self, opt, dropout=0.3):
         super(MSHGAT, self).__init__()
         self.hidden_size = opt.d_word_vec
         self.n_node = opt.user_size
@@ -232,7 +232,7 @@ class MSHGAT(nn.Module):
             multiscale=False
         )
 
-        self.num_skills = num_skills
+        self.num_skills = opt.user_size
         self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
 
     def reset_parameters(self):
