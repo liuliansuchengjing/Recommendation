@@ -10,6 +10,7 @@ import Constants
 from TransformerBlock import TransformerBlock
 from torch.autograd import Variable
 from DKT import DKT
+from rl_adjuster import LearningPathRLAdjuster
 
 class HGNN_conv(nn.Module):
     def __init__(self, in_ft, out_ft, bias=True):  #
@@ -191,31 +192,35 @@ class MLPReadout(nn.Module):
 
 
 class MSHGAT(nn.Module):
-    def __init__(self, opt, dropout=0.3):
+    def __init__(self, num_skills, opt, dropout=0.3):
         super(MSHGAT, self).__init__()
         self.hidden_size = opt.d_word_vec
         self.n_node = opt.user_size
         self.dropout = nn.Dropout(dropout)
         self.initial_feature = opt.initialFeatureSize
 
-        # Only keep graph neural network for node embedding
+        self.hgnn = HGNN_ATT(self.initial_feature, self.hidden_size * 2, self.hidden_size, dropout=dropout)
         self.gnn = GraphNN(self.n_node, self.initial_feature, dropout=dropout)
+        self.fus = Fusion(self.hidden_size)
+        self.fus1 = Fusion(self.hidden_size)
+        self.fus2 = Fusion(self.hidden_size)
 
-        # Transformer for sequence processing
-        self.n_layers = 2  # Increased layers for better sequence modeling
-        self.n_heads = 8  # Increased heads for better attention
-        self.inner_size = 256
+        self.embedding = nn.Embedding(self.n_node, self.initial_feature, padding_idx=0)
+        self.reset_parameters()
+        self.readout = MLPReadout(self.hidden_size, self.n_node, None)
+        self.gru1 = nn.GRU(self.hidden_size, self.hidden_size, num_layers=1, batch_first=True)
+        self.gru2 = nn.GRU(self.hidden_size, self.hidden_size, num_layers=1, batch_first=True)
+
+        self.n_layers = 1
+        self.n_heads = 2
+        self.inner_size = 64
         self.hidden_dropout_prob = 0.3
         self.attn_dropout_prob = 0.3
         self.layer_norm_eps = 1e-12
         self.hidden_act = 'gelu'
-
-        # Embedding layers for sequence processing
-        self.item_embedding = nn.Embedding(self.n_node + 1, self.hidden_size, padding_idx=0)
-        self.position_embedding = nn.Embedding(500, self.hidden_size)
+        self.item_embedding = nn.Embedding(self.n_node + 1, self.hidden_size, padding_idx=0)  # mask token add 1
+        self.position_embedding = nn.Embedding(500, self.hidden_size)  # add mask_token at the last
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
-
-        # Transformer encoder
         self.trm_encoder = TransformerEncoder(
             n_layers=self.n_layers,
             n_heads=self.n_heads,
@@ -228,8 +233,13 @@ class MSHGAT(nn.Module):
             multiscale=False
         )
 
-        # Final prediction layer
-        self.readout = MLPReadout(self.hidden_size, self.n_node, None)
+        self.num_skills = num_skills
+        self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
+
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.hidden_size)
+        for weight in self.parameters():
+            weight.data.uniform_(-stdv, stdv)
 
     def get_attention_mask(self, item_seq):
         """Generate bidirectional attention mask for multi-scale attention."""
@@ -244,13 +254,16 @@ class MSHGAT(nn.Module):
         predictions = self.readout(pred_logits)
         return predictions
 
-    def forward(self, input, input_timestamp, input_idx, graph, hypergraph_list):
+    def forward(self, input, input_timestamp, input_idx, ans, graph, hypergraph_list):
         # 只使用图神经网络部分，跳过超图处理
         input = input[:, :-1]  # 保持原始处理方式
         input_timestamp = input_timestamp[:, :-1]  # 保持原始处理方式
 
         # 仅使用图神经网络获取节点嵌入
         hidden = self.dropout(self.gnn(graph))
+
+        # 使用DKT模型获取知识追踪结果
+        pred_res, kt_mask = self.ktmodel(hidden, input, ans)
 
         # 直接使用图神经网络的输出作为序列嵌入
         batch_size, max_len = input.size()
@@ -277,4 +290,4 @@ class MSHGAT(nn.Module):
         pred = self.pred(trm_output)
         mask = get_previous_user_mask(input.cpu(), self.n_node)
 
-        return (pred + mask).view(-1, pred.size(-1)).cuda()
+        return (pred + mask).view(-1, pred.size(-1)).cuda(), pred_res, kt_mask
