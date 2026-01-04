@@ -461,7 +461,7 @@ class KnowledgeAwareAttention(nn.Module):
                 attn_mask = attn_mask.unsqueeze(1)  # [batch, 1, seq_len, seq_len]
 
             # 应用掩码（将掩码为True的位置设为负无穷）
-            attn_scores = attn_scores.masked_fill(attn_mask == 0, float('-inf'))
+            attn_scores = attn_scores.masked_fill(attn_mask == 0, float('-1e9'))
 
         # 7. 计算注意力权重（softmax）
         attn_weights = F.softmax(attn_scores, dim=-1)
