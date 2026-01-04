@@ -104,7 +104,7 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         # loss_eff = learning_effect_loss(model, yt, tgt.tolist(), ans.tolist(), topk_sequence, graph, batch_size, topnum = 1)
         loss_eff = learning_effect_loss(yt)
 
-        loss = loss + 10000*loss_kt + loss_eff
+        loss = loss + 6000*loss_kt + 4000*loss_eff
         # print("loss:", loss)
 
         # print("loss_kt:", loss_kt)
