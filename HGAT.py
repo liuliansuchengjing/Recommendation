@@ -261,7 +261,7 @@ class MSHGAT(nn.Module):
         predictions = self.readout(pred_logits)
         return predictions
 
-    def align_knowledge_states(knowledge_states_seq, init_state=None):
+    def align_knowledge_states(self, knowledge_states_seq, init_state=None):
         """
         将知识状态序列对齐到预测任务
 
