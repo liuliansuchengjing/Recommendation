@@ -161,27 +161,33 @@ class Metrics(object):
 
         返回值：
         gain_tensor: [B, seq_len-1, K] 每个推荐资源的独立增益值（无效位置填充0）
-        avg_gain: 标量（兼容原逻辑的全局平均增益，可选）
+        avg_gain: 标量（兼容原逻辑的全局平均增益）
         """
+        # 1. 统一所有张量到同一设备（核心修复）
+        device = yt_before.device
+        yt_after = yt_after.to(device)
+        topk_indices = topk_indices.to(device)
+
+        # 2. 处理PAD（确保是标量或同设备张量）
+        pad_val = self.PAD.item() if isinstance(self.PAD, torch.Tensor) else self.PAD
+
         batch_size, seq_len_minus_1, K = topk_indices.shape
         num_skills = yt_before.shape[2]
 
-        # 1. 初始化增益张量，维度和topk_indices完全对齐，初始值为0（无效位置填充0）
-        gain_tensor = torch.zeros_like(topk_indices, dtype=torch.float32)
-        # 若在GPU上运行，需同步设备（根据yt_before的设备调整）
-        gain_tensor = gain_tensor.to(yt_before.device)
+        # 3. 初始化增益张量（指定设备）
+        gain_tensor = torch.zeros((batch_size, seq_len_minus_1, K), dtype=torch.float32, device=device)
 
         total_gain = 0.0
         valid_count = 0
 
-        # 2. 逐batch、逐时间步、逐推荐资源计算独立增益
+        # 4. 逐batch、逐时间步、逐推荐资源计算
         for b in range(batch_size):
             for t in range(seq_len_minus_1):
-                # 跳过PAD位置（和原逻辑一致）
-                if original_seqs[b][t] == self.PAD:
+                # 跳过PAD位置
+                if original_seqs[b][t] == pad_val:
                     continue
 
-                # 当前时间步的TopK推荐资源索引
+                # 当前时间步的TopK推荐资源（已在device上）
                 recommended = topk_indices[b, t]  # [K]
                 # 过滤有效索引（0 <= r < num_skills）
                 valid_mask = (recommended >= 0) & (recommended < num_skills)  # [K]
@@ -189,33 +195,27 @@ class Metrics(object):
                 if len(valid_rec) == 0:
                     continue
 
-                # 原始知识状态（当前batch-时间步-有效推荐资源）
+                # 索引操作（同设备，无报错）
                 pb_values = yt_before[b, t, valid_rec]  # [K_valid]
-                # 插入后的知识状态（同维度）
                 pa_values = yt_after[b, t, valid_rec]  # [K_valid]
 
-                # 逐推荐资源计算增益（保留原始维度）
+                # 逐推荐资源填充增益
                 for k_idx in range(len(valid_rec)):
-                    # 找到该有效推荐资源在原始TopK中的位置
+                    # 找到该资源在原始TopK中的位置
                     original_k = torch.where(recommended == valid_rec[k_idx])[0].item()
 
                     pb = pb_values[k_idx].item()
                     pa = pa_values[k_idx].item()
 
-                    # 原增益计算逻辑（仅对有效条件计算）
                     if pb < 0.9 and pa > 0:
                         gain = (pa - pb) / (1.0 - pb)
-                        # 将增益值填充到张量的对应位置
                         gain_tensor[b, t, original_k] = gain
-
-                        # 累计全局增益（兼容原逻辑）
                         total_gain += gain
                         valid_count += 1
 
-        # 3. 计算全局平均增益（兼容原返回值）
+        # 计算全局平均增益
         avg_gain = total_gain / valid_count if valid_count > 0 else 0.0
 
-        # 返回维度对齐的张量 + 可选的全局平均
         return gain_tensor
 
     # --------------------适应性计算-------------------------------------
