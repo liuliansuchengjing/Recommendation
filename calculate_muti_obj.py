@@ -8,9 +8,38 @@ from dataLoader import Split_data, DataLoader
 from Metrics import Metrics, KTLoss
 from HGAT import MSHGAT, KTOnlyModel
 from Optim import ScheduledOptim
-
+import torch.nn.functional as F
 # 初始化一个Metrics类的实例，用于后续的指标计算
 metric = Metrics()
+
+
+# 新增学习效果损失
+def learning_effect_loss(model, post_test_scores,  original_seqs, original_ans, topk_sequence, graph, batch_size, topnum):
+    # 预测学习效果
+    # 计算有效性（仅当前时间步）
+    yt_before = post_test_scores
+    # 初始化KTOnlyModel
+    kt_model = KTOnlyModel(model)
+    yt_after = simulate_learning(
+        kt_model, original_seqs, original_ans, topk_sequence, graph, yt_before, batch_size, topnum
+    )  # 维度: [batch_size, seq_len-1, num_skills]
+    topk_indices = torch.tensor(
+        [[rec + [Constants.PAD] * (topnum - len(rec)) for rec in sample] for sample in topk_sequence],
+        dtype=torch.long
+    ).cuda()  # 维度: [batch_size, seq_len-1, topnum]
+    batch_gain = metric.compute_effectiveness(original_seqs,
+                                              yt_before,  # [batch_size, seq_len-1, num_skills]
+                                              yt_after,  # [batch_size, seq_len-1, num_skills]
+                                              topk_indices  # [batch_size, seq_len-1, topnum]
+                                              )
+
+    predicted_score_gain = 1.0
+    # 3. 学习效果损失：鼓励推荐能带来高学习收益的资源
+    effect_loss = F.mse_loss(predicted_score_gain, batch_gain)
+
+    return effect_loss
+
+
 
 def generate_candidate_seq(y_pred, batch_size, seq_len, topnum, cannum):
     total_samples = batch_size * (seq_len - 1)

@@ -13,10 +13,10 @@ import torch
 import torch.nn as nn
 from graphConstruct import ConRelationGraph, ConHyperGraphList
 from dataLoader import Split_data, DataLoader
-from Metrics import Metrics, KTLoss, learning_effect_loss
+from Metrics import Metrics, KTLoss
 from HGAT import MSHGAT
 from Optim import ScheduledOptim
-from calculate_muti_obj import gain_test_model
+from calculate_muti_obj import gain_test_model, learning_effect_loss
 
 torch.backends.cudnn.deterministic = True
 torch.manual_seed(0)
@@ -92,12 +92,17 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
 
         # loss
         loss, n_correct = get_performance(loss_func, pred, gold)
-        scores_batch, topk_sequence, scores_len = metric.gaintest_compute_metric(
-            pred, gold, batch_size, seq_len
-        )
-        loss_eff = learning_effect_loss(model, yt, tgt.tolist(), ans.tolist(), topk_sequence, graph, batch_size, topnum = 1, )
+
         loss_kt, auc, acc = kt_loss(pred_res, ans,
                                     kt_mask)  # ============================================================================
+
+        y_gold = tgt[:, 1:].contiguous().view(-1).cpu().numpy()  # 维度: [(batch_size * (seq_len - 1))]
+        y_pred = pred.detach().cpu().numpy()  # 维度: [batch_size*seq_len-1, num_skills]
+        scores_batch, topk_sequence, scores_len = metric.gaintest_compute_metric(
+            y_pred, y_gold, batch_size, seq_len, k_list=[5, 15, 20], topnum=1
+        )
+        loss_eff = learning_effect_loss(model, yt, tgt.tolist(), ans.tolist(), topk_sequence, graph, batch_size, topnum = 1)
+
         loss = loss + 10000*loss_kt + loss_eff
         # print("loss:", loss)
 
