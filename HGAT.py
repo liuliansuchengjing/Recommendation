@@ -11,6 +11,7 @@ from TransformerBlock import TransformerBlock
 from torch.autograd import Variable
 from DKT import DKT
 
+
 class HGNN_conv(nn.Module):
     def __init__(self, in_ft, out_ft, bias=True):  #
         super(HGNN_conv, self).__init__()
@@ -241,7 +242,7 @@ class MSHGAT(nn.Module):
             num_heads=self.n_heads,
             num_layers=self.n_layers,
             knowledge_dim=self.num_skills
-            )
+        )
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.hidden_size)
@@ -295,13 +296,12 @@ class MSHGAT(nn.Module):
 
         return aligned
 
-
     def forward(self, input, input_timestamp, input_idx, ans, graph, hypergraph_list):
         # 只使用图神经网络部分，跳过超图处理
         original_input = input
         input = input[:, :-1]  # 保持原始处理方式
         input_timestamp = input_timestamp[:, :-1]  # 保持原始处理方式
-        
+
         # 从original_input中提取对应的ans部分
         # original_ans = ans
         # ans = ans[:, :-1] if ans.size(1) > input.size(1) else ans
@@ -343,6 +343,7 @@ class MSHGAT(nn.Module):
         mask = get_previous_user_mask(input.cpu(), self.n_node)
 
         return (pred + mask).view(-1, pred.size(-1)).cuda(), pred_res, kt_mask, yt, hidden
+
 
 # 单独知识追踪模块用于有效性评价指标计算
 class KTOnlyModel(nn.Module):
@@ -433,10 +434,10 @@ class KnowledgeAwareAttention(nn.Module):
         # 3. 融合知识状态（位置对应融合）
         # 每个位置的知识状态增强该位置的键和值
         # 方案1：门控融合
-        gate = torch.sigmoid(self.gate_layer(torch.cat([K, knowledge_K], dim=-1)))
-        K = gate * K + (1 - gate) * knowledge_K# 知识增强的键
-        gate = torch.sigmoid(self.gate_layer(torch.cat([V, knowledge_V], dim=-1)))
-        V = gate * V + (1 - gate) * knowledge_V  # 知识增强的值
+        attention_weights = F.softmax(torch.matmul(K, knowledge_K.transpose(-2, -1)), dim=-1)
+        K = torch.matmul(attention_weights, knowledge_K)
+        attention_weights = F.softmax(torch.matmul(V, knowledge_V.transpose(-2, -1)), dim=-1)
+        V = torch.matmul(attention_weights, knowledge_V)  # 知识增强的值
 
         # 4. 重塑为多头格式
         # 先转换为 [batch, seq_len, num_heads, head_dim]
@@ -452,6 +453,9 @@ class KnowledgeAwareAttention(nn.Module):
         # 5. 计算注意力分数
         # Q * K^T / sqrt(d_k)
         attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+
+        # 将掩码移动到与attn_scores相同的设备
+        attn_mask = attn_mask.to(attn_scores.device)
 
         # 6. 应用注意力掩码（如果有）
         if attn_mask is not None:

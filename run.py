@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from graphConstruct import ConRelationGraph, ConHyperGraphList
 from dataLoader import Split_data, DataLoader
-from Metrics import Metrics, KTLoss
+from Metrics import Metrics, KTLoss, learning_effect_loss
 from HGAT import MSHGAT
 from Optim import ScheduledOptim
 from calculate_muti_obj import gain_test_model
@@ -58,6 +58,7 @@ def get_performance(crit, pred, gold):
     return loss, n_correct
 
 
+
 def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss, optimizer):
     # train
 
@@ -74,6 +75,7 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
             training_data):  # tqdm(training_data, mininterval=2, desc='  - (Training)   ', leave=False):
         # data preparing
         tgt, tgt_timestamp, tgt_idx, ans = (item.cuda() for item in batch)
+        batch_size, seq_len = tgt.size()
 
         np.set_printoptions(threshold=np.inf)
         gold = tgt[:, 1:]
@@ -85,14 +87,20 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         # training
         optimizer.zero_grad()
         # pred= model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
-        pred, pred_res, kt_mask, _, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph,
+        pred, pred_res, kt_mask, yt, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph,
                                         hypergraph_list)  # ==================================
 
         # loss
         loss, n_correct = get_performance(loss_func, pred, gold)
+        scores_batch, topk_sequence, scores_len = metric.gaintest_compute_metric(
+            pred, gold, batch_size, seq_len
+        )
+        loss_eff = learning_effect_loss(model, yt, tgt.tolist(), ans.tolist(), topk_sequence, graph, batch_size, topnum = 1, )
         loss_kt, auc, acc = kt_loss(pred_res, ans,
                                     kt_mask)  # ============================================================================
-        loss = loss + loss_kt
+        loss = loss + 10000*loss_kt + loss_eff
+        # print("loss:", loss)
+
         # print("loss_kt:", loss_kt)
 
         loss.backward()

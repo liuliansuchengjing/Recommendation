@@ -10,6 +10,9 @@ import torch.nn as nn
 from sklearn.metrics import roc_auc_score, accuracy_score
 from dataLoader import Options
 import torch.nn.functional as F
+from calculate_muti_obj import simulate_learning
+import Constants
+from HGAT import KTOnlyModel
 
 class Metrics(object):
 
@@ -55,7 +58,7 @@ class Metrics(object):
 
     # 多目标评价指标计算
     # --------------------计算击中率和排名质量指标-------------------------------------
-    def gaintest_compute_metric(self, y_prob, y_true, batch_size, seq_len, k_list=[10, 50, 100], topnum=5):
+    def gaintest_compute_metric(self, y_prob, y_true, batch_size, seq_len, k_list=[5, 15, 20], topnum=5):
         # 初始化所有指标字典，用于存储hits@k和map@k的累积值
         scores = {'hits@' + str(k): 0.0 for k in k_list}
         scores.update({'map@' + str(k): 0.0 for k in k_list})
@@ -548,4 +551,32 @@ class KTLoss(nn.Module):
         loss = valid_loss.sum() / answer_mask.float().sum()  # 仅对有效位置求平均
 
         return loss, auc, acc
+
+# 初始化一个Metrics类的实例，用于后续的指标计算
+metric = Metrics()
+# 新增学习效果损失
+def learning_effect_loss(model, post_test_scores,  original_seqs, original_ans, topk_sequence, graph, batch_size, topnum):
+    # 预测学习效果
+    # 计算有效性（仅当前时间步）
+    yt_before = post_test_scores
+    # 初始化KTOnlyModel
+    kt_model = KTOnlyModel(model)
+    yt_after = simulate_learning(
+        kt_model, original_seqs, original_ans, topk_sequence, graph, yt_before, batch_size, topnum
+    )  # 维度: [batch_size, seq_len-1, num_skills]
+    topk_indices = torch.tensor(
+        [[rec + [Constants.PAD] * (topnum - len(rec)) for rec in sample] for sample in topk_sequence],
+        dtype=torch.long
+    ).cuda()  # 维度: [batch_size, seq_len-1, topnum]
+    batch_gain = metric.compute_effectiveness(original_seqs,
+                                              yt_before,  # [batch_size, seq_len-1, num_skills]
+                                              yt_after,  # [batch_size, seq_len-1, num_skills]
+                                              topk_indices  # [batch_size, seq_len-1, topnum]
+                                              )
+
+    predicted_score_gain = 1.0
+    # 3. 学习效果损失：鼓励推荐能带来高学习收益的资源
+    effect_loss = F.mse_loss(predicted_score_gain, batch_gain)
+
+    return effect_loss
 

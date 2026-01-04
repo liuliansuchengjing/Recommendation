@@ -143,7 +143,6 @@ def gain_test_epoch(model, kt_model, test_data, graph, hypergraph_list, kt_loss,
             scores_batch, topk_sequence, scores_len = metric.gaintest_compute_metric(
                 y_pred, y_gold, batch_size, seq_len, k_list, topnum
             )
-            candidate_seq = generate_candidate_seq(y_pred, batch_size, seq_len, topnum, cannum)
 
             # 累加有效的样本数
             total_valid_samples += scores_len
