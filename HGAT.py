@@ -239,7 +239,7 @@ class MSHGAT(nn.Module):
         self.trans_model = KnowledgeAwareTransformerEncoder(
             embed_dim=self.hidden_size,
             num_heads=self.n_heads,
-            num_layers=self.num_layers,
+            num_layers=self.n_layers,
             knowledge_dim=self.num_skills
             )
 
