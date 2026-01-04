@@ -151,6 +151,73 @@ class Metrics(object):
 
         return total_gain / valid_count if valid_count > 0 else 0.0
 
+    def compute_effectiveness_tensor(self, original_seqs, yt_before, yt_after, topk_indices):
+        """
+        有效性计算（独立处理每个推荐资源，返回维度对齐的张量）
+        输入维度说明：
+        yt_before: [B, seq_len-1, num_skills]（原始知识状态）
+        yt_after: [B, seq_len-1, num_skills]（每个时间步插入后的最终知识状态）
+        topk_indices: [B, seq_len-1, K]（每个batch-时间步的TopK推荐资源）
+
+        返回值：
+        gain_tensor: [B, seq_len-1, K] 每个推荐资源的独立增益值（无效位置填充0）
+        avg_gain: 标量（兼容原逻辑的全局平均增益，可选）
+        """
+        batch_size, seq_len_minus_1, K = topk_indices.shape
+        num_skills = yt_before.shape[2]
+
+        # 1. 初始化增益张量，维度和topk_indices完全对齐，初始值为0（无效位置填充0）
+        gain_tensor = torch.zeros_like(topk_indices, dtype=torch.float32)
+        # 若在GPU上运行，需同步设备（根据yt_before的设备调整）
+        gain_tensor = gain_tensor.to(yt_before.device)
+
+        total_gain = 0.0
+        valid_count = 0
+
+        # 2. 逐batch、逐时间步、逐推荐资源计算独立增益
+        for b in range(batch_size):
+            for t in range(seq_len_minus_1):
+                # 跳过PAD位置（和原逻辑一致）
+                if original_seqs[b][t] == self.PAD:
+                    continue
+
+                # 当前时间步的TopK推荐资源索引
+                recommended = topk_indices[b, t]  # [K]
+                # 过滤有效索引（0 <= r < num_skills）
+                valid_mask = (recommended >= 0) & (recommended < num_skills)  # [K]
+                valid_rec = recommended[valid_mask]  # [K_valid]
+                if len(valid_rec) == 0:
+                    continue
+
+                # 原始知识状态（当前batch-时间步-有效推荐资源）
+                pb_values = yt_before[b, t, valid_rec]  # [K_valid]
+                # 插入后的知识状态（同维度）
+                pa_values = yt_after[b, t, valid_rec]  # [K_valid]
+
+                # 逐推荐资源计算增益（保留原始维度）
+                for k_idx in range(len(valid_rec)):
+                    # 找到该有效推荐资源在原始TopK中的位置
+                    original_k = torch.where(recommended == valid_rec[k_idx])[0].item()
+
+                    pb = pb_values[k_idx].item()
+                    pa = pa_values[k_idx].item()
+
+                    # 原增益计算逻辑（仅对有效条件计算）
+                    if pb < 0.9 and pa > 0:
+                        gain = (pa - pb) / (1.0 - pb)
+                        # 将增益值填充到张量的对应位置
+                        gain_tensor[b, t, original_k] = gain
+
+                        # 累计全局增益（兼容原逻辑）
+                        total_gain += gain
+                        valid_count += 1
+
+        # 3. 计算全局平均增益（兼容原返回值）
+        avg_gain = total_gain / valid_count if valid_count > 0 else 0.0
+
+        # 返回维度对齐的张量 + 可选的全局平均
+        return gain_tensor
+
     # --------------------适应性计算-------------------------------------
     def calculate_adaptivity(self, original_seqs, topk_sequence, data_name, T=10, epsilon=1e-5):
         """

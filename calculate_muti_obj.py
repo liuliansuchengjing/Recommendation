@@ -27,15 +27,15 @@ def learning_effect_loss(model, post_test_scores,  original_seqs, original_ans, 
         [[rec + [Constants.PAD] * (topnum - len(rec)) for rec in sample] for sample in topk_sequence],
         dtype=torch.long
     ).cuda()  # 维度: [batch_size, seq_len-1, topnum]
-    batch_gain = metric.compute_effectiveness(original_seqs,
+    batch_gain = metric.compute_effectiveness_tensor(original_seqs,
                                               yt_before,  # [batch_size, seq_len-1, num_skills]
                                               yt_after,  # [batch_size, seq_len-1, num_skills]
                                               topk_indices  # [batch_size, seq_len-1, topnum]
                                               )
 
-    predicted_score_gain = 1.0
+    target_gain = torch.ones_like(batch_gain)
     # 3. 学习效果损失：鼓励推荐能带来高学习收益的资源
-    effect_loss = F.mse_loss(predicted_score_gain, batch_gain)
+    effect_loss = F.mse_loss(batch_gain, target_gain)
 
     return effect_loss
 
