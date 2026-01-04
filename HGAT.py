@@ -236,12 +236,12 @@ class MSHGAT(nn.Module):
         self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
 
         # 知识感知自注意力
-        self.trans_model = KnowledgeAwareAttention(
+        self.trans_model = KnowledgeAwareTransformerEncoder(
             embed_dim=self.hidden_size,
             num_heads=self.n_heads,
-            knowledge_dim=self.num_skills,
-            dropout=dropout
-        )
+            num_layers=self.num_layers,
+            knowledge_dim=self.num_skills
+            )
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.hidden_size)
@@ -336,9 +336,7 @@ class MSHGAT(nn.Module):
         # 对齐知识状态
         aligned_knowledge = self.align_knowledge_states(yt)
         # 添加知识注意力的编码器 前向传播
-        trm_output, attn_weights = self.trans_model(
-            input_embeddings, aligned_knowledge, extended_attention_mask, need_weights=True
-        )
+        trm_output, attn_weights = self.trans_model(input_embeddings, aligned_knowledge, extended_attention_mask)
 
         # 预测
         pred = self.pred(trm_output)
@@ -434,8 +432,11 @@ class KnowledgeAwareAttention(nn.Module):
 
         # 3. 融合知识状态（位置对应融合）
         # 每个位置的知识状态增强该位置的键和值
-        K = K + knowledge_K  # 知识增强的键
-        V = V + knowledge_V  # 知识增强的值
+        # 方案1：门控融合
+        gate = torch.sigmoid(self.gate_layer(torch.cat([K, knowledge_K], dim=-1)))
+        K = gate * K + (1 - gate) * knowledge_K# 知识增强的键
+        gate = torch.sigmoid(self.gate_layer(torch.cat([V, knowledge_V], dim=-1)))
+        V = gate * V + (1 - gate) * knowledge_V  # 知识增强的值
 
         # 4. 重塑为多头格式
         # 先转换为 [batch, seq_len, num_heads, head_dim]
@@ -484,3 +485,118 @@ class KnowledgeAwareAttention(nn.Module):
         else:
             return output
 
+
+class KnowledgeAwareTransformerEncoderLayer(nn.Module):
+    """
+    知识感知的Transformer编码器层
+    包含：知识感知注意力 + 前馈网络 + 残差连接 + 层归一化
+    """
+
+    def __init__(self, embed_dim, num_heads, knowledge_dim, ffn_dim=2048, dropout=0.1):
+        super().__init__()
+
+        # 知识感知自注意力
+        self.self_attn = KnowledgeAwareAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            knowledge_dim=knowledge_dim,
+            dropout=dropout
+        )
+
+        # 层归一化
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+        # 前馈网络
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, ffn_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
+
+        # dropout
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x, knowledge_states_seq, attn_mask=None):
+        """
+        Args:
+            x: 输入序列 [batch, seq_len, embed_dim]
+            knowledge_states_seq: 知识状态序列 [batch, seq_len, knowledge_dim]
+            attn_mask: 注意力掩码
+        """
+        # 1. 知识感知自注意力（带残差连接）
+        residual = x
+        x, attn_weights = self.self_attn(
+            x, knowledge_states_seq, attn_mask, need_weights=True
+        )
+        x = self.dropout1(x)
+        x = self.norm1(residual + x)
+
+        # 2. 前馈网络（带残差连接）
+        residual = x
+        x = self.ffn(x)
+        x = self.dropout2(x)
+        x = self.norm2(residual + x)
+
+        return x, attn_weights
+
+
+class KnowledgeAwareTransformerEncoder(nn.Module):
+    """
+    完整的知识感知Transformer编码器
+    包含：位置编码 + 多个编码器层
+    """
+
+    def __init__(self, embed_dim, num_heads, num_layers, knowledge_dim,
+                 ffn_dim=2048, dropout=0.1, max_seq_len=512):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.num_layers = num_layers
+
+        # 位置编码（可学习的位置编码）
+        self.position_embedding = nn.Embedding(max_seq_len, embed_dim)
+
+        # 多个编码器层
+        self.layers = nn.ModuleList([
+            KnowledgeAwareTransformerEncoderLayer(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                knowledge_dim=knowledge_dim,
+                ffn_dim=ffn_dim,
+                dropout=dropout
+            )
+            for _ in range(num_layers)
+        ])
+
+        # 层归一化和dropout
+        self.norm = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, knowledge_states_seq, attn_mask=None):
+        """
+        Args:
+            x: 资源序列嵌入 [batch, seq_len, embed_dim]
+            knowledge_states_seq: 知识状态序列 [batch, seq_len, knowledge_dim]
+            attn_mask: 注意力掩码
+        """
+        batch_size, seq_len, _ = x.shape
+
+        # 1. 添加位置编码
+        positions = torch.arange(seq_len, device=x.device).expand(batch_size, seq_len)
+        x = x + self.position_embedding(positions)
+        x = self.dropout(x)
+
+        # 2. 逐层处理
+        all_attn_weights = []
+        for layer in self.layers:
+            x, attn_weights = layer(x, knowledge_states_seq, attn_mask)
+            all_attn_weights.append(attn_weights)
+
+        # 3. 最终层归一化
+        x = self.norm(x)
+
+        return x, all_attn_weights
