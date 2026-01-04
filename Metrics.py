@@ -177,9 +177,6 @@ class Metrics(object):
         # 3. 初始化增益张量（指定设备）
         gain_tensor = torch.zeros((batch_size, seq_len_minus_1, K), dtype=torch.float32, device=device)
 
-        total_gain = 0.0
-        valid_count = 0
-
         # 4. 逐batch、逐时间步、逐推荐资源计算
         for b in range(batch_size):
             for t in range(seq_len_minus_1):
@@ -210,11 +207,6 @@ class Metrics(object):
                     if pb < 0.9 and pa > 0:
                         gain = (pa - pb) / (1.0 - pb)
                         gain_tensor[b, t, original_k] = gain
-                        total_gain += gain
-                        valid_count += 1
-
-        # 计算全局平均增益
-        avg_gain = total_gain / valid_count if valid_count > 0 else 0.0
 
         return gain_tensor
 
