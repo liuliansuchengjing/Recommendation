@@ -115,7 +115,7 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
 def train_model(MSHGAT, data_path):
     # ========= Preparing DataLoader =========#
     user_size, total_cascades, timestamps, train, valid, test = Split_data(data_path, opt.train_rate, opt.valid_rate,
-                                                                           load_dict=False)
+                                                                           load_dict=True)
 
     train_data = DataLoader(train, batch_size=opt.batch_size, load_dict=True, cuda=False)
     valid_data = DataLoader(valid, batch_size=opt.batch_size, load_dict=True, cuda=False)

@@ -220,20 +220,28 @@ class MSHGAT(nn.Module):
         self.item_embedding = nn.Embedding(self.n_node + 1, self.hidden_size, padding_idx=0)  # mask token add 1
         self.position_embedding = nn.Embedding(500, self.hidden_size)  # add mask_token at the last
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
-        self.trm_encoder = TransformerEncoder(
-            n_layers=self.n_layers,
-            n_heads=self.n_heads,
-            hidden_size=self.hidden_size,
-            inner_size=self.inner_size,
-            hidden_dropout_prob=self.hidden_dropout_prob,
-            attn_dropout_prob=self.attn_dropout_prob,
-            hidden_act=self.hidden_act,
-            layer_norm_eps=self.layer_norm_eps,
-            multiscale=False
-        )
+        # self.trm_encoder = TransformerEncoder(
+        #     n_layers=self.n_layers,
+        #     n_heads=self.n_heads,
+        #     hidden_size=self.hidden_size,
+        #     inner_size=self.inner_size,
+        #     hidden_dropout_prob=self.hidden_dropout_prob,
+        #     attn_dropout_prob=self.attn_dropout_prob,
+        #     hidden_act=self.hidden_act,
+        #     layer_norm_eps=self.layer_norm_eps,
+        #     multiscale=False
+        # )
 
         self.num_skills = opt.user_size
         self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
+
+        # 知识感知自注意力
+        self.trans_model = KnowledgeAwareAttention(
+            embed_dim=self.hidden_size,
+            num_heads=self.n_heads,
+            knowledge_dim=self.num_skills,
+            dropout=dropout
+        )
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.hidden_size)
@@ -252,6 +260,41 @@ class MSHGAT(nn.Module):
     def pred(self, pred_logits):
         predictions = self.readout(pred_logits)
         return predictions
+
+    def align_knowledge_states(knowledge_states_seq, init_state=None):
+        """
+        将知识状态序列对齐到预测任务
+
+        输入: [batch, seq_len, knowledge_dim] 原始知识状态（每个是学习对应资源后的状态）
+        输出: [batch, seq_len, knowledge_dim] 对齐后的知识状态（每个是预测对应资源前的状态）
+
+        对齐规则:
+        预测资源r₁时 → 使用初始状态s₀
+        预测资源r₂时 → 使用s₁（学习r₁后的状态）
+        预测资源r₃时 → 使用s₂（学习r₂后的状态）
+        ...
+        """
+        batch_size, seq_len, knowledge_dim = knowledge_states_seq.shape
+
+        # 方法1: 如果没有提供初始状态，使用零向量
+        if init_state is None:
+            init_state = torch.zeros(batch_size, knowledge_dim,
+                                     device=knowledge_states_seq.device)
+
+        # 创建对齐后的序列
+        aligned = torch.zeros(batch_size, seq_len, knowledge_dim,
+                              device=knowledge_states_seq.device)
+
+        # 第一个位置: 初始状态
+        aligned[:, 0, :] = init_state
+
+        # 后续位置: 原始知识状态序列的前seq_len-1个状态
+        # 注意: 我们不需要最后一个状态，因为它是学习最后一个资源后的状态
+        #       这个状态应该用于预测下一个资源（但我们没有这个预测）
+        aligned[:, 1:, :] = knowledge_states_seq[:, :-1, :]
+
+        return aligned
+
 
     def forward(self, input, input_timestamp, input_idx, ans, graph, hypergraph_list):
         # 只使用图神经网络部分，跳过超图处理
@@ -286,9 +329,16 @@ class MSHGAT(nn.Module):
 
         # 应用注意力掩码
         extended_attention_mask = self.get_attention_mask(input)
+        #
+        # # Transformer处理
+        # trm_output = self.trm_encoder(input_embeddings, extended_attention_mask, output_all_encoded_layers=False)
 
-        # Transformer处理
-        trm_output = self.trm_encoder(input_embeddings, extended_attention_mask, output_all_encoded_layers=False)
+        # 对齐知识状态
+        aligned_knowledge = self.align_knowledge_states(yt)
+        # 添加知识注意力的编码器 前向传播
+        trm_output, attn_weights = self.trans_model(
+            input_embeddings, aligned_knowledge, extended_attention_mask, need_weights=True
+        )
 
         # 预测
         pred = self.pred(trm_output)
@@ -318,4 +368,119 @@ class KTOnlyModel(nn.Module):
         # 仅运行 KT 模块
         _, _, yt, yt_all = self.ktmodel(hidden, input_seq, answers)
         return yt_all
+
+
+class KnowledgeAwareAttention(nn.Module):
+    """
+    知识感知的注意力层
+    输入:
+        - 资源序列: [batch, seq_len, embed_dim]
+        - 知识状态序列: [batch, seq_len, knowledge_dim]（每个位置对应一个知识状态）
+    输出:
+        - 注意力输出: [batch, seq_len, embed_dim]
+        - 注意力权重: [batch, num_heads, seq_len, seq_len]（用于可视化）
+    """
+
+    def __init__(self, embed_dim, num_heads, knowledge_dim, dropout=0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+        # 确保embed_dim可以被num_heads整除
+        assert self.head_dim * num_heads == embed_dim, "embed_dim必须能被num_heads整除"
+
+        # 标准注意力参数
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+
+        # 知识感知参数：将知识状态映射到注意力空间
+        self.knowledge_k_proj = nn.Linear(knowledge_dim, embed_dim)  # 知识到键的映射
+        self.knowledge_v_proj = nn.Linear(knowledge_dim, embed_dim)  # 知识到值的映射
+
+        # 输出投影和dropout
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+        # 缩放因子
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+
+    def forward(self, x, knowledge_states_seq, attn_mask=None, need_weights=True):
+        """
+        前向传播
+
+        Args:
+            x: 资源序列嵌入，形状为 [batch_size, seq_len, embed_dim]
+            knowledge_states_seq: 知识状态序列，形状为 [batch_size, seq_len, knowledge_dim]
+            attn_mask: 注意力掩码，形状为 [batch_size, seq_len, seq_len] 或 [seq_len, seq_len]
+            need_weights: 是否返回注意力权重
+
+        Returns:
+            output: 注意力输出，形状为 [batch_size, seq_len, embed_dim]
+            attn_weights: 注意力权重，形状为 [batch_size, num_heads, seq_len, seq_len]
+        """
+        batch_size, seq_len, _ = x.shape
+
+        # 1. 标准Q, K, V投影
+        Q = self.q_proj(x)  # [batch, seq_len, embed_dim]
+        K = self.k_proj(x)  # [batch, seq_len, embed_dim]
+        V = self.v_proj(x)  # [batch, seq_len, embed_dim]
+
+        # 2. 知识状态投影
+        # 将知识状态映射到与K和V相同的空间
+        knowledge_K = self.knowledge_k_proj(knowledge_states_seq)  # [batch, seq_len, embed_dim]
+        knowledge_V = self.knowledge_v_proj(knowledge_states_seq)  # [batch, seq_len, embed_dim]
+
+        # 3. 融合知识状态（位置对应融合）
+        # 每个位置的知识状态增强该位置的键和值
+        K = K + knowledge_K  # 知识增强的键
+        V = V + knowledge_V  # 知识增强的值
+
+        # 4. 重塑为多头格式
+        # 先转换为 [batch, seq_len, num_heads, head_dim]
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim)
+
+        # 转置为 [batch, num_heads, seq_len, head_dim]
+        Q = Q.transpose(1, 2)
+        K = K.transpose(1, 2)
+        V = V.transpose(1, 2)
+
+        # 5. 计算注意力分数
+        # Q * K^T / sqrt(d_k)
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+
+        # 6. 应用注意力掩码（如果有）
+        if attn_mask is not None:
+            # 如果attn_mask是2D的 [seq_len, seq_len]，扩展维度
+            if attn_mask.dim() == 2:
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+            elif attn_mask.dim() == 3:
+                attn_mask = attn_mask.unsqueeze(1)  # [batch, 1, seq_len, seq_len]
+
+            # 应用掩码（将掩码为True的位置设为负无穷）
+            attn_scores = attn_scores.masked_fill(attn_mask == 0, float('-inf'))
+
+        # 7. 计算注意力权重（softmax）
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        # 8. 应用注意力权重到值上
+        attn_output = torch.matmul(attn_weights, V)  # [batch, num_heads, seq_len, head_dim]
+
+        # 9. 合并多头输出
+        # 转置回 [batch, seq_len, num_heads, head_dim]
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        # 重塑为 [batch, seq_len, embed_dim]
+        attn_output = attn_output.view(batch_size, seq_len, self.embed_dim)
+
+        # 10. 最终输出投影
+        output = self.out_proj(attn_output)
+
+        if need_weights:
+            return output, attn_weights
+        else:
+            return output
 
