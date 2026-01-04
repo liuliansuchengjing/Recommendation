@@ -35,7 +35,9 @@ def learning_effect_loss(post_test_scores):
     #                                           )
 
     predicted_score_gain = post_test_scores
-    actual_score_gain = torch.ones_like(predicted_score_gain)
+    # actual_score_gain = torch.ones_like(predicted_score_gain)
+    # 创建一个与predicted_score_gain形状相同、所有元素为0.5的张量
+    actual_score_gain = torch.full_like(predicted_score_gain, fill_value=0.5)
     # 3. 学习效果损失：鼓励推荐能带来高学习收益的资源
     effect_loss = F.mse_loss(predicted_score_gain, actual_score_gain)
 
