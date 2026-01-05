@@ -316,6 +316,93 @@ class Metrics(object):
 
         return adaptivity_sum / valid_count if valid_count > 0 else 0.0
 
+    def calculate_adaptivity_tensor(self, original_seqs, original_ans, topk_sequence, data_name, T=10, epsilon=1e-5):
+        """
+        计算适应性表征参数（使用真实答题结果，返回维度对齐张量）
+        参数:
+            original_seqs: 原始习题序列 [batch_size, seq_len]
+            original_ans: 原始答题结果 [batch_size, seq_len]（与seqs维度一致，0=错误，1=正确）
+            topk_sequence: 推荐序列 [batch_size, seq_len-1, K]
+            data_name: 数据集名称
+            T: 历史窗口大小
+            epsilon: 平滑项
+        返回:
+            adaptivity_tensor: [batch_size, seq_len-1, K] 每个推荐资源的独立适应性分数（无效位置填充0）
+        """
+        # 1. 加载映射和难度数据（精简版）
+        options = Options(data_name)
+        with open(options.idx2u_dict, 'rb') as handle:
+            idx2u = pickle.load(handle)
+
+        # 加载难度数据（简化异常处理）
+        difficulty_data = {}
+        with open(options.difficult_file, 'r') as f:
+            next(f)  # 跳过标题行
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) < 2:
+                    continue
+                try:
+                    difficulty_data[int(parts[0].strip())] = int(parts[1].strip())
+                except (ValueError, IndexError):
+                    continue
+
+        # 2. 简化难度获取函数
+        def get_difficulty(idx):
+            """通过习题索引获取难度（无效索引返回默认值1）"""
+            return difficulty_data.get(int(idx2u[idx]), 1) if idx > 1 else 1
+
+        # 3. 初始化维度对齐的张量（核心：和topk_sequence维度一致）
+        batch_size = len(original_seqs)
+        seq_len_minus_1 = len(topk_sequence[0]) if batch_size > 0 else 0
+        K = len(topk_sequence[0][0]) if seq_len_minus_1 > 0 else 0
+        adaptivity_tensor = torch.zeros((batch_size, seq_len_minus_1, K), dtype=torch.float32)
+
+        # 4. 逐batch/时间步/推荐资源计算（使用真实答题结果）
+        for b in range(batch_size):
+            seq = original_seqs[b]  # 当前样本的习题序列 [seq_len]
+            ans = original_ans[b]  # 当前样本的答题结果 [seq_len]（真实值）
+            recs = topk_sequence[b]  # 当前样本的推荐序列 [seq_len-1, K]
+
+            # 预处理当前样本的历史难度/真实答题结果（仅计算一次）
+            history_diffs, history_results = [], []
+            # 遍历原始序列（去掉最后一个时间步，和原逻辑一致）
+            for t in range(len(seq) - 1):
+                challenge_idx = seq[t]
+                if challenge_idx > 1:  # 有效习题索引
+                    history_diffs.append(get_difficulty(challenge_idx))
+                    history_results.append(ans[t])  # 替换：取真实答题结果（0/1）
+
+            # 逐时间步计算
+            for t in range(len(recs)):
+                # 计算当前时间步的能力值delta（基于真实答题结果）
+                if len(history_diffs[:t]) < T // 2:
+                    delta = 1.0  # 历史数据不足，用默认值
+                else:
+                    # 取最近T个历史数据（真实难度+真实答题结果）
+                    start_idx = max(0, t - T)
+                    recent_diffs = history_diffs[start_idx:t]
+                    recent_results = history_results[start_idx:t]
+
+                    if len(recent_diffs) > 0:
+                        # 分子：难度*真实答题结果 求和
+                        numerator = sum(d * r for d, r in zip(recent_diffs, recent_results))
+                        # 分母：答题结果求和 + 平滑项（避免除以0）
+                        denominator = sum(recent_results) + epsilon
+                        delta = numerator / denominator
+                    else:
+                        delta = 1.0
+
+                # 逐推荐资源计算适应性，填充到张量
+                for k, rec in enumerate(recs[t]):
+                    if rec > 1:  # 有效推荐资源
+                        rec_diff = get_difficulty(rec)
+                        # 适应性公式：1 - |能力值delta - 推荐资源难度|
+                        adaptivity = 1 - abs(delta - rec_diff)
+                        adaptivity_tensor[b, t, k] = adaptivity  # 独立分数，无累加
+
+        return adaptivity_tensor
+
     # --------------------多样性计算-------------------------------------
     def calculate_diversity(self, original_seqs, topk_sequence, hidden, batch_size, seq_len, topnum):
         """
