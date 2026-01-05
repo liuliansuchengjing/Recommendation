@@ -211,20 +211,22 @@ class Metrics(object):
         return gain_tensor
 
     # --------------------适应性计算-------------------------------------
-    def calculate_adaptivity(self, original_seqs, topk_sequence, data_name, T=10, epsilon=1e-5):
+    import pickle
+
+    def calculate_adaptivity(self, original_seqs, original_ans, topk_sequence, data_name, T=10, epsilon=1e-5):
         """
         计算适应性表征参数（Adaptivity）
 
         参数:
             original_seqs: 原始序列列表 [batch_size, seq_len]
+            original_ans: 原始答题结果列表 [batch_size, seq_len]（与original_seqs维度一致，0=错误，1=正确）
             topk_sequence: 推荐序列列表 [batch_size, seq_len-1, K]
-            u2idx_path: u2idx.pickle文件路径
-            difficulty_path: difficulty.csv文件路径
+            data_name: 数据集名称
             T: 历史窗口大小
             epsilon: 平滑项
 
         返回:
-            adaptivity_scores: 每个样本的适应性分数列表
+            adaptivity_sum / valid_count: 全局平均适应性分数（保持原返回逻辑）
         """
         # 1. 加载u2idx映射和难度数据
         options = Options(data_name)
@@ -264,6 +266,7 @@ class Metrics(object):
 
         for b in range(len(original_seqs)):
             seq = original_seqs[b]
+            ans = original_ans[b]  # 获取当前样本的真实答题结果
             recs = topk_sequence[b]
 
             # 获取历史答题记录（难度和结果）
@@ -273,7 +276,8 @@ class Metrics(object):
             # 遍历原始序列（去掉最后一个时间步，因为我们要预测它）
             for t in range(len(seq) - 1):
                 challenge_idx = seq[t]
-                result = 1  # 假设所有历史答题结果都是正确的（根据原始代码逻辑）
+                # 核心替换：取真实答题结果，而非默认的1
+                result = ans[t]
 
                 # 获取难度
                 if challenge_idx > 1:
@@ -308,11 +312,11 @@ class Metrics(object):
                         adaptivity_sum += adaptivity
                         valid_count += 1
 
-            # # 计算平均适应性
-            # if valid_count > 0:
-            #     adaptivity_scores.append(adaptivity_sum / valid_count)
-            # else:
-            #     adaptivity_scores.append(0.0)  # 无有效推荐时得分为0
+                # # 计算平均适应性
+                # if valid_count > 0:
+                #     adaptivity_scores.append(adaptivity_sum / valid_count)
+                # else:
+                #     adaptivity_scores.append(0.0)  # 无有效推荐时得分为0
 
         return adaptivity_sum / valid_count if valid_count > 0 else 0.0
 

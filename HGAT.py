@@ -221,17 +221,17 @@ class MSHGAT(nn.Module):
         self.item_embedding = nn.Embedding(self.n_node + 1, self.hidden_size, padding_idx=0)  # mask token add 1
         self.position_embedding = nn.Embedding(500, self.hidden_size)  # add mask_token at the last
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
-        # self.trm_encoder = TransformerEncoder(
-        #     n_layers=self.n_layers,
-        #     n_heads=self.n_heads,
-        #     hidden_size=self.hidden_size,
-        #     inner_size=self.inner_size,
-        #     hidden_dropout_prob=self.hidden_dropout_prob,
-        #     attn_dropout_prob=self.attn_dropout_prob,
-        #     hidden_act=self.hidden_act,
-        #     layer_norm_eps=self.layer_norm_eps,
-        #     multiscale=False
-        # )
+        self.trm_encoder = TransformerEncoder(
+            n_layers=self.n_layers,
+            n_heads=self.n_heads,
+            hidden_size=self.hidden_size,
+            inner_size=self.inner_size,
+            hidden_dropout_prob=self.hidden_dropout_prob,
+            attn_dropout_prob=self.attn_dropout_prob,
+            hidden_act=self.hidden_act,
+            layer_norm_eps=self.layer_norm_eps,
+            multiscale=False
+        )
 
         self.num_skills = opt.user_size
         self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
