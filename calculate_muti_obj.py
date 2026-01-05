@@ -44,7 +44,7 @@ def learning_effect_loss(post_test_scores):
     return effect_loss
 
 def learning_adaptive_loss(original_seqs, original_ans, topk_sequence, data_path):
-    batch_adaptivity = metric.calculate_adaptivity_tensor(original_seqs, original_ans, topk_sequence, data_path, T=5)
+    batch_adaptivity = metric.calculate_adaptivity_tensor(original_seqs, original_ans, topk_sequence, data_path, T=10)
     # 创建一个与predicted_score_gain形状相同、所有元素为0.5的张量
     # expect_adaptivity = torch.full_like(batch_adaptivity, fill_value=0.5)
     expect_adaptivity = torch.ones_like(batch_adaptivity)
