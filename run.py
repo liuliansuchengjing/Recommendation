@@ -96,16 +96,16 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         loss_kt, auc, acc = kt_loss(pred_res, ans,
                                     kt_mask)  # ============================================================================
 
-        # y_gold = tgt[:, 1:].contiguous().view(-1).cpu().numpy()  # 维度: [(batch_size * (seq_len - 1))]
-        # y_pred = pred.detach().cpu().numpy()  # 维度: [batch_size*seq_len-1, num_skills]
-        # scores_batch, topk_sequence, scores_len = metric.gaintest_compute_metric(
-        #     y_pred, y_gold, batch_size, seq_len, k_list=[5, 15, 20], topnum=5
-        # )
-        # # loss_eff = learning_effect_loss(model, yt, tgt.tolist(), ans.tolist(), topk_sequence, graph, batch_size, topnum = 1)
-        # # loss_eff = learning_effect_loss(yt)
-        # adaptivity_loss = learning_adaptive_loss(tgt.tolist(), ans.tolist(), topk_sequence, opt.data_name)
+        y_gold = tgt[:, 1:].contiguous().view(-1).cpu().numpy()  # 维度: [(batch_size * (seq_len - 1))]
+        y_pred = pred.detach().cpu().numpy()  # 维度: [batch_size*seq_len-1, num_skills]
+        scores_batch, topk_sequence, scores_len = metric.gaintest_compute_metric(
+            y_pred, y_gold, batch_size, seq_len, k_list=[5, 15, 20], topnum=5
+        )
+        # loss_eff = learning_effect_loss(model, yt, tgt.tolist(), ans.tolist(), topk_sequence, graph, batch_size, topnum = 1)
+        # loss_eff = learning_effect_loss(yt)
+        adaptivity_loss = learning_adaptive_loss(tgt.tolist(), ans.tolist(), topk_sequence, opt.data_name)
 
-        loss = loss + 5000*loss_kt
+        loss = loss + 5000*loss_kt + 10000*adaptivity_loss
         # print("loss:", loss)
 
         # print("loss_kt:", loss_kt)
@@ -271,7 +271,7 @@ def test_model(MSHGAT, data_path):
 
 if __name__ == "__main__":
     model = MSHGAT
-    # train_model(model, opt.data_name)
+    train_model(model, opt.data_name)
     # test_model(model, opt.data_name)
     # 多目标评价指标计算
     gain_test_model(model, opt.data_name, opt)
