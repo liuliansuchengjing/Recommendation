@@ -213,7 +213,7 @@ def gain_test_epoch(model, kt_model, test_data, graph, hypergraph_list, kt_loss,
             )
             # 累加有效性指标
             total_gain += batch_gain
-            batch_adaptivity = metric.calculate_adaptivity(original_seqs, topk_sequence, data_path)
+            batch_adaptivity = metric.calculate_adaptivity(original_seqs, original_ans, topk_sequence, data_path)
             total_diff += batch_adaptivity
             batch_diversity = metric.calculate_diversity(original_seqs,topk_indices, hidden, batch_size, seq_len, topnum)
             total_div += batch_diversity
