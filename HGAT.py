@@ -330,13 +330,13 @@ class MSHGAT(nn.Module):
         # 应用注意力掩码
         extended_attention_mask = self.get_attention_mask(input)
         #
-        # # Transformer处理
-        # trm_output = self.trm_encoder(input_embeddings, extended_attention_mask, output_all_encoded_layers=False)
+        # Transformer处理
+        trm_output = self.trm_encoder(input_embeddings, extended_attention_mask, output_all_encoded_layers=False)
 
-        # 对齐知识状态
-        aligned_knowledge = self.align_knowledge_states(yt)
-        # 添加知识注意力的编码器 前向传播
-        trm_output, attn_weights = self.trans_model(input_embeddings, aligned_knowledge, extended_attention_mask)
+        # # 对齐知识状态
+        # aligned_knowledge = self.align_knowledge_states(yt)
+        # # 添加知识注意力的编码器 前向传播
+        # trm_output, attn_weights = self.trans_model(input_embeddings, aligned_knowledge, extended_attention_mask)
 
         # 预测
         pred = self.pred(trm_output)
