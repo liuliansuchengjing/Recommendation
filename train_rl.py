@@ -7,7 +7,7 @@ import torch
 import argparse
 import os
 from HGAT import MSHGAT
-from rl_adjuster import RLPathOptimizer, RLPathRecommender, evaluate_policy
+from rl_adjuster import RLPathOptimizer, evaluate_policy
 from dataLoader import Split_data, DataLoader
 from graphConstruct import ConRelationGraph, ConHyperGraphList
 import numpy as np
@@ -62,6 +62,10 @@ def train_rl_model(data_path, opt, pretrained_model, num_skills, batch_size, rec
                 
             # 准备数据
             if not opt.no_cuda and torch.cuda.is_available():
+                # tgt: [batch_size, seq_len] - 目标序列
+                # tgt_timestamp: [batch_size, seq_len] - 时间戳序列
+                # tgt_idx: [batch_size, seq_len] - 索引序列
+                # ans: [batch_size, seq_len] - 答案序列
                 tgt, tgt_timestamp, tgt_idx, ans = (item.cuda() for item in batch)
             else:
                 tgt, tgt_timestamp, tgt_idx, ans = batch
@@ -72,7 +76,7 @@ def train_rl_model(data_path, opt, pretrained_model, num_skills, batch_size, rec
             )
 
             # 计算平均奖励
-            avg_reward = trajectory['rewards'].mean().item()
+            avg_reward = trajectory['rewards'].mean().item()  # scalar
             epoch_rewards.append(avg_reward)
 
             # 更新策略
@@ -84,8 +88,8 @@ def train_rl_model(data_path, opt, pretrained_model, num_skills, batch_size, rec
                 print(f"Epoch {epoch}, Batch {batch_idx}: Loss={loss:.4f}, Reward={avg_reward:.4f}")
 
         # 记录统计
-        avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else 0
-        avg_epoch_reward = np.mean(epoch_rewards) if epoch_rewards else 0
+        avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else 0  # scalar
+        avg_epoch_reward = np.mean(epoch_rewards) if epoch_rewards else 0  # scalar
 
         training_stats['epoch_losses'].append(avg_epoch_loss)
         training_stats['avg_rewards'].append(avg_epoch_reward)
@@ -101,10 +105,10 @@ def train_rl_model(data_path, opt, pretrained_model, num_skills, batch_size, rec
             training_stats['validity_scores'].append(validity)
             training_stats['diversity_scores'].append(diversity)
             training_stats['adaptivity_scores'].append(adaptivity)
-            print(f"Epoch {epoch}: Avg Loss={avg_epoch_loss:.4f}, Avg Reward={avg_reward:.4f}, "
+            print(f"Epoch {epoch}: Avg Loss={avg_epoch_loss:.4f}, Avg Reward={avg_epoch_reward:.4f}, "
                   f"Validity={validity:.4f}, Diversity={diversity:.4f}, Adaptivity={adaptivity:.4f}")
         else:
-            print(f"Epoch {epoch} completed: Avg Loss={avg_epoch_loss:.4f}, Avg Reward={avg_reward:.4f}")
+            print(f"Epoch {epoch} completed: Avg Loss={avg_epoch_loss:.4f}, Avg Reward={avg_epoch_reward:.4f}")
 
     print("强化学习训练完成!")
     
@@ -130,9 +134,9 @@ def train_rl_model(data_path, opt, pretrained_model, num_skills, batch_size, rec
     print(f"  适应性 (Adaptivity): {final_adaptivity:.4f}")
     
     # 保存验证结果
-    training_stats['final_validity'] = final_validity
-    training_stats['final_diversity'] = final_diversity
-    training_stats['final_adaptivity'] = final_adaptivity
+    training_stats['final_validity'] = final_validity  # scalar
+    training_stats['final_diversity'] = final_diversity  # scalar
+    training_stats['final_adaptivity'] = final_adaptivity  # scalar
     
     print(f"\n训练统计:")
     print(f"  最终平均奖励: {training_stats['avg_rewards'][-1] if training_stats['avg_rewards'] else 0:.4f}")
@@ -203,7 +207,7 @@ def run_training_with_pretrained_model(data_path="MOO", model_path=None):
     except Exception as e:
         print(f"加载预训练模型失败: {e}")
     
-    num_skills = user_size
+    num_skills = user_size  # scalar
     
     print(f"数据加载完成，知识点数量: {num_skills}")
     

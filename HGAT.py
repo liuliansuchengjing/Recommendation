@@ -300,7 +300,7 @@ class MSHGAT(nn.Module):
         # 只使用图神经网络部分，跳过超图处理
         original_input = input
         input = input[:, :-1]  # 保持原始处理方式
-        input_timestamp = input_timestamp[:, :-1]  # 保持原始处理方式
+        # input_timestamp = input_timestamp[:, :-1]  # 保持原始处理方式
 
         # 从original_input中提取对应的ans部分
         # original_ans = ans
@@ -333,6 +333,7 @@ class MSHGAT(nn.Module):
         # Transformer处理
         trm_output = self.trm_encoder(input_embeddings, extended_attention_mask, output_all_encoded_layers=False)
 
+        status_emb = trm_output
         # # 对齐知识状态
         # aligned_knowledge = self.align_knowledge_states(yt)
         # # 添加知识注意力的编码器 前向传播
@@ -342,7 +343,7 @@ class MSHGAT(nn.Module):
         pred = self.pred(trm_output)
         mask = get_previous_user_mask(input.cpu(), self.n_node)
 
-        return (pred + mask).view(-1, pred.size(-1)).cuda(), pred_res, kt_mask, yt, hidden
+        return (pred + mask).view(-1, pred.size(-1)).cuda(), pred_res, kt_mask, yt, hidden, status_emb
 
 
 # 单独知识追踪模块用于有效性评价指标计算
