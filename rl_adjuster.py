@@ -32,6 +32,14 @@ class RLPathOptimizer:
 
         # 构建策略网络（动作选择器）
         self.policy_net = self._build_policy_network()
+        
+        # 将策略网络移动到与预训练模型相同的设备
+        if next(self.base_model.parameters()).is_cuda:
+            device = next(self.base_model.parameters()).device
+            self.policy_net = self.policy_net.to(device)
+            print(f"策略网络已移动到设备: {device}")
+        else:
+            print("预训练模型在CPU上，策略网络保持在CPU")
 
         # 构建环境
         self.env = LearningPathEnv(
@@ -100,6 +108,9 @@ class LearningPathEnv:
         self.original_sequences = None  # 存储原始序列用于奖励计算
         self.all_knowledge_states = []  # 存储每一步的知识状态，用于最终奖励计算
         self.all_predictions = []  # 存储每一步的预测结果，用于最终奖励计算
+        
+        # 存储扩展的答案序列
+        self.extended_ans = None  # 用于存储扩展的答案序列
 
     def reset(self, tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list):
         """
@@ -126,6 +137,9 @@ class LearningPathEnv:
         self.paths = [[] for _ in range(self.batch_size)]
         self.all_knowledge_states = []  # 重置知识状态记录
         self.all_predictions = []  # 重置预测结果记录
+        
+        # 初始化扩展答案序列，复制原始答案序列
+        self.extended_ans = ans.clone()
 
         # 获取初始状态
         initial_state = self._get_current_state(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
@@ -140,10 +154,18 @@ class LearningPathEnv:
         # 使用当前累积的历史路径作为输入
         batch_histories = torch.stack(self.histories)  # [batch_size, current_seq_len]
 
+        # 确保tgt_timestamp, tgt_idx, ans与当前历史长度一致
+        max_hist_len = batch_histories.size(1)  # 当前历史的最大长度
+        
+        # 调整其他输入以匹配当前历史长度
+        current_tgt_timestamp = tgt_timestamp[:, :max_hist_len]
+        current_tgt_idx = tgt_idx[:, :max_hist_len]
+        current_ans = ans[:, :max_hist_len]
+
         # 调用预训练模型
         with torch.no_grad():
             pred, pred_res, kt_mask, knowledge_state, hidden = self.base_model(
-                batch_histories, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
+                batch_histories, current_tgt_timestamp, current_tgt_idx, current_ans, graph, hypergraph_list)
             
             # 获取当前步骤的topk候选（只取最后一个时间步的topk）
             # 获取最后时间步的预测概率
@@ -181,18 +203,22 @@ class LearningPathEnv:
         """
         提取候选习题的特征
         """
-        # 确保topk_candidates是tensor并具有正确的形状
+        # 确保topk_candidates是tensor
         if not isinstance(topk_candidates, torch.Tensor):
             topk_candidates = torch.tensor(topk_candidates)
-        
-        if topk_candidates.dim() == 1:
-            # 如果是一维张量，说明是单个样本，需要扩展维度
-            topk_candidates = topk_candidates.unsqueeze(0)
-        
+
+        # 验证topk_candidates形状
+        if topk_candidates.dim() != 2:
+            raise ValueError(f"topk_candidates should be 2D tensor [batch_size, topk], got shape {topk_candidates.shape}")
+
         batch_size, topk = topk_candidates.shape
         
+        # 确保所有张量都在同一设备上
+        device = knowledge_state.device  # 使用knowledge_state的设备作为目标设备
+        topk_candidates = topk_candidates.to(device)
+        
         # 创建候选特征
-        candidate_features = torch.zeros(batch_size, topk, 5, device=topk_candidates.device, dtype=torch.float)
+        candidate_features = torch.zeros(batch_size, topk, 5, device=device, dtype=torch.float)
         
         # 特征1: 习题ID归一化
         candidate_features[:, :, 0] = topk_candidates.float() / self.base_model.n_node
@@ -205,7 +231,7 @@ class LearningPathEnv:
                     candidate_features[b, k, 1] = knowledge_state[b, skill_id]
         
         # 特征3: 习题在topk中的排名
-        rank_weights = torch.linspace(1.0, 0.0, topk, device=topk_candidates.device)
+        rank_weights = torch.linspace(1.0, 0.0, topk, device=device)
         candidate_features[:, :, 2] = rank_weights.unsqueeze(0).repeat(batch_size, 1)
         
         # 特征4: 与当前知识状态的差异度
@@ -244,16 +270,42 @@ class LearningPathEnv:
         for i in range(self.batch_size):
             # 将选择的习题添加到历史
             new_exercise = selected_exercises[i].unsqueeze(0)
+            # 确保new_exercise与histories[i]在同一设备上
+            new_exercise = new_exercise.to(self.histories[i].device)
             self.histories[i] = torch.cat([self.histories[i], new_exercise])
             # 记录到推荐路径
             self.paths[i].append(selected_exercises[i].item())
+        
+        # 扩展答案序列，为新添加的习题添加预测答案
+        # 这里使用一个简单的启发式方法：根据当前知识状态预测答案
+        # 获取当前知识状态对新习题的预测概率
+        current_knowledge = self.current_state['knowledge_state']  # [batch_size, num_skills]
+        
+        # 为每个选择的习题获取预测正确率（这里使用当前知识状态作为预测）
+        predicted_correct = []
+        for i in range(self.batch_size):
+            selected_exercise_id = selected_exercises[i].item()
+            if selected_exercise_id < current_knowledge.size(1):
+                # 使用当前知识状态作为预测正确率
+                pred_prob = current_knowledge[i, selected_exercise_id].item()
+                # 转换为0或1（正确或错误）
+                predicted_answer = 1 if pred_prob > 0.5 else 0
+            else:
+                # 如果习题ID超出知识点范围，假设答错
+                predicted_answer = 0
+            predicted_correct.append(predicted_answer)
+        
+        # 创建新的答案张量
+        new_answers = torch.tensor(predicted_correct, dtype=self.extended_ans.dtype, device=self.extended_ans.device).unsqueeze(1)
+        self.extended_ans = torch.cat([self.extended_ans, new_answers], dim=1)
 
         # 更新步骤计数
         self.current_step += 1
 
         # 获取新状态 - 重新运行预训练模型以获取完整的状态信息
+        # 使用当前累积的历史来获取状态，不需要扩展答案
         next_state = self._get_current_state(
-            self.original_tgt, 
+            torch.stack(self.histories), 
             self.original_tgt_timestamp, 
             self.original_tgt_idx, 
             self.original_ans, 
