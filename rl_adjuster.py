@@ -6,7 +6,7 @@ from torch.distributions import Categorical
 from graphConstruct import ConRelationGraph, ConHyperGraphList
 from dataLoader import Split_data, DataLoader
 from Metrics import Metrics
-from Constants import Constants
+import Constants
 
 metric = Metrics()
 
@@ -145,12 +145,13 @@ class LearningPathEnv:
             pred, pred_res, kt_mask, knowledge_state, hidden = self.base_model(
                 batch_histories, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
             
+            # 获取当前步骤的topk候选（只取最后一个时间步的topk）
+            # 获取最后时间步的预测概率
+            last_step_pred = pred.view(batch_histories.size(0), -1, pred.size(-1))[:, -1, :]  # [batch_size, num_skills]
+            
             # 获取topk候选
-            y_gold = batch_histories[:, 1:].contiguous().view(-1).cpu().numpy()
-            y_pred = pred.detach().cpu().numpy()
-            topk_candidates = metric.generate_topk_sequence(
-                y_pred, y_gold, batch_histories.size(0), batch_histories.size(1), topnum=self.topk
-            )
+            topk_scores, topk_indices = torch.topk(last_step_pred, k=self.topk, dim=-1)  # [batch_size, topk]
+            topk_candidates = topk_indices
 
         # 提取当前知识状态（最后一个时间步）
         if knowledge_state.dim() == 3:
@@ -180,6 +181,14 @@ class LearningPathEnv:
         """
         提取候选习题的特征
         """
+        # 确保topk_candidates是tensor并具有正确的形状
+        if not isinstance(topk_candidates, torch.Tensor):
+            topk_candidates = torch.tensor(topk_candidates)
+        
+        if topk_candidates.dim() == 1:
+            # 如果是一维张量，说明是单个样本，需要扩展维度
+            topk_candidates = topk_candidates.unsqueeze(0)
+        
         batch_size, topk = topk_candidates.shape
         
         # 创建候选特征

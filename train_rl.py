@@ -163,6 +163,10 @@ def run_training_with_pretrained_model(data_path="MOO", model_path=None):
     opt = parser.parse_args([])
     opt.d_word_vec = opt.d_model
     
+    # 获取数据信息以设置opt.user_size
+    user_size, _, _, _, _, _ = Split_data(opt.data_name, opt.train_rate, opt.valid_rate, load_dict=True)
+    opt.user_size = user_size
+    
     # 加载预训练的MSHGAT模型或创建模拟模型
     print("尝试加载预训练模型...")
     try:
@@ -199,9 +203,6 @@ def run_training_with_pretrained_model(data_path="MOO", model_path=None):
     except Exception as e:
         print(f"加载预训练模型失败: {e}")
     
-    # 获取数据信息
-    user_size, _, _, _, _, _ = Split_data(opt.data_name, opt.train_rate, opt.valid_rate, load_dict=True)
-    opt.user_size = user_size
     num_skills = user_size
     
     print(f"数据加载完成，知识点数量: {num_skills}")
