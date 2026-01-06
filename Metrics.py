@@ -6,6 +6,7 @@ import torch.nn as nn
 from sklearn.metrics import roc_auc_score, accuracy_score
 from dataLoader import Options
 import torch.nn.functional as F
+import Constants
 
 class Metrics(object):
 
@@ -111,6 +112,52 @@ class Metrics(object):
             topk_sequence.append(seq)  # 维度: [batch_size, seq_len-1, topnum]
 
         return scores, topk_sequence, valid_samples
+
+    def generate_topk_sequence(self, y_prob, y_true, batch_size, seq_len, topnum=5):
+        """
+        仅生成并返回topk_sequence（移除指标计算冗余逻辑）
+        参数:
+            y_prob: 预测概率 [batch_size*(seq_len-1), num_users]
+            y_true: 真实标签 [batch_size*(seq_len-1)]
+            batch_size: 批次大小
+            seq_len: 序列长度
+            topnum: 取TopK的K值（默认5）
+        返回:
+            topk_sequence: 推荐序列 [batch_size, seq_len-1, topnum]
+        """
+        total_samples = batch_size * (seq_len - 1)
+        # 初始化topk_sequence的基础存储
+        detailed_results = [{'topk_resources': []} for _ in range(total_samples)]
+
+        # 遍历每个样本，仅提取TopK资源
+        for i in range(total_samples):
+            y_ = y_true[i]
+            # 跳过PAD标签的样本（保持空列表）
+            if y_ == self.PAD:
+                continue
+
+            # 对预测概率排序，取TopK资源
+            p_ = y_prob[i]
+            p_sort = p_.argsort()
+            topk = p_sort[-topnum:][::-1]  # 降序取TopK
+            detailed_results[i]['topk_resources'] = topk.tolist()
+
+        # 构造最终的topk_sequence（维度对齐）
+        topk_sequence = []
+        for b in range(batch_size):
+            seq = []
+            for t in range(seq_len - 1):
+                idx = b * (seq_len - 1) + t
+                # 取对应位置的TopK资源，不足topnum时补空（或截断）
+                topk_res = detailed_results[idx]['topk_resources'][:topnum] if idx < len(detailed_results) else []
+                seq.append(topk_res)
+            topk_sequence.append(seq)
+
+        topk_indices = torch.tensor(
+            [[rec + [Constants.PAD] * (topnum - len(rec)) for rec in sample] for sample in topk_sequence],
+            dtype=torch.long
+        ).cuda()
+        return topk_indices
 
     # Metrics.py 的 compute_effectiveness 方法
     # --------------------有效性计算-------------------------------------
