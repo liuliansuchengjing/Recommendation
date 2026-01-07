@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-
+from calculate_muti_obj import simulate_learning
 import Constants
 from Metrics import Metrics
 
@@ -79,72 +79,73 @@ def _safe_to_cpu_list_1d(x: torch.Tensor):
 @torch.no_grad()
 def simulate_learning_for_metrics(
     kt_model,
-    original_seqs,
-    original_ans,
-    topk_sequence,
+    original_seqs,      # List[List[int]]  shape [B, seq_len]
+    original_ans,       # List[List[int]]  shape [B, seq_len]
+    topk_sequence,      # List[List[List[int]]] shape [B][seq_len-1][K]
     graph,
-    yt_before: torch.Tensor,
+    yt_before: torch.Tensor,  # [B, seq_len-1, num_skills]
     batch_size: int,
-    topnum: int,
+    K: int,             # topnum
 ):
     """
-    按照 calculate_muti_obj.py 的思想，把推荐资源插入序列并用 KTOnlyModel 跑出 yt_after。
-    这是为了给 Metrics.combined_metrics 提供正确的 yt_after。
-
-    输入：
-      - original_seqs: List[List[int]] 长度 batch_size
-      - original_ans:  List[List[int]] 长度 batch_size
-      - topk_sequence: List[List[List[int]]] 形状 [B][seq_len-1][topnum or less]
-      - yt_before: Tensor [B, seq_len-1, num_skills]（来自 base_model 输出的 yt/knowledge state）
-    输出：
-      - yt_after: Tensor [B, seq_len-1, num_skills]
+    严格复刻 calculate_muti_obj.py 的 simulate_learning():
+    - 对每个时间步 t：在 t+1 后插入 K 个推荐
+    - 只保留到 t+K（max_len = insert_pos + K）
+    - 用 KTOnlyModel 跑
+    - 取最后一步 yt_after[:, -1, :] 作为该 t 的 after
+    - 堆叠得到 [B, seq_len-1, num_skills]
     """
     device = yt_before.device
-    B = batch_size
-    seq_len_minus_1 = yt_before.size(1)
-    num_skills = yt_before.size(2)
+    seq_len_minus_1 = len(topk_sequence[0])  # = seq_len-1
+    yt_after_list = []
 
-    yt_after = torch.zeros((B, seq_len_minus_1, num_skills), device=device, dtype=yt_before.dtype)
+    for t in range(seq_len_minus_1):
+        extended_inputs = []
+        extended_ans = []
 
-    for b in range(B):
-        original_seq = list(original_seqs[b])
-        original_answer = list(original_ans[b])
+        for b in range(batch_size):
+            original_seq = list(original_seqs[b])
+            original_an = list(original_ans[b])
 
-        for t in range(seq_len_minus_1):
-            recs = topk_sequence[b][t] if (b < len(topk_sequence) and t < len(topk_sequence[b])) else []
-            # 只保留有效推荐（非 PAD）
-            recommended = [int(r) for r in recs[:topnum] if int(r) != int(Constants.PAD)]
+            recs = topk_sequence[b][t] if t < len(topk_sequence[b]) else []
+            recommended = [int(r) for r in recs[:K] if int(r) != int(Constants.PAD)]
 
             insert_pos = t + 1
-            new_seq = original_seq[:insert_pos] + recommended + original_seq[insert_pos:]
-
-            # 推荐项的“伪答题结果”：用 yt_before 在阈值 0.5 上二值化
+            new_seq = original_seq[:insert_pos] + recommended
+            # ✅ 与原版一致：用 yt_before 的符号生成伪答案（>=0）
             if len(recommended) > 0:
-                pred_probs = yt_before[b, t, torch.tensor(recommended, device=device)]
-                pred_answers = (pred_probs >= 0.5).long().detach().cpu().tolist()
+                rec_tensor = torch.tensor(recommended, device=device, dtype=torch.long)
+                pred_answers = (yt_before[b, t, rec_tensor] >= 0).float().tolist()
             else:
                 pred_answers = []
 
-            new_answer = original_answer[:insert_pos] + pred_answers + original_answer[insert_pos:]
+            new_ans = original_an[:insert_pos] + pred_answers
 
-            # padding 到 max_len（与原始长度一致，否则 KT 输出长度会变）
-            max_len = len(original_seq)
-            if len(new_seq) < max_len:
-                new_seq = new_seq + [Constants.PAD] * (max_len - len(new_seq))
-                new_answer = new_answer + [0] * (max_len - len(new_answer))
-            else:
-                new_seq = new_seq[:max_len]
-                new_answer = new_answer[:max_len]
+            # ✅ 与原版一致：max_len = insert_pos + K（只保留到 t+K）
+            max_len = insert_pos + K
+            new_seq = new_seq[:max_len]
+            new_ans = new_ans[:max_len]
 
-            new_seq_tensor = torch.tensor([new_seq], device=device, dtype=torch.long)
-            new_ans_tensor = torch.tensor([new_answer], device=device, dtype=torch.long)
+            extended_inputs.append(new_seq)
+            extended_ans.append(new_ans)
 
-            # KTOnlyModel.forward: (input_seq, answers, graph) -> yt_all  [B, seq_len, num_skills]
-            yt_all = kt_model(new_seq_tensor, new_ans_tensor, graph)
-            # 对齐取 t 位置（对应 yt_before 的 t）
-            yt_after[b, t, :] = yt_all[0, t, :]
+        # padding 到 max_len（与原版一致：每个 t 的 max_len 不同）
+        max_len = (t + 1) + K
+        padded_inputs = torch.full((batch_size, max_len), Constants.PAD, dtype=torch.long, device=device)
+        padded_ans = torch.zeros((batch_size, max_len), dtype=torch.float, device=device)
 
-    return yt_after
+        for b in range(batch_size):
+            seq = extended_inputs[b]
+            ans = extended_ans[b]
+            padded_inputs[b, :len(seq)] = torch.tensor(seq, device=device, dtype=torch.long)
+            padded_ans[b, :len(ans)] = torch.tensor(ans, device=device, dtype=torch.float)
+
+        yt_after = kt_model(padded_inputs, padded_ans, graph)  # [B, max_len, num_skills] 或 [B, max_len-1, num_skills]
+        # ✅ 与原版一致：取最后一步
+        p_after = yt_after[:, -1, :].detach()
+        yt_after_list.append(p_after)
+
+    return torch.stack(yt_after_list, dim=1)  # [B, seq_len-1, num_skills]
 
 
 # ======================================================
@@ -382,8 +383,8 @@ class LearningPathEnv:
             rec_chosen_i = self.paths[i]
             rec_topk_i = self.topk_recs[i]
 
-            full_seq_i = orig_seq_i + rec_chosen_i
-            full_ans_i = orig_ans_i + [0] * len(rec_chosen_i)
+            full_seq_i = orig_seq_i + [Constants.PAD] * rec_len
+            full_ans_i = orig_ans_i + [0] * rec_len
 
             # build topk_sequence for Metrics: [1, seq_len-1, topnum]
             seq_steps = seq_len_full - 1
@@ -421,7 +422,7 @@ class LearningPathEnv:
                 graph=self.graph,
                 yt_before=yt_before,
                 batch_size=1,
-                topnum=self.metrics_topnum,
+                K=self.metrics_topnum,
             )
 
             pred_probs_flat = pred_probs_1.reshape(-1, pred_probs_1.size(-1)).detach().cpu().numpy()
@@ -466,7 +467,52 @@ class LearningPathEnv:
         }
 
     def compute_final_reward(self) -> torch.Tensor:
-        return self.compute_final_metrics()["final_quality"]
+        """
+        使用原始 calculate_muti_obj.py 中的逻辑，
+        计算 episode-level 的 effectiveness / final_quality
+        """
+        device = self.device
+        batch_size = self.batch_size
+
+        # 1️⃣ 原始历史序列（不加 PAD、不加推荐）
+        original_seqs = self.original_tgt.tolist()  # [B, seq_len]
+        original_ans = self.original_ans.tolist()  # [B, seq_len]
+
+        # 2️⃣ yt_before：来自 base_model（你之前就是这么算的）
+        # shape: [B, seq_len-1, num_skills]
+        yt_before = self.yt_before.detach()
+
+        # 3️⃣ topk_sequence：RL 过程中记录的推荐
+        # 形状必须对齐你原来的逻辑：
+        # [B][seq_len-1][topnum]
+        topk_sequence = self.topk_sequence_for_metrics
+
+        # 4️⃣ 调用你原来已经验证正确的 simulate_learning
+        yt_after = simulate_learning(
+            self.kt_model,
+            original_seqs,
+            original_ans,
+            topk_sequence,
+            self.graph,
+            yt_before,
+            batch_size,
+            self.metrics_topnum,
+        )
+
+        # 5️⃣ 计算 effectiveness（你原来怎么调，现在一模一样）
+        effectiveness = self.metric.compute_effectiveness(
+            original_seqs,
+            yt_before,
+            yt_after,
+            topk_sequence
+        )
+
+        # 6️⃣ 只返回一个 episode-level reward（标量或 [B]）
+        # 如果 effectiveness 是标量：
+        if not torch.is_tensor(effectiveness):
+            effectiveness = torch.tensor(effectiveness, device=device)
+
+        return effectiveness
 
 
 # ======================================================
