@@ -9,9 +9,11 @@ from Metrics import Metrics
 import Constants
 import pickle
 from dataLoader import Options
+
 metric = Metrics()
 
-#  轨迹数据管理器类
+
+# 轨迹数据管理器类
 class TrajectoryDataManager:
     """
     管理RL轨迹中的完整数据，用于最终指标计算
@@ -19,7 +21,6 @@ class TrajectoryDataManager:
 
     def __init__(self, batch_size):
         self.batch_size = batch_size
-
         # 初始化存储结构
         self.reset()
 
@@ -94,7 +95,6 @@ class TrajectoryMetricsEvaluator:
             'diversity': 0.2,
             'preference': 0.1
         }
-
         # 缓存难度映射
         self.difficulty_cache = {}
 
@@ -299,109 +299,35 @@ class TrajectoryMetricsEvaluator:
 
         return total_preference / valid_count if valid_count > 0 else 0.0
 
-# 添加评估函数，监控奖励构成
-def analyze_reward_components(self, trajectory):
-    """
-    分析奖励构成，用于监控训练
-    """
-    if 'final_quality' in trajectory and trajectory['final_quality']:
-        print(f"最终质量奖励: {trajectory['final_quality'][-1].mean().item():.4f}")
-
-    # 计算奖励的各个部分（如果环境记录了）
-    if hasattr(self.env, 'reward_components_history'):
-        components = self.env.reward_components_history[-1]
-        print(f"奖励构成 - 有效性: {components['validity'].mean():.4f}, "
-              f"适应性: {components['adaptivity'].mean():.4f}, "
-              f"多样性: {components['diversity'].mean():.4f}, "
-              f"偏好: {components['preference'].mean():.4f}")
-
-class RLPathOptimizer:
-    """
-    强化学习路径优化器
-    核心逻辑：
-    1. 在每一步，使用完整的当前历史序列调用预训练模型
-    2. 从模型输出的topk候选中选择动作
-    3. 基于多目标奖励优化选择策略
-    """
-    def __init__(self, pretrained_model, num_skills, batch_size, recommendation_length=5, topk=20, data_name=None):
-        self.base_model = pretrained_model  # 预训练模型
-        self.recommendation_length = recommendation_length  # 推荐路径长度
-        self.topk = topk                    # 候选集大小
-        self.num_skills = num_skills        # 知识点数量
-        self.batch_size = batch_size
-        self.data_name = data_name          # 数据集名称，用于计算适应性奖励
-
-        # 冻结预训练模型
-        for param in self.base_model.parameters():
-            param.requires_grad = False
-
-        # 构建策略网络（动作选择器）
-        self.policy_net = self._build_policy_network()
-        
-        # 将策略网络移动到与预训练模型相同的设备
-        if next(self.base_model.parameters()).is_cuda:
-            device = next(self.base_model.parameters()).device
-            self.policy_net = self.policy_net.to(device)
-            print(f"策略网络已移动到设备: {device}")
-        else:
-            print("预训练模型在CPU上，策略网络保持在CPU")
-
-        # 构建环境
-        self.env = LearningPathEnv(
-            batch_size=self.batch_size,
-            base_model=self.base_model,
-            policy_net=self.policy_net,
-            recommendation_length=self.recommendation_length,
-            topk=self.topk,
-            data_name=self.data_name
-        )
-
-        self.trainer = PPOTrainer(
-            policy_net = self.policy_net,
-            env = self.env,
-            lr = 3e-4,
-            gamma = 0.99,
-            clip_epsilon = 0.2)
-
-    def _build_policy_network(self):
-        """构建策略网络实例"""
-        # 确定网络参数
-        knowledge_dim = self.num_skills  # 知识状态维度
-        candidate_feature_dim = 5  # 候选特征维度（可配置）
-
-        # 创建策略网络
-        policy_net = PolicyNetwork(
-            knowledge_dim=knowledge_dim,
-            candidate_feature_dim=candidate_feature_dim,
-            hidden_dim=128,  # 隐藏层维度
-            topk=self.topk  # 候选数量
-        )
-
-        return policy_net
-
 
 class LearningPathEnv:
     """
-    学习路径环境
+    学习路径环境（合并增强功能）
     关键特性：
     - 维护每个学习者的完整历史路径
     - 每一步都使用完整历史调用预训练模型
     - 计算多目标奖励
+    - 支持轨迹数据管理和最终质量奖励计算
     """
 
-    def __init__(self, batch_size, base_model, policy_net, recommendation_length, topk, data_name):
+    def __init__(self, batch_size, base_model, policy_net, recommendation_length, topk, data_name,
+                 graph=None, hypergraph_list=None):
         self.base_model = base_model  # 预训练模型
         self.policy_net = policy_net  # 策略网络
         self.recommendation_length = recommendation_length  # 推荐路径长度
         self.topk = topk  # 候选集大小
         self.data_name = data_name  # 数据集名称
 
+        # 存储默认图数据
+        self.default_graph = graph
+        self.default_hypergraph_list = hypergraph_list
+
         # 环境状态
         self.batch_size = batch_size  # 批次大小（动态设置）
         self.histories = []  # 每个学习者的历史路径列表
         self.current_step = 0  # 当前步骤
         self.paths = []  # 已生成的推荐路径
-        
+
         # 存储原始输入数据，以便在step中使用
         self.original_tgt = None  # [batch_size, history_len] - 目标序列
         self.original_tgt_timestamp = None  # [batch_size, history_len] - 时间戳序列
@@ -413,7 +339,7 @@ class LearningPathEnv:
         self.original_sequences = None  # 存储原始序列用于奖励计算
         self.all_knowledge_states = []  # 存储每一步的知识状态，用于最终奖励计算
         self.all_predictions = []  # 存储每一步的预测结果，用于最终奖励计算
-        
+
         # 存储扩展的答案序列
         self.extended_ans = None  # [batch_size, history_len + current_step] - 扩展的答案序列
 
@@ -424,19 +350,25 @@ class LearningPathEnv:
             'diversity': 0.2,
             'preference': 0.1
         }
-        self.prev_knowledge_state = None  # 添加这行
+        self.prev_knowledge_state = None  # 上一步的知识状态
 
         # 用于存储最终质量奖励
         self.final_quality_scores = []
         self.trajectory_rewards = []  # 存储轨迹的即时奖励
+
+        # 轨迹数据管理器和评估器
+        self.trajectory_manager = TrajectoryDataManager(batch_size)
+        self.metrics_evaluator = None  # 将在reset时初始化
+
+        # 奖励混合参数
+        self.reward_decay_factor = 0.8  # 时间衰减因子
+        self.final_reward_weight = 2.0  # 最终奖励权重
 
         # 加载真实难度数据（用于适应性计算）
         self._load_difficulty_data(data_name)
 
     def _load_difficulty_data(self, data_name):
         """加载真实难度数据"""
-
-
         options = Options(data_name)
         try:
             with open(options.idx2u_dict, 'rb') as handle:
@@ -461,7 +393,45 @@ class LearningPathEnv:
             self.difficulty_data = {}
             self.idx2u = {}
 
-    def reset(self, tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list):
+    def _load_metrics_evaluator(self):
+        """加载指标评估器所需的难度数据"""
+        # 加载难度数据和映射（重用原有逻辑）
+        options = Options(self.data_name)
+        try:
+            with open(options.idx2u_dict, 'rb') as handle:
+                idx2u = pickle.load(handle)
+
+            difficulty_data = {}
+            with open(options.difficult_file, 'r') as f:
+                next(f)  # 跳过标题行
+                for line in f:
+                    parts = line.strip().split(',')
+                    if len(parts) >= 2:
+                        try:
+                            challenge_id = int(parts[0].strip())
+                            difficulty = int(parts[1].strip())
+                            difficulty_data[challenge_id] = difficulty
+                        except ValueError:
+                            continue
+
+            # 创建评估器
+            self.metrics_evaluator = TrajectoryMetricsEvaluator(
+                difficulty_data=difficulty_data,
+                idx2u=idx2u,
+                reward_weights=self.reward_weights
+            )
+
+            print(f"指标评估器初始化完成，加载了 {len(difficulty_data)} 个习题的难度数据")
+
+        except Exception as e:
+            print(f"加载难度数据失败，使用默认评估器: {e}")
+            self.metrics_evaluator = TrajectoryMetricsEvaluator(
+                difficulty_data={},
+                idx2u={},
+                reward_weights=self.reward_weights
+            )
+
+    def reset(self, tgt, tgt_timestamp, tgt_idx, ans, graph=None, hypergraph_list=None):
         """
         重置环境
         Args:
@@ -473,12 +443,23 @@ class LearningPathEnv:
             hypergraph_list: 超图列表
         """
         self.original_tgt = tgt  # [batch_size, history_len]
-        # self.original_tgt_timestamp = tgt_timestamp  # [batch_size, history_len]
-        # self.original_tgt_idx = tgt_idx  # [batch_size, history_len]
         self.original_ans = ans  # [batch_size, history_len]
-        self.original_graph = graph
-        self.original_hypergraph_list = hypergraph_list
-        
+
+        # 使用传入的图数据或默认图数据
+        if graph is not None:
+            self.original_graph = graph
+        elif self.default_graph is not None:
+            self.original_graph = self.default_graph
+        else:
+            raise ValueError("Graph must be provided either in init or reset")
+
+        if hypergraph_list is not None:
+            self.original_hypergraph_list = hypergraph_list
+        elif self.default_hypergraph_list is not None:
+            self.original_hypergraph_list = self.default_hypergraph_list
+        else:
+            raise ValueError("Hypergraph list must be provided either in init or reset")
+
         # 初始化历史路径
         self.batch_size = tgt.size(0)  # [batch_size, ...]
         self.histories = [tgt[i].clone() for i in range(self.batch_size)]  # List of [history_len] for each batch
@@ -486,46 +467,50 @@ class LearningPathEnv:
         self.paths = [[] for _ in range(self.batch_size)]  # List of lists for each batch 独立维护batch每个学习者的推荐路径
         self.all_knowledge_states = []  # 重置每一步知识状态记录，step推荐后更新 List[torch.Tensor] [batch_size, num_skills]
         self.all_predictions = []  # 重置每一步预测结果记录，step推荐后更新 List[torch.Tensor] [batch_size, total_seq_len, num_skills]
-        
+
         # 初始化扩展答案序列，复制原始答案序列
         self.extended_ans = ans.clone()  # [batch_size, history_len] - 扩展的答案序列，随着步骤的推荐，扩展答案序列的长度会增加
 
         # 获取初始状态
-        initial_state = self._get_current_state(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
+        initial_state = self._get_current_state(tgt, tgt_timestamp, tgt_idx, ans)
         self.current_state = initial_state
 
         # 新增：初始化 prev_knowledge_state
-        self.prev_knowledge_state = initial_state['knowledge_state'].clone
+        self.prev_knowledge_state = initial_state['knowledge_state'].clone()
+
+        # 重置轨迹管理器
+        self.trajectory_manager.reset()
+
+        # 存储原始数据
+        for i in range(self.batch_size):
+            self.trajectory_manager.add_original_data(
+                i,
+                tgt[i].cpu().tolist(),
+                ans[i].cpu().tolist()
+            )
+
+        # 初始化评估器（加载难度数据）
+        if self.metrics_evaluator is None:
+            self._load_metrics_evaluator()
+
+        # 获取并存储资源嵌入
+        with torch.no_grad():
+            hidden = self.base_model.gnn(self.original_graph)
+            self.trajectory_manager.set_hidden_embeddings(hidden)
 
         return initial_state
 
-    def _get_current_state(self, tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list):
+    def _get_current_state(self, tgt, tgt_timestamp, tgt_idx, ans):
         """
         获取当前状态
         """
         # 使用当前累积的历史路径作为输入
         batch_histories = torch.stack(self.histories)  # [batch_size, current_seq_len] - 当前累积的历史路径
 
-        # 确保tgt_timestamp, tgt_idx, ans与当前历史长度一致
+        # 确保ans与当前历史长度一致
         max_hist_len = batch_histories.size(1)  # 当前历史的最大长度 - scalar
-        
+
         # 调整其他输入以匹配当前历史长度，确保张量是二维的
-        # 检查张量维度并进行适当的切片
-        # print("tgt_timestamp.shape", tgt_timestamp.shape)
-        # if tgt_timestamp.dim() == 2:
-        #     current_tgt_timestamp = tgt_timestamp[:, :max_hist_len]  # [batch_size, current_seq_len]
-        # else:
-        #     # 如果是一维张量，说明是单个序列，直接使用
-        #     current_tgt_timestamp = tgt_timestamp.unsqueeze(0)[:, :max_hist_len]  # [1, current_seq_len]
-
-        # print("tgt_idx.shape", tgt_idx.shape)
-        # if tgt_idx.dim() == 2:
-        #     current_tgt_idx = tgt_idx[:, :max_hist_len]  # [batch_size, current_seq_len]
-        # else:
-        #     # 如果是一维张量，扩展为二维
-        #     current_tgt_idx = tgt_idx.unsqueeze(0)[:, :max_hist_len]  # [1, current_seq_len]
-
-        # print("ans.shape", ans.shape)
         if ans.dim() == 2:
             current_ans = ans[:, :max_hist_len]  # [batch_size, current_seq_len]
         else:
@@ -541,17 +526,17 @@ class LearningPathEnv:
             # hidden: [num_skills, hidden_dim] - 知识初始嵌入
             # status_emb: [batch_size, total_seq_len, hidden_dim] - 状态嵌入
             pred, pred_res, kt_mask, knowledge_state, hidden, status_emb = self.base_model(
-                batch_histories, tgt_timestamp, tgt_idx, current_ans, graph, hypergraph_list)
-            
+                batch_histories, tgt_timestamp, tgt_idx, current_ans,
+                self.original_graph, self.original_hypergraph_list)
+
             # 获取当前步骤的topk候选（只取最后一个时间步的topk）
             # 获取最后时间步的预测概率
             last_step_pred = pred.view(batch_histories.size(0), -1, pred.size(-1))[:, -1, :]  # [batch_size, num_skills]
-            
+
             # 获取topk候选
             topk_scores, topk_indices = torch.topk(last_step_pred, k=self.topk, dim=-1)  # [batch_size, topk]
             topk_candidates = topk_indices  # [batch_size, topk]
 
-        # print("knowledge_state.shape", knowledge_state.shape)
         # 提取当前知识状态（最后一个时间步）
         if knowledge_state.dim() == 3:
             current_knowledge = knowledge_state[:, -1, :]  # [batch_size, num_skills]
@@ -559,7 +544,8 @@ class LearningPathEnv:
             current_knowledge = knowledge_state  # [num_skills,] or [batch_size, num_skills]
 
         # 提取候选特征
-        candidate_features = self._extract_candidate_features(topk_candidates, current_knowledge)  # [batch_size, topk, feature_dim]
+        candidate_features = self._extract_candidate_features(topk_candidates,
+                                                              current_knowledge)  # [batch_size, topk, feature_dim]
 
         # 构建状态字典
         state = {
@@ -591,31 +577,32 @@ class LearningPathEnv:
 
         # 验证topk_candidates形状
         if topk_candidates.dim() != 2:
-            raise ValueError(f"topk_candidates should be 2D tensor [batch_size, topk], got shape {topk_candidates.shape}")
+            raise ValueError(
+                f"topk_candidates should be 2D tensor [batch_size, topk], got shape {topk_candidates.shape}")
 
         batch_size, topk = topk_candidates.shape  # scalar, scalar
-        
+
         # 确保所有张量都在同一设备上
         device = knowledge_state.device  # 使用knowledge_state的设备作为目标设备
         topk_candidates = topk_candidates.to(device)
-        
+
         # 创建候选特征: [batch_size, topk, 5]
         candidate_features = torch.zeros(batch_size, topk, 5, device=device, dtype=torch.float)
-        
+
         # 特征1: 习题ID归一化 - [batch_size, topk]
         candidate_features[:, :, 0] = topk_candidates.float() / self.base_model.n_node
-        
+
         # 特征2: 对应知识点的当前掌握程度 - [batch_size, topk]
         for b in range(batch_size):
             for k in range(topk):
                 skill_id = topk_candidates[b, k].item()
                 if skill_id < knowledge_state.size(1):  # num_skills
                     candidate_features[b, k, 1] = knowledge_state[b, skill_id]
-        
+
         # 特征3: 习题在topk中的排名 - [batch_size, topk]
         rank_weights = torch.linspace(1.0, 0.0, topk, device=device)
         candidate_features[:, :, 2] = rank_weights.unsqueeze(0).repeat(batch_size, 1)
-        
+
         # 特征4: 与当前知识状态的差异度 - [batch_size, topk]
         for b in range(batch_size):
             for k in range(topk):
@@ -623,121 +610,15 @@ class LearningPathEnv:
                 if skill_id < knowledge_state.size(1):
                     diff = abs(0.5 - knowledge_state[b, skill_id])
                     candidate_features[b, k, 3] = diff
-        
+
         # 特征5: 偏好分数 - [batch_size, topk]
         candidate_features[:, :, 4] = 1.0 - rank_weights.unsqueeze(0).repeat(batch_size, 1)
-        
+
         return candidate_features
-
-    # 添加最终质量奖励计算方法
-    def _calculate_final_quality_bonus(self):
-        """
-        计算最终路径质量奖励
-        使用Metrics模块评估整条推荐路径
-        """
-        batch_size = self.batch_size
-
-        # 1. 获取完整序列
-        full_sequences = []
-        original_seqs = self.original_tgt.cpu().numpy() if self.original_tgt is not None else []
-
-        for i in range(batch_size):
-            # 原始历史 + 推荐路径
-            original_len = len(original_seqs[i]) if i < len(original_seqs) else 0
-            full_seq = list(original_seqs[i]) + self.paths[i] if original_len > 0 else self.paths[i]
-            full_sequences.append(full_seq)
-
-        # 2. 使用预训练模型获取知识状态（用于有效性计算）
-        # 这里需要重新运行模型获取完整的知识状态序列
-        with torch.no_grad():
-            batch_histories = torch.stack(self.histories)
-
-            # 运行模型获取预测和知识状态
-            pred, pred_res, kt_mask, knowledge_state, hidden, status_emb = self.base_model(
-                batch_histories,
-                self.original_tgt_timestamp,
-                self.original_tgt_idx,
-                self.extended_ans,
-                self.original_graph,
-                self.original_hypergraph_list
-            )
-
-        # 3. 转换为numpy用于Metrics计算
-        pred_np = pred.cpu().numpy()
-        knowledge_state_np = knowledge_state.cpu().numpy()
-
-        # 4. 计算各项指标（简化版，实际应调用Metrics中的方法）
-        quality_scores = torch.zeros(batch_size, device=batch_histories.device)
-
-        for i in range(batch_size):
-            # 有效性：知识状态提升
-            if knowledge_state_np.shape[1] > 1:
-                # 计算平均知识增益
-                initial_knowledge = knowledge_state_np[i, len(original_seqs[i]) - 1, :]
-                final_knowledge = knowledge_state_np[i, -1, :]
-                knowledge_gain = np.mean(np.maximum(final_knowledge - initial_knowledge, 0))
-                validity_score = knowledge_gain / (1.0 - initial_knowledge.mean() + 1e-8)
-            else:
-                validity_score = 0.0
-
-            # 多样性：路径中独特知识点比例
-            unique_exercises = len(set(self.paths[i]))
-            total_exercises = len(self.paths[i])
-            diversity_score = unique_exercises / total_exercises if total_exercises > 0 else 0.0
-
-            # 适应性：平均难度匹配度（简化计算）
-            adaptivity_score = 0.0
-            if hasattr(self, 'difficulty_data') and self.difficulty_data:
-                for exercise in self.paths[i]:
-                    if exercise in self.idx2u and self.idx2u[exercise] in self.difficulty_data:
-                        # 这里需要更精确的适应性计算，简化处理
-                        adaptivity_score += 0.5  # 简化：假设中等适应性
-                adaptivity_score = adaptivity_score / total_exercises if total_exercises > 0 else 0.0
-
-            # 组合最终质量分数
-            final_quality = (
-                    self.reward_weights['validity'] * validity_score +
-                    self.reward_weights['diversity'] * diversity_score +
-                    self.reward_weights['adaptivity'] * adaptivity_score
-            )
-
-            quality_scores[i] = final_quality
-
-        return quality_scores
-
-    def _mix_rewards(self, immediate_rewards, final_quality_bonus, dones):
-        """
-        混合即时奖励和最终质量奖励
-        方案：使用时间衰减将最终奖励分配到各个时间步
-        """
-        batch_size = immediate_rewards.size(0)
-        mixed_rewards = immediate_rewards.clone()
-
-        # 只对结束的轨迹添加最终奖励
-        for i in range(batch_size):
-            if dones[i].item():
-                # 计算衰减权重：越接近结束，权重越高
-                total_steps = self.recommendation_length
-                current_step = self.current_step
-
-                # 衰减因子：最后一步获得最多最终奖励
-                decay_factor = 0.7  # 每步衰减30%
-                step_weight = decay_factor ** (total_steps - current_step)
-
-                # 分配最终奖励
-                bonus = final_quality_bonus[i] * step_weight
-                mixed_rewards[i] += bonus
-
-                # 可选：将部分最终奖励反向传播到历史步骤
-                if hasattr(self, 'immediate_rewards_history') and self.immediate_rewards_history:
-                    # 这里可以更复杂地分配，简化处理
-                    pass
-
-        return mixed_rewards
 
     def step(self, actions):
         """
-        执行一步动作
+        执行一步动作，记录轨迹数据
         Args:
             actions: [batch_size] 选择的候选索引（0到topk-1）
         Returns:
@@ -763,12 +644,12 @@ class LearningPathEnv:
             self.histories[i] = torch.cat([self.histories[i], new_exercise])  # [current_history_len + 1]
             # 记录到推荐路径
             self.paths[i].append(selected_exercises[i].item())
-        
-        #  3. 扩展答案序列，为新添加的习题添加预测答案
+
+        # 3. 扩展答案序列，为新添加的习题添加预测答案
         # 这里使用一个简单的启发式方法：根据当前知识状态预测答案
         # 获取当前知识状态对新习题的预测概率
         current_knowledge = self.current_state['knowledge_state']  # [batch_size, num_skills]
-        
+
         # 为每个选择的习题获取预测正确率（这里使用当前知识状态作为预测）
         predicted_correct = []
         for i in range(self.batch_size):
@@ -782,32 +663,36 @@ class LearningPathEnv:
                 # 如果习题ID超出知识点范围，假设答错
                 predicted_answer = 0
             predicted_correct.append(predicted_answer)
-        
+
         # 创建新的答案张量 - [batch_size, 1]
-        new_answers = torch.tensor(predicted_correct, dtype=self.extended_ans.dtype, device=self.extended_ans.device).unsqueeze(1)
+        new_answers = torch.tensor(predicted_correct, dtype=self.extended_ans.dtype,
+                                   device=self.extended_ans.device).unsqueeze(1)
         # 扩展答案序列 - [batch_size, current_seq_len + 1]
         self.extended_ans = torch.cat([self.extended_ans, new_answers], dim=1)
 
-        # 4. 更新步骤计数
+        # 4. 记录轨迹数据
+        self._record_trajectory_data(actions, selected_exercises)
+
+        # 5. 更新步骤计数
         self.current_step += 1
 
-        # 5. 获取新状态 - 重新运行预训练模型以获取完整的状态信息
+        # 6. 获取新状态 - 重新运行预训练模型以获取完整的状态信息
         # 使用当前累积的历史来获取状态，并使用扩展后的答案
         next_state = self._get_current_state(
-            torch.stack(self.histories),      # [batch_size, current_seq_len + 1] - 当前累积的历史
-            self.original_tgt_timestamp,      # [batch_size, original_seq_len] - 原始时间戳
-            self.original_tgt_idx,            # [batch_size, original_seq_len] - 原始索引
-            self.extended_ans,                # [batch_size, current_seq_len + 1] - 扩展后的答案
-            self.original_graph,              # 关系图
-            self.original_hypergraph_list     # 超图列表
+            torch.stack(self.histories),  # [batch_size, current_seq_len + 1] - 当前累积的历史
+            self.original_tgt_timestamp,  # [batch_size, original_seq_len] - 原始时间戳
+            self.original_tgt_idx,  # [batch_size, original_seq_len] - 原始索引
+            self.extended_ans  # [batch_size, current_seq_len + 1] - 扩展后的答案
         )
 
-        # 6. 计算即时奖励 - [batch_size]
+        # 7. 计算即时奖励 - [batch_size]
         immediate_rewards = self._calculate_immediate_reward(selected_exercises, next_state)
-        # 7. 检查是否轨迹结束 - [batch_size]
-        dones = torch.tensor([self.current_step >= self.recommendation_length] * self.batch_size, device=selected_exercises.device)
 
-        # 8. 如果是轨迹结束，计算最终质量奖励并混合
+        # 8. 检查是否轨迹结束 - [batch_size]
+        dones = torch.tensor([self.current_step >= self.recommendation_length] * self.batch_size,
+                             device=selected_exercises.device)
+
+        # 9. 如果是轨迹结束，计算最终质量奖励并混合
         if torch.any(dones):
             # 计算最终质量奖励
             final_quality_bonus = self._calculate_final_quality_bonus()
@@ -815,19 +700,85 @@ class LearningPathEnv:
             # 混合奖励：即时奖励 + 最终质量奖励（反向分配）
             mixed_rewards = self._mix_rewards(immediate_rewards, final_quality_bonus, dones)
 
-            # 清空历史记录
-            if hasattr(self, 'immediate_rewards_history'):
-                self.immediate_rewards_history.clear()
+            # 存储最终质量分数用于分析
+            self.final_quality_scores = final_quality_bonus
         else:
             mixed_rewards = immediate_rewards
 
-        # 9. 保存当前知识状态供下一步使用
+        # 10. 保存当前知识状态供下一步使用
         self.prev_knowledge_state = self.current_state['knowledge_state'].clone()
 
         return next_state, mixed_rewards, dones
 
+    def _record_trajectory_data(self, actions, selected_exercises):
+        """记录当前步骤的轨迹数据"""
+        # 获取当前知识状态
+        knowledge_before = self.current_state['knowledge_state']
 
-    # 即时奖励计算
+        # 预测答案（基于推荐前的知识状态）
+        predicted_answers = self._predict_answers_batch(
+            knowledge_before, selected_exercises)
+
+        # 获取模型预测概率
+        model_predictions = self._get_model_predictions_batch(
+            self.current_state, selected_exercises)
+
+        # 临时保存，下一步会更新知识状态
+        # 注意：knowledge_after 将在下一步的 _get_current_state 中获取
+
+        # 记录数据
+        for i in range(self.batch_size):
+            # 注意：knowledge_after 需要在下一步才能获取
+            # 这里先记录知识状态前和预测数据，知识状态后将在下一步补全
+            self.trajectory_manager.add_recommendation(
+                i,
+                selected_exercises[i].item(),
+                knowledge_before[i].cpu().detach(),
+                None,  # 将在下一步补全
+                predicted_answers[i],
+                model_predictions[i]
+            )
+
+    def _predict_answers_batch(self, knowledge_state, selected_exercises):
+        """批量预测答案（基于当前知识状态）"""
+        predicted_answers = []
+        for i, rec in enumerate(selected_exercises):
+            if rec < knowledge_state.size(1):
+                prob = knowledge_state[i, rec].item()
+                # 使用0.5作为阈值
+                answer = 1 if prob > 0.5 else 0
+            else:
+                answer = 0  # 默认答错
+            predicted_answers.append(answer)
+        return predicted_answers
+
+    def _get_model_predictions_batch(self, state, selected_exercises):
+        """获取模型对推荐资源的预测概率"""
+        batch_size = len(selected_exercises)
+        model_predictions = []
+
+        if 'pred' in state:
+            pred_probs = state['pred']  # [batch, seq_len, num_skills]
+
+            for i in range(batch_size):
+                # 获取最后一个时间步的预测概率
+                last_step_pred = pred_probs[i, -1, :] if pred_probs.dim() == 3 else pred_probs[i]
+
+                # 转换为概率分布
+                if isinstance(last_step_pred, torch.Tensor):
+                    probs = torch.softmax(last_step_pred, dim=0).cpu().tolist()
+                else:
+                    probs = last_step_pred.tolist()
+
+                model_predictions.append(probs)
+        else:
+            # 如果没有预测数据，使用均匀分布
+            num_skills = self.base_model.n_node
+            uniform_probs = [1.0 / num_skills] * num_skills
+            model_predictions = [uniform_probs] * batch_size
+
+        return model_predictions
+
     def _calculate_immediate_reward(self, selected_exercises, next_state):
         """
         修正的即时奖励计算，与Metrics保持一致
@@ -968,184 +919,6 @@ class LearningPathEnv:
 
         return preference_reward
 
-
-class EnhancedLearningPathEnv(LearningPathEnv):
-    """
-    增强的RL环境，支持完整轨迹指标计算
-    """
-
-    def __init__(self, batch_size, base_model, policy_net,
-                 recommendation_length, topk, data_name):
-        super().__init__(batch_size, base_model, policy_net,
-                         recommendation_length, topk, data_name)
-
-        # 初始化轨迹数据管理器和评估器
-        self.trajectory_manager = TrajectoryDataManager(batch_size)
-        self.metrics_evaluator = None  # 将在reset时初始化
-
-        # 奖励混合参数
-        self.reward_decay_factor = 0.8  # 时间衰减因子
-        self.final_reward_weight = 2.0  # 最终奖励权重
-
-    def reset(self, tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list):
-        """重置环境，并初始化轨迹管理器"""
-        # 调用父类reset
-        state = super().reset(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
-
-        # 重置轨迹管理器
-        self.trajectory_manager.reset()
-
-        # 存储原始数据
-        for i in range(self.batch_size):
-            self.trajectory_manager.add_original_data(
-                i,
-                tgt[i].cpu().tolist(),
-                ans[i].cpu().tolist()
-            )
-
-        # 初始化评估器（加载难度数据）
-        if self.metrics_evaluator is None:
-            self._load_metrics_evaluator()
-
-        # 获取并存储资源嵌入
-        with torch.no_grad():
-            hidden = self.base_model.gnn(graph)
-            self.trajectory_manager.set_hidden_embeddings(hidden)
-
-        return state
-
-    def _load_metrics_evaluator(self):
-        """加载指标评估器所需的难度数据"""
-        # 加载难度数据和映射（重用原有逻辑）
-        options = Options(self.data_name)
-        try:
-            with open(options.idx2u_dict, 'rb') as handle:
-                idx2u = pickle.load(handle)
-
-            difficulty_data = {}
-            with open(options.difficult_file, 'r') as f:
-                next(f)  # 跳过标题行
-                for line in f:
-                    parts = line.strip().split(',')
-                    if len(parts) >= 2:
-                        try:
-                            challenge_id = int(parts[0].strip())
-                            difficulty = int(parts[1].strip())
-                            difficulty_data[challenge_id] = difficulty
-                        except ValueError:
-                            continue
-
-            # 创建评估器
-            self.metrics_evaluator = TrajectoryMetricsEvaluator(
-                difficulty_data=difficulty_data,
-                idx2u=idx2u,
-                reward_weights=self.reward_weights
-            )
-
-            print(f"指标评估器初始化完成，加载了 {len(difficulty_data)} 个习题的难度数据")
-
-        except Exception as e:
-            print(f"加载难度数据失败，使用默认评估器: {e}")
-            self.metrics_evaluator = TrajectoryMetricsEvaluator(
-                difficulty_data={},
-                idx2u={},
-                reward_weights=self.reward_weights
-            )
-
-    def step(self, actions):
-        """
-        改进的step方法，记录完整轨迹数据
-        """
-        # 1. 执行动作（调用父类方法）
-        next_state, rewards, dones = super().step(actions)
-
-        # 2. 记录轨迹数据
-        self._record_trajectory_data(actions, next_state)
-
-        # 3. 如果是轨迹结束，计算最终质量奖励并混合
-        if torch.any(dones):
-            final_quality_bonus = self._calculate_final_quality_bonus()
-            mixed_rewards = self._mix_rewards(rewards, final_quality_bonus, dones)
-
-            # 存储最终质量分数用于分析
-            self.final_quality_scores = final_quality_bonus
-
-            return next_state, mixed_rewards, dones
-
-        return next_state, rewards, dones
-
-    def _record_trajectory_data(self, actions, next_state):
-        """记录当前步骤的轨迹数据"""
-        # 获取选择的习题
-        selected_exercises = []
-        for i in range(self.batch_size):
-            candidate_idx = actions[i].item()
-            exercise_id = self.current_state['candidates'][i, candidate_idx].item()
-            selected_exercises.append(exercise_id)
-
-        # 获取当前知识状态
-        knowledge_before = self.current_state['knowledge_state']
-        knowledge_after = next_state['knowledge_state']
-
-        # 预测答案（基于推荐前的知识状态）
-        predicted_answers = self._predict_answers_batch(
-            knowledge_before, selected_exercises)
-
-        # 获取模型预测概率
-        model_predictions = self._get_model_predictions_batch(
-            self.current_state, selected_exercises)
-
-        # 记录数据
-        for i in range(self.batch_size):
-            self.trajectory_manager.add_recommendation(
-                i,
-                selected_exercises[i],
-                knowledge_before[i].cpu().detach(),
-                knowledge_after[i].cpu().detach(),
-                predicted_answers[i],
-                model_predictions[i]
-            )
-
-    def _predict_answers_batch(self, knowledge_state, selected_exercises):
-        """批量预测答案（基于当前知识状态）"""
-        predicted_answers = []
-        for i, rec in enumerate(selected_exercises):
-            if rec < knowledge_state.size(1):
-                prob = knowledge_state[i, rec].item()
-                # 使用0.5作为阈值
-                answer = 1 if prob > 0.5 else 0
-            else:
-                answer = 0  # 默认答错
-            predicted_answers.append(answer)
-        return predicted_answers
-
-    def _get_model_predictions_batch(self, state, selected_exercises):
-        """获取模型对推荐资源的预测概率"""
-        batch_size = len(selected_exercises)
-        model_predictions = []
-
-        if 'pred' in state:
-            pred_probs = state['pred']  # [batch, seq_len, num_skills]
-
-            for i in range(batch_size):
-                # 获取最后一个时间步的预测概率
-                last_step_pred = pred_probs[i, -1, :] if pred_probs.dim() == 3 else pred_probs[i]
-
-                # 转换为概率分布
-                if isinstance(last_step_pred, torch.Tensor):
-                    probs = torch.softmax(last_step_pred, dim=0).cpu().tolist()
-                else:
-                    probs = last_step_pred.tolist()
-
-                model_predictions.append(probs)
-        else:
-            # 如果没有预测数据，使用均匀分布
-            num_skills = self.base_model.n_node
-            uniform_probs = [1.0 / num_skills] * num_skills
-            model_predictions = [uniform_probs] * batch_size
-
-        return model_predictions
-
     def _calculate_final_quality_bonus(self):
         """计算最终质量奖励"""
         if self.metrics_evaluator is None:
@@ -1156,6 +929,13 @@ class EnhancedLearningPathEnv(LearningPathEnv):
         for i in range(self.batch_size):
             # 获取轨迹数据
             trajectory_data = self.trajectory_manager.get_trajectory_data(i)
+
+            # 补全知识状态后
+            # 注意：这里需要从all_knowledge_states中获取完整的知识状态
+            # 简化处理：使用当前状态作为最终知识状态
+            if len(self.all_knowledge_states) > 0:
+                knowledge_after = self.all_knowledge_states[-1][i].cpu().detach()
+                trajectory_data['knowledge_after'] = [knowledge_after] * len(trajectory_data['recommended_path'])
 
             # 评估轨迹
             metrics = self.metrics_evaluator.evaluate_trajectory(trajectory_data)
@@ -1194,7 +974,6 @@ class EnhancedLearningPathEnv(LearningPathEnv):
 
                     # 由于immediate_rewards是当前步骤的奖励，我们需要将最终奖励
                     # 分配到历史步骤。这里我们简化处理，将总奖励加到当前步骤
-                    # （实际应该修改PPO训练器来存储历史奖励）
                     total_bonus = bonus_per_step.sum()
                     mixed_rewards[i] += total_bonus
 
@@ -1210,6 +989,83 @@ class EnhancedLearningPathEnv(LearningPathEnv):
                     })
 
         return mixed_rewards
+
+    def _calculate_final_quality_bonus_simple(self):
+        """
+        计算最终路径质量奖励（简化版）
+        使用Metrics模块评估整条推荐路径
+        """
+        batch_size = self.batch_size
+
+        # 1. 获取完整序列
+        full_sequences = []
+        original_seqs = self.original_tgt.cpu().numpy() if self.original_tgt is not None else []
+
+        for i in range(batch_size):
+            # 原始历史 + 推荐路径
+            original_len = len(original_seqs[i]) if i < len(original_seqs) else 0
+            full_seq = list(original_seqs[i]) + self.paths[i] if original_len > 0 else self.paths[i]
+            full_sequences.append(full_seq)
+
+        # 2. 使用预训练模型获取知识状态（用于有效性计算）
+        # 这里需要重新运行模型获取完整的知识状态序列
+        with torch.no_grad():
+            batch_histories = torch.stack(self.histories)
+
+            # 运行模型获取预测和知识状态
+            pred, pred_res, kt_mask, knowledge_state, hidden, status_emb = self.base_model(
+                batch_histories,
+                self.original_tgt_timestamp,
+                self.original_tgt_idx,
+                self.extended_ans,
+                self.original_graph,
+                self.original_hypergraph_list
+            )
+            self.all_knowledge_states.append(knowledge_state)
+
+        # 3. 转换为numpy用于Metrics计算
+        pred_np = pred.cpu().numpy()
+        knowledge_state_np = knowledge_state.cpu().numpy()
+
+        # 4. 计算各项指标（简化版，实际应调用Metrics中的方法）
+        quality_scores = torch.zeros(batch_size, device=batch_histories.device)
+
+        for i in range(batch_size):
+            # 有效性：知识状态提升
+            if knowledge_state_np.shape[1] > 1:
+                # 计算平均知识增益
+                initial_knowledge = knowledge_state_np[i, len(original_seqs[i]) - 1, :]
+                final_knowledge = knowledge_state_np[i, -1, :]
+                knowledge_gain = np.mean(np.maximum(final_knowledge - initial_knowledge, 0))
+                validity_score = knowledge_gain / (1.0 - initial_knowledge.mean() + 1e-8)
+            else:
+                validity_score = 0.0
+
+            # 多样性：路径中独特知识点比例
+            unique_exercises = len(set(self.paths[i]))
+            total_exercises = len(self.paths[i])
+            diversity_score = unique_exercises / total_exercises if total_exercises > 0 else 0.0
+
+            # 适应性：平均难度匹配度（简化计算）
+            adaptivity_score = 0.0
+            if hasattr(self, 'difficulty_data') and self.difficulty_data:
+                for exercise in self.paths[i]:
+                    if exercise in self.idx2u and self.idx2u[exercise] in self.difficulty_data:
+                        # 这里需要更精确的适应性计算，简化处理
+                        adaptivity_score += 0.5  # 简化：假设中等适应性
+                adaptivity_score = adaptivity_score / total_exercises if total_exercises > 0 else 0.0
+
+            # 组合最终质量分数
+            final_quality = (
+                    self.reward_weights['validity'] * validity_score +
+                    self.reward_weights['diversity'] * diversity_score +
+                    self.reward_weights['adaptivity'] * adaptivity_score
+            )
+
+            quality_scores[i] = final_quality
+
+        return quality_scores
+
 
 class PolicyNetwork(nn.Module):
     """
@@ -1263,29 +1119,29 @@ class PolicyNetwork(nn.Module):
         # 验证输入张量维度
         assert knowledge_state.dim() == 2, f"knowledge_state should be 2D, got {knowledge_state.dim()}D: {knowledge_state.shape}"
         assert candidate_features.dim() == 3, f"candidate_features should be 3D, got {candidate_features.dim()}D: {candidate_features.shape}"
-        
+
         batch_size = knowledge_state.size(0)  # scalar
-        
+
         # 编码知识状态 - [batch_size, hidden_dim]
         knowledge_encoded = self.knowledge_encoder(knowledge_state)
-        
+
         # 验证编码后的张量维度
         assert knowledge_encoded.dim() == 2, f"knowledge_encoded should be 2D, got {knowledge_encoded.dim()}D: {knowledge_encoded.shape}"
-        
+
         # 确保知识状态编码后的维度是正确的hidden_dim
         # 扩展知识编码以匹配候选数量 - [batch_size, topk, hidden_dim]
         knowledge_encoded_expanded = knowledge_encoded.unsqueeze(1).expand(-1, candidate_features.size(1), -1)
-        
+
         # 验证扩展后的张量维度
         assert knowledge_encoded_expanded.dim() == 3, f"knowledge_encoded_expanded should be 3D, got {knowledge_encoded_expanded.dim()}D: {knowledge_encoded_expanded.shape}"
-        
+
         # 编码候选特征 - [batch_size, topk, hidden_dim]
         candidate_encoded = self.candidate_encoder(candidate_features)
-        
+
         # 确保张量维度正确，用于注意力机制
         # 验证所有张量的最后一个维度（嵌入维度）是否一致
         expected_dim = self.attention.embed_dim  # 应该是128
-        
+
         # 确保张量维度正确
         if candidate_encoded.size(-1) != expected_dim:
             # 如果最后一个维度不匹配，进行线性变换或切片
@@ -1294,37 +1150,40 @@ class PolicyNetwork(nn.Module):
                 candidate_encoded = candidate_encoded[..., :expected_dim]
             else:
                 # 如果维度太小，需要扩展，但这种情况不太可能
-                raise ValueError(f"Candidate encoded dimension {candidate_encoded.size(-1)} is less than expected {expected_dim}")
-        
+                raise ValueError(
+                    f"Candidate encoded dimension {candidate_encoded.size(-1)} is less than expected {expected_dim}")
+
         if knowledge_encoded_expanded.size(-1) != expected_dim:
             if knowledge_encoded_expanded.size(-1) > expected_dim:
                 knowledge_encoded_expanded = knowledge_encoded_expanded[..., :expected_dim]
             else:
-                raise ValueError(f"Knowledge encoded expanded dimension {knowledge_encoded_expanded.size(-1)} is less than expected {expected_dim}")
-        
+                raise ValueError(
+                    f"Knowledge encoded expanded dimension {knowledge_encoded_expanded.size(-1)} is less than expected {expected_dim}")
+
         # 注意力机制
         # query: candidate_encoded [batch_size, topk, hidden_dim]
-        # key: knowledge_encoded_expanded [batch_size, topk, hidden_dim] 
+        # key: knowledge_encoded_expanded [batch_size, topk, hidden_dim]
         # value: knowledge_encoded_expanded [batch_size, topk, hidden_dim]
         attended, _ = self.attention(
             candidate_encoded,  # query - [batch_size, topk, hidden_dim]
             knowledge_encoded_expanded,  # key - [batch_size, topk, hidden_dim]
-            knowledge_encoded_expanded   # value - [batch_size, topk, hidden_dim]
+            knowledge_encoded_expanded  # value - [batch_size, topk, hidden_dim]
         )
-        
+
         # 拼接原始候选编码和注意力输出 - [batch_size, topk, hidden_dim*2]
         combined = torch.cat([candidate_encoded, attended], dim=-1)
 
         # 计算得分 - [batch_size, topk, 1] -> [batch_size, topk]
         scores = self.score_network(combined).squeeze(-1)
-        
+
         return scores
 
 
 class PPOTrainer:
     """
-    PPO训练器
+    PPO训练器（合并增强功能）
     使用近端策略优化算法训练策略网络
+    支持轨迹分析和奖励混合
     """
 
     def __init__(self, policy_net, env, lr=3e-4, gamma=0.99, clip_epsilon=0.2):
@@ -1341,7 +1200,7 @@ class PPOTrainer:
 
     def collect_trajectory(self, initial_histories, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list):
         """
-        收集一条轨迹（一个批次）
+        收集一条轨迹（一个批次），支持最终质量奖励
         Args:
             initial_histories: [batch_size, history_len] - 初始历史路径
             tgt_timestamp: [batch_size, history_len] - 时间戳
@@ -1365,14 +1224,14 @@ class PPOTrainer:
         # 运行完整轨迹
         step_count = 0
         max_steps = self.env.recommendation_length  # 防止无限循环
-        
+
         while step_count < max_steps:
             # 获取动作概率分布
             with torch.no_grad():
                 # scores: [batch_size, topk] - 候选得分
                 scores = self.policy_net(
-                    state['knowledge_state'],      # [batch_size, num_skills]
-                    state['candidate_features']    # [batch_size, topk, feature_dim]
+                    state['knowledge_state'],  # [batch_size, num_skills]
+                    state['candidate_features']  # [batch_size, topk, feature_dim]
                 )
                 # 动作概率 - [batch_size, topk]
                 action_probs = F.softmax(scores, dim=-1)
@@ -1393,7 +1252,7 @@ class PPOTrainer:
             # 存储转换
             states.append(state)
             actions.append(action)
-            rewards.append(reward) # 混合奖励
+            rewards.append(reward)  # 混合奖励
             log_probs.append(log_prob)
             values.append(state_value)
             dones.append(done)
@@ -1404,24 +1263,45 @@ class PPOTrainer:
             # 检查是否终止
             if torch.all(done):
                 break
-                
+
             step_count += 1
 
         # 构建轨迹
         trajectory = {
             'states': states,
-            'actions': torch.stack(actions),
-            'rewards': torch.stack(rewards),
-            'log_probs': torch.stack(log_probs),
-            'values': torch.stack(values),
-            'dones': torch.stack(dones),
+            'actions': torch.stack(actions) if actions else torch.tensor([]),
+            'rewards': torch.stack(rewards) if rewards else torch.tensor([]),
+            'log_probs': torch.stack(log_probs) if log_probs else torch.tensor([]),
+            'values': torch.stack(values) if values else torch.tensor([]),
+            'dones': torch.stack(dones) if dones else torch.tensor([]),
             'final_quality': getattr(self.env, 'final_quality_scores', [])  # 新增：最终质量分数
         }
+
+        # 分析轨迹质量
+        self._analyze_trajectory_quality(trajectory)
 
         # 存储到缓冲区
         self.buffer.append(trajectory)
 
         return trajectory
+
+    def _analyze_trajectory_quality(self, trajectory):
+        """分析轨迹质量"""
+        if trajectory['final_quality'] is not None and len(trajectory['final_quality']) > 0:
+            avg_final_quality = trajectory['final_quality'].mean().item()
+            avg_immediate_reward = trajectory['rewards'].mean().item() if trajectory['rewards'].numel() > 0 else 0
+
+            print(f"轨迹分析: 最终质量={avg_final_quality:.4f}, "
+                  f"平均即时奖励={avg_immediate_reward:.4f}, "
+                  f"总奖励={avg_final_quality + avg_immediate_reward:.4f}")
+
+            # 记录奖励分配详情
+            if hasattr(self.env, 'reward_allocation_history'):
+                for allocation in self.env.reward_allocation_history:
+                    print(f"  批次{allocation['batch_idx']}: "
+                          f"轨迹长度={allocation['traj_len']}, "
+                          f"最终质量={allocation['final_quality']:.4f}, "
+                          f"总奖励加成={allocation['total_bonus']:.4f}")
 
     def compute_advantages(self, rewards, values, dones):
         """
@@ -1472,7 +1352,7 @@ class PPOTrainer:
         rewards = trajectory['rewards']
         old_values = trajectory['values']
         dones = trajectory['dones']
-        
+
         # 确保所有张量都在同一设备上
         device = self.policy_net.parameters().__next__().device
         rewards = rewards.to(device)
@@ -1497,11 +1377,11 @@ class PPOTrainer:
             # 确保每个state的knowledge_state是2维的 [batch_size, knowledge_dim]
             knowledge_state = state['knowledge_state'].to(device)
             candidate_features = state['candidate_features'].to(device)
-            
+
             # 验证张量维度
             assert knowledge_state.dim() == 2, f"knowledge_state should be 2D, got {knowledge_state.dim()}D: {knowledge_state.shape}"
             assert candidate_features.dim() == 3, f"candidate_features should be 3D, got {candidate_features.dim()}D: {candidate_features.shape}"
-            
+
             batch_states.append(knowledge_state)
             batch_candidate_features.append(candidate_features)
 
@@ -1510,19 +1390,19 @@ class PPOTrainer:
         batch_states = torch.stack(batch_states)
         # batch_candidate_features: [num_steps, batch_size, topk, feature_dim]
         batch_candidate_features = torch.stack(batch_candidate_features)
-        
+
         # 获取维度信息
         num_steps, batch_size = batch_states.size(0), batch_states.size(1)
         topk, feature_dim = batch_candidate_features.size(2), batch_candidate_features.size(3)
         knowledge_dim = batch_states.size(2)
-        
+
         # 重塑张量以适应策略网络的输入要求
         # 将 [num_steps, batch_size, ...] 重塑为 [num_steps * batch_size, ...]
         # batch_states: [num_steps * batch_size, knowledge_dim]
         batch_states = batch_states.view(-1, knowledge_dim)
         # batch_candidate_features: [num_steps * batch_size, topk, feature_dim]
         batch_candidate_features = batch_candidate_features.view(num_steps * batch_size, topk, feature_dim)
-        
+
         # 验证重塑后的张量维度
         assert batch_states.dim() == 2, f"Reshaped batch_states should be 2D, got {batch_states.dim()}D: {batch_states.shape}"
         assert batch_candidate_features.dim() == 3, f"Reshaped batch_candidate_features should be 3D, got {batch_candidate_features.dim()}D: {batch_candidate_features.shape}"
@@ -1531,14 +1411,15 @@ class PPOTrainer:
         scores = self.policy_net(batch_states, batch_candidate_features)
         # 重塑scores回到 [num_steps, batch_size, topk]
         scores = scores.view(num_steps, batch_size, -1)
-        
+
         # 计算动作概率
         action_probs = F.softmax(scores, dim=-1)  # [num_steps, batch_size, topk]
-        
+
         # 计算新对数概率
         # 使用gather操作来获取对应动作的对数概率
-        new_log_probs = torch.log(action_probs.gather(dim=2, index=actions.unsqueeze(-1))).squeeze(-1)  # [num_steps, batch_size]
-        
+        new_log_probs = torch.log(action_probs.gather(dim=2, index=actions.unsqueeze(-1))).squeeze(
+            -1)  # [num_steps, batch_size]
+
         # 计算熵
         entropy_list = []
         for t in range(num_steps):
@@ -1550,7 +1431,7 @@ class PPOTrainer:
         # new_log_probs: [num_steps, batch_size]
         # old_log_probs: [num_steps, batch_size]
         assert new_log_probs.shape == old_log_probs.shape, f"new_log_probs {new_log_probs.shape} and old_log_probs {old_log_probs.shape} should have same shape"
-        
+
         # 计算比率
         ratios = torch.exp(new_log_probs - old_log_probs)
 
@@ -1578,100 +1459,90 @@ class PPOTrainer:
 
         return total_loss.item()
 
-
-class EnhancedPPOTrainer(PPOTrainer):
-    """
-    增强的PPO训练器，支持轨迹分析和奖励混合
-    """
-
-    def collect_trajectory(self, initial_histories, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list):
+    def analyze_reward_components(self, trajectory):
         """
-        收集轨迹，支持最终质量奖励
+        分析奖励构成，用于监控训练
         """
-        # 重置环境
-        state = self.env.reset(initial_histories, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
+        if 'final_quality' in trajectory and trajectory['final_quality'] and len(trajectory['final_quality']) > 0:
+            print(f"最终质量奖励: {trajectory['final_quality'][-1].mean().item():.4f}")
 
-        states = []
-        actions = []
-        rewards = []
-        log_probs = []
-        values = []
-        dones = []
+        # 计算奖励的各个部分（如果环境记录了）
+        if hasattr(self.env, 'reward_components_history'):
+            components = self.env.reward_components_history[-1]
+            print(f"奖励构成 - 有效性: {components['validity'].mean():.4f}, "
+                  f"适应性: {components['adaptivity'].mean():.4f}, "
+                  f"多样性: {components['diversity'].mean():.4f}, "
+                  f"偏好: {components['preference'].mean():.4f}")
 
-        # 运行完整轨迹
-        step_count = 0
-        max_steps = self.env.recommendation_length
 
-        while step_count < max_steps:
-            # 获取动作概率分布
-            with torch.no_grad():
-                scores = self.policy_net(
-                    state['knowledge_state'],
-                    state['candidate_features']
-                )
-                action_probs = F.softmax(scores, dim=-1)
-                dist = Categorical(action_probs)
+class RLPathOptimizer:
+    """
+    强化学习路径优化器
+    核心逻辑：
+    1. 在每一步，使用完整的当前历史序列调用预训练模型
+    2. 从模型输出的topk候选中选择动作
+    3. 基于多目标奖励优化选择策略
+    """
 
-                action = dist.sample()
-                log_prob = dist.log_prob(action)
-                state_value = torch.mean(scores, dim=-1)
+    def __init__(self, pretrained_model, num_skills, batch_size, recommendation_length=5,
+                 topk=20, data_name=None, graph=None, hypergraph_list=None):
+        self.base_model = pretrained_model  # 预训练模型
+        self.recommendation_length = recommendation_length  # 推荐路径长度
+        self.topk = topk  # 候选集大小
+        self.num_skills = num_skills  # 知识点数量
+        self.batch_size = batch_size
+        self.data_name = data_name  # 数据集名称，用于计算适应性奖励
 
-            # 执行动作
-            next_state, reward, done = self.env.step(action)
+        # 冻结预训练模型
+        for param in self.base_model.parameters():
+            param.requires_grad = False
 
-            # 记录转换
-            states.append(state)
-            actions.append(action)
-            rewards.append(reward)
-            log_probs.append(log_prob)
-            values.append(state_value)
-            dones.append(done)
+        # 构建策略网络（动作选择器）
+        self.policy_net = self._build_policy_network()
 
-            # 更新状态
-            state = next_state
+        # 将策略网络移动到与预训练模型相同的设备
+        if next(self.base_model.parameters()).is_cuda:
+            device = next(self.base_model.parameters()).device
+            self.policy_net = self.policy_net.to(device)
+            print(f"策略网络已移动到设备: {device}")
+        else:
+            print("预训练模型在CPU上，策略网络保持在CPU")
 
-            # 检查是否终止
-            if torch.all(done):
-                break
+        # 构建环境，传入图数据
+        self.env = LearningPathEnv(
+            batch_size=self.batch_size,
+            base_model=self.base_model,
+            policy_net=self.policy_net,
+            recommendation_length=self.recommendation_length,
+            topk=self.topk,
+            data_name=self.data_name,
+            graph=graph,  # 传入图数据
+            hypergraph_list=hypergraph_list  # 传入超图数据
+        )
 
-            step_count += 1
+        self.trainer = PPOTrainer(
+            policy_net=self.policy_net,
+            env=self.env,
+            lr=3e-4,
+            gamma=0.99,
+            clip_epsilon=0.2)
 
-        # 构建轨迹（包含最终质量信息）
-        trajectory = {
-            'states': states,
-            'actions': torch.stack(actions) if actions else torch.tensor([]),
-            'rewards': torch.stack(rewards) if rewards else torch.tensor([]),
-            'log_probs': torch.stack(log_probs) if log_probs else torch.tensor([]),
-            'values': torch.stack(values) if values else torch.tensor([]),
-            'dones': torch.stack(dones) if dones else torch.tensor([]),
-            'final_quality': getattr(self.env, 'final_quality_scores', None)
-        }
+    def _build_policy_network(self):
+        """构建策略网络实例"""
+        # 确定网络参数
+        knowledge_dim = self.num_skills  # 知识状态维度
+        candidate_feature_dim = 5  # 候选特征维度（可配置）
 
-        # 分析轨迹质量
-        self._analyze_trajectory_quality(trajectory)
+        # 创建策略网络
+        policy_net = PolicyNetwork(
+            knowledge_dim=knowledge_dim,
+            candidate_feature_dim=candidate_feature_dim,
+            hidden_dim=128,  # 隐藏层维度
+            topk=self.topk  # 候选数量
+        )
 
-        # 存储到缓冲区
-        self.buffer.append(trajectory)
+        return policy_net
 
-        return trajectory
-
-    def _analyze_trajectory_quality(self, trajectory):
-        """分析轨迹质量"""
-        if trajectory['final_quality'] is not None:
-            avg_final_quality = trajectory['final_quality'].mean().item()
-            avg_immediate_reward = trajectory['rewards'].mean().item() if trajectory['rewards'].numel() > 0 else 0
-
-            print(f"轨迹分析: 最终质量={avg_final_quality:.4f}, "
-                  f"平均即时奖励={avg_immediate_reward:.4f}, "
-                  f"总奖励={avg_final_quality + avg_immediate_reward:.4f}")
-
-            # 记录奖励分配详情
-            if hasattr(self.env, 'reward_allocation_history'):
-                for allocation in self.env.reward_allocation_history:
-                    print(f"  批次{allocation['batch_idx']}: "
-                          f"轨迹长度={allocation['traj_len']}, "
-                          f"最终质量={allocation['final_quality']:.4f}, "
-                          f"总奖励加成={allocation['total_bonus']:.4f}")
 
 def evaluate_policy(env, policy_net, test_data_loader, relation_graph, hypergraph_list, num_episodes=10):
     """
@@ -1782,92 +1653,83 @@ def evaluate_path_metrics(rl_recommender, test_data_loader, data_name):
         for batch_idx, batch in enumerate(test_data_loader):
             if batch_idx >= 5:  # 只评估前几个批次以节省时间
                 break
-                
+
             # 获取批次数据
             tgt, tgt_timestamp, tgt_idx, ans = (item.cuda() for item in batch)
-            
+
             # 使用RL策略生成推荐路径
             recommended_paths, _ = rl_recommender.batch_recommend(tgt, deterministic=True)
-            
+
             # 将推荐路径与原始序列拼接以获取完整序列
             full_sequences = torch.cat([tgt, recommended_paths], dim=1)
             full_answers = torch.cat([ans, torch.zeros_like(recommended_paths)], dim=1)
-            
+
             # 使用预训练模型获取知识状态和预测结果
             env = rl_recommender.rl_optimizer.env
             with torch.no_grad():
                 pred, pred_res, kt_mask, knowledge_state, hidden = env.base_model(
-                    full_sequences, tgt_timestamp, tgt_idx, full_answers, 
+                    full_sequences, tgt_timestamp, tgt_idx, full_answers,
                     env.original_graph, env.original_hypergraph_list
                 )
-            
+
             # 将数据转换为numpy以便使用Metrics函数
             pred_np = pred.cpu().numpy()
             knowledge_state_np = knowledge_state.cpu().numpy()
             recommended_paths_np = recommended_paths.cpu().numpy()
             full_sequences_np = full_sequences.cpu().numpy()
             full_answers_np = full_answers.cpu().numpy()
-            
+
             # 使用Metrics函数计算各项指标
             # 这里我们使用generate_topk_sequence来生成topk序列用于多样性计算
             topk_sequence = metric.generate_topk_sequence(
-                pred_np, full_sequences_np.flatten(), 
+                pred_np, full_sequences_np.flatten(),
                 full_sequences.size(0), full_sequences.size(1), topnum=5
             ).cpu().numpy()
-            
+
             # 计算有效性
             # 需要获取yt_before和yt_after，这里我们使用知识状态
             if knowledge_state.dim() == 3:
                 yt_before = knowledge_state[:, :-1, :]  # [batch_size, seq_len-1, num_skills]
-                yt_after = knowledge_state[:, 1:, :]    # [batch_size, seq_len-1, num_skills]
+                yt_after = knowledge_state[:, 1:, :]  # [batch_size, seq_len-1, num_skills]
             else:
                 yt_before = knowledge_state
                 yt_after = knowledge_state
-            
+
             validity_score = metric.compute_effectiveness(
-                full_sequences_np, 
-                yt_before.cpu().numpy(), 
-                yt_after.cpu().numpy(), 
+                full_sequences_np,
+                yt_before.cpu().numpy(),
+                yt_after.cpu().numpy(),
                 topk_sequence
             )
-            
+
             all_validity_scores.append(validity_score)
-            
+
             # 计算适应性
             adaptivity_score = metric.calculate_adaptivity(
-                full_sequences_np, 
-                full_answers_np, 
-                topk_sequence, 
+                full_sequences_np,
+                full_answers_np,
+                topk_sequence,
                 data_name
             )
             all_adaptivity_scores.append(adaptivity_score)
-            
+
             # 计算多样性
             diversity_score = metric.calculate_diversity(
-                full_sequences_np, 
-                topk_sequence, 
-                hidden, 
-                full_sequences.size(0), 
-                full_sequences.size(1), 
+                full_sequences_np,
+                topk_sequence,
+                hidden,
+                full_sequences.size(0),
+                full_sequences.size(1),
                 5  # topnum
             )
             all_diversity_scores.append(diversity_score)
 
     avg_validity = np.mean(all_validity_scores) if all_validity_scores else 0
-    avg_validity = np.mean(all_validity_scores) if all_validity_scores else 0
     avg_adaptivity = np.mean(all_adaptivity_scores) if all_adaptivity_scores else 0
     avg_diversity = np.mean(all_diversity_scores) if all_diversity_scores else 0
-    
+
     return {
         'validity': avg_validity,
         'adaptivity': avg_adaptivity,
         'diversity': avg_diversity
     }
-
-
-# 使用示例
-if __name__ == "__main__":
-    # 示例：如何使用强化学习路径优化器
-    # 注意：这只是一个示例框架，实际使用时需要加载训练好的MSHGAT模型
-    
-
