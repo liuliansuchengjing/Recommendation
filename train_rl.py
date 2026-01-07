@@ -13,6 +13,79 @@ from dataLoader import Split_data, DataLoader
 from graphConstruct import ConRelationGraph, ConHyperGraphList
 
 from rl_adjuster import PolicyNetwork, LearningPathEnv, PPOTrainer
+import Constants
+from torch.distributions import Categorical
+
+def evaluate_and_print(policy_net, env, data_loader, device, max_batches=10):
+    policy_net.eval()
+    all_eff, all_ada, all_div, all_pref, all_fq = [], [], [], [], []
+
+    with torch.no_grad():
+        for b_idx, batch in enumerate(data_loader):
+            if b_idx >= max_batches:
+                break
+            tgt, tgt_timestamp, tgt_idx, ans = (x.to(device) for x in batch)
+
+            # 用确定性策略跑一条轨迹
+            rewards, log_probs, entropies = env_runner(policy_net, env, tgt, tgt_timestamp, tgt_idx, ans, deterministic=True)
+
+            m = env.compute_final_metrics()
+            all_eff.append(m["effectiveness"].detach().cpu())
+            all_ada.append(m["adaptivity"].detach().cpu())
+            all_div.append(m["diversity"].detach().cpu())
+            all_pref.append(m["preference"].detach().cpu())
+            all_fq.append(m["final_quality"].detach().cpu())
+
+    def _cat_mean(xs):
+        x = torch.cat(xs) if xs else torch.tensor([0.0])
+        return float(x.mean().item())
+
+    print("\n[Evaluation Metrics on Recommended Paths]")
+    print(f"  effectiveness: {_cat_mean(all_eff):.4f}")
+    print(f"  adaptivity:    {_cat_mean(all_ada):.4f}")
+    print(f"  diversity:     {_cat_mean(all_div):.4f}")
+    print(f"  preference:    {_cat_mean(all_pref):.4f}")
+    print(f"  final_quality: {_cat_mean(all_fq):.4f}")
+
+    policy_net.train()
+
+
+def env_runner(policy_net, env, tgt, tgt_timestamp, tgt_idx, ans, deterministic=True):
+    # 复用 PPOTrainer.collect_trajectory 的逻辑，但不更新参数
+    # 这里直接实例化一个临时 trainer 也行；为了最少改动，我们写个轻量 runner
+    state = env.reset(tgt, tgt_timestamp, tgt_idx, ans)
+    rewards, log_probs, entropies = [], [], []
+    B = tgt.size(0)
+    device = tgt.device
+
+    for _ in range(env.recommendation_length):
+        cand_probs = state["cand_probs"]
+        cand_ids = state["cand_ids"]
+        cand_feat = cand_probs.unsqueeze(-1)
+
+        logits = policy_net(state["knowledge_state"], cand_feat)
+        dist = Categorical(logits=logits)
+        action_index = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
+
+        log_probs.append(dist.log_prob(action_index))
+        entropies.append(dist.entropy())
+
+        chosen_item = cand_ids.gather(1, action_index.view(-1,1)).squeeze(1)
+
+        topn = env.metrics_topnum
+        step_topk = torch.full((B, topn), Constants.PAD, device=device, dtype=cand_ids.dtype)
+        step_topk[:, 0] = chosen_item
+        for k in range(1, topn):
+            alt = cand_ids[:, k] if k < cand_ids.size(1) else cand_ids[:, 0]
+            if k < cand_ids.size(1) - 1:
+                alt2 = cand_ids[:, k+1]
+                alt = torch.where(alt == chosen_item, alt2, alt)
+            step_topk[:, k] = alt
+
+        state, step_reward, done = env.step(chosen_item, step_topk)
+        rewards.append(step_reward)
+
+    return rewards, log_probs, entropies
 
 
 def train_rl_model(
@@ -45,8 +118,8 @@ def train_rl_model(
         data_name=data_path,
         graph=graph,
         hypergraph_list=hypergraph_list,
-        policy_topk=topk,  # ✅ 确保 env 候选数与 policy.topk 一致
-        metrics_topnum=1,
+        policy_topk=topk,  #  确保 env 候选数与 policy.topk 一致
+        metrics_topnum=2,
         metrics_T=5,
     )
 
@@ -86,11 +159,9 @@ def train_rl_model(
             tgt_idx = tgt_idx.to(device)
             ans = ans.to(device)
 
-            states_k, actions, rewards, log_probs, entropies = trainer.collect_trajectory(
-                tgt, tgt_timestamp, tgt_idx, ans
-            )
+            rewards, log_probs, entropies = trainer.collect_trajectory(tgt, tgt_timestamp, tgt_idx, ans)
+            loss = trainer.update_policy(rewards, log_probs, entropies)
 
-            loss = trainer.update_policy(states_k, actions, rewards, log_probs, entropies)
             epoch_losses.append(loss)
 
             step_reward = torch.stack(rewards).mean().item()
@@ -117,6 +188,8 @@ def train_rl_model(
         )
 
     print("强化学习训练完成")
+    evaluate_and_print(policy_net, env, valid, device, max_batches=20)
+
     return policy_net, stats
 
 
@@ -136,7 +209,7 @@ def run_training_with_pretrained_model(data_path="MOO", model_path=None):
     parser.add_argument("-pos_emb", type=bool, default=True)
     opt = parser.parse_args([])
 
-    # ✅ 关键：MSHGAT 需要 d_word_vec
+    #  关键：MSHGAT 需要 d_word_vec
     opt.d_word_vec = opt.d_model
 
     # load data + set user_size（MSHGAT 也需要 opt.user_size）
@@ -178,3 +251,5 @@ def run_training_with_pretrained_model(data_path="MOO", model_path=None):
 
 if __name__ == "__main__":
     run_training_with_pretrained_model()
+
+

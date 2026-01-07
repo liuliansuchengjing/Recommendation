@@ -1,18 +1,4 @@
 # rl_adjuster.py
-"""
-A minimal RL adjuster (policy gradient) compatible with the "new-interface" train_rl.py:
-- PolicyNetwork
-- LearningPathEnv
-- PPOTrainer
-
-Key fixes:
-1) Action is an index within per-step candidate list (topk), then mapped to a real item id.
-2) Final reward uses Metrics.combined_metrics trajectory-level logic. To provide per-sample learning
-   signal, compute Metrics per-sample (batch_size=1) without modifying Metrics.py.
-3) Safe padding for timestamp/idx: only pad if they are 2D+ sequence tensors.
-4) update_policy uses REINFORCE + baseline (avoid z-score that can shrink gradients to ~0).
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -77,25 +63,6 @@ def _reshape_pred_flat(pred_flat: torch.Tensor, batch_size: int, steps: int) -> 
     return pred_flat.view(batch_size, steps, -1)
 
 
-def _build_topk_sequence(history_len: int, rec_paths: list, seq_len_full: int, topnum: int):
-    """
-    Build python list topk_sequence of shape [seq_len_full-1, <=topnum] for ONE sample.
-    - history steps -> []
-    - rec steps -> [item]
-    Metrics.combined_metrics will internally pad with PAD to topnum.
-    """
-    seq_steps = seq_len_full - 1
-    topk_seq = []
-    hist_offset = history_len - 1
-    for t in range(seq_steps):
-        rec_t = t - hist_offset
-        if 0 <= rec_t < len(rec_paths):
-            topk_seq.append([int(rec_paths[rec_t])])
-        else:
-            topk_seq.append([])
-    return topk_seq
-
-
 # ======================================================
 # Learning Path Environment
 # ======================================================
@@ -103,8 +70,12 @@ class LearningPathEnv:
     """
     Vectorized (batch) environment:
     - reset(...) takes a batch of student histories.
-    - step(chosen_item_ids) appends items to each student's path and re-runs base_model to get new state.
-    - state includes: knowledge_state, cand_ids, cand_probs (used by policy).
+    - step(chosen_item_ids, step_topk_items) appends to each student's path.
+    - state includes candidate list to allow "action_index -> real item id" mapping.
+
+    IMPORTANT:
+    - For Metrics.diversity, topnum must be >=2; we keep metrics_topnum=2 by default,
+      and record per-step top-2 recommendations as [chosen, alt].
     """
     def __init__(
         self,
@@ -115,7 +86,7 @@ class LearningPathEnv:
         graph=None,
         hypergraph_list=None,
         policy_topk: int = 10,
-        metrics_topnum: int = 1,
+        metrics_topnum: int = 2,
         metrics_T: int = 5,
     ):
         self.batch_size = int(batch_size)
@@ -125,12 +96,10 @@ class LearningPathEnv:
         self.graph = graph
         self.hypergraph_list = hypergraph_list
 
-        # candidate set size for policy actions
         self.policy_topk = int(policy_topk)
 
-        # Metrics params (topnum should match how many items you "recommend per step"
-        # RL here recommends 1 item per step, so topnum=1 is correct.)
-        self.metrics_topnum = int(metrics_topnum)
+        # MUST be >=2 for diversity in Metrics.combined_metrics
+        self.metrics_topnum = max(2, int(metrics_topnum))
         self.metrics_T = int(metrics_T)
 
         self.metric = Metrics()
@@ -158,7 +127,8 @@ class LearningPathEnv:
         self.original_tgt_idx = None
         self.original_ans = None
 
-        self.paths = None
+        self.paths = None               # chosen-only path: List[List[int]]
+        self.topk_recs = None           # per-step Top-N: List[List[List[int]]]
         self.current_step = 0
 
         # caches from last forward
@@ -175,8 +145,6 @@ class LearningPathEnv:
         steps = seq_len - 1
 
         with torch.no_grad():
-            # HGAT.MSHGAT forward returns:
-            # pred_flat, pred_res, kt_mask, yt, hidden, status_emb
             pred_flat, _, _, yt, hidden, *_ = self.base_model(
                 seq, timestamp, idx, ans, self.graph, self.hypergraph_list
             )
@@ -213,23 +181,31 @@ class LearningPathEnv:
         self.original_ans = ans
 
         self.paths = [[] for _ in range(B)]
+        self.topk_recs = [[] for _ in range(B)]
         self.current_step = 0
 
         self._forward_base(tgt, tgt_timestamp, tgt_idx, ans)
         return self._make_state_from_last()
 
-    def step(self, chosen_item_ids: torch.Tensor):
+    def step(self, chosen_item_ids: torch.Tensor, step_topk_items: torch.Tensor):
         """
         chosen_item_ids: LongTensor [B] real item ids.
+        step_topk_items: LongTensor [B, metrics_topnum] for Metrics (Top-N at this step).
         """
         B = chosen_item_ids.size(0)
         device = chosen_item_ids.device
 
-        # 1) update paths
+        # 1) update chosen paths
         for i in range(B):
             self.paths[i].append(int(chosen_item_ids[i].item()))
 
-        # 2) build extended inputs
+        # 2) record step Top-N recs for Metrics
+        # ensure python list with ints
+        for i in range(B):
+            recs = step_topk_items[i].tolist()
+            self.topk_recs[i].append([int(x) for x in recs])
+
+        # 3) build extended inputs
         ext_len = len(self.paths[0])
         path_tensor = torch.tensor(self.paths, device=device, dtype=self.original_tgt.dtype)  # [B, ext_len]
         ext_tgt = torch.cat([self.original_tgt, path_tensor], dim=1)
@@ -240,13 +216,13 @@ class LearningPathEnv:
         pad_ans = torch.zeros(B, ext_len, device=device, dtype=self.original_ans.dtype)
         ext_ans = torch.cat([self.original_ans, pad_ans], dim=1)
 
-        # 3) forward base model for new state
+        # 4) forward base model for new state
         self._forward_base(ext_tgt, ext_timestamp, ext_idx, ext_ans)
 
-        # 4) step reward (shaping)
+        # 5) step reward (shaping)
         step_reward = self._compute_step_reward(chosen_item_ids)
 
-        # 5) done
+        # 6) done
         self.current_step += 1
         done = torch.zeros(B, dtype=torch.bool, device=device)
         if self.current_step >= self.recommendation_length:
@@ -265,27 +241,34 @@ class LearningPathEnv:
         for i in range(B):
             item = int(chosen_item_ids[i].item())
 
+            # preference
             if 0 <= item < pred_probs_last.size(1):
                 reward[i] += self.step_weights["preference"] * pred_probs_last[i, item]
 
+            # repeat penalty
             if item in self.paths[i][:-1]:
                 reward[i] -= self.step_weights["diversity"]
 
+            # difficulty proxy
             if 0 <= item < knowledge_last.size(1):
                 k = knowledge_last[i, item]
                 reward[i] += self.step_weights["difficulty"] * (1 - torch.abs(k - 0.5))
 
         return reward
 
-    def compute_final_reward(self) -> torch.Tensor:
+    # ---------------- Metrics outputs ----------------
+    def compute_final_metrics(self):
         """
-        Final reward aligned with Metrics.combined_metrics.
+        Return per-sample metrics tensors:
+          effectiveness, adaptivity, diversity, preference, final_quality
 
-        IMPORTANT: combined_metrics aggregates over a batch. To provide per-sample learning signal,
-        we compute metrics PER SAMPLE (batch_size=1). This is slower but correct and avoids modifying Metrics.py.
+        Uses Metrics.combined_metrics per-sample (batch_size=1) to ensure reward depends on each path.
         """
         if self.original_tgt is None:
-            return torch.zeros(self.batch_size)
+            z = torch.zeros(self.batch_size)
+            return {
+                "effectiveness": z, "adaptivity": z, "diversity": z, "preference": z, "final_quality": z
+            }
 
         device = self.original_tgt.device
         B = self.batch_size
@@ -293,37 +276,50 @@ class LearningPathEnv:
         rec_len = self.recommendation_length
         hist_len = self.original_tgt.size(1)
         seq_len_full = hist_len + rec_len
-        steps_full = seq_len_full - 1
 
-        final_reward = torch.zeros(B, device=device)
+        eff_t = torch.zeros(B, device=device)
+        ada_t = torch.zeros(B, device=device)
+        div_t = torch.zeros(B, device=device)
+        pref_t = torch.zeros(B, device=device)
+        fq_t = torch.zeros(B, device=device)
 
         for i in range(B):
             orig_seq_i = self.original_tgt[i].detach().cpu().tolist()
             orig_ans_i = self.original_ans[i].detach().cpu().tolist()
-            rec_i = self.paths[i]
 
-            full_seq_i = orig_seq_i + rec_i
-            full_ans_i = orig_ans_i + [0] * len(rec_i)
+            rec_chosen_i = self.paths[i]
+            rec_topk_i = self.topk_recs[i]  # list length rec_len, each is list length metrics_topnum
 
-            topk_seq_i = _build_topk_sequence(
-                history_len=hist_len,
-                rec_paths=rec_i,
-                seq_len_full=seq_len_full,
-                topnum=self.metrics_topnum,
-            )
-            topk_sequence = [topk_seq_i]  # batch_size=1
+            full_seq_i = orig_seq_i + rec_chosen_i
+            full_ans_i = orig_ans_i + [0] * len(rec_chosen_i)
+
+            # build topk_sequence for Metrics: [1, seq_len-1, topnum]
+            # history steps -> []
+            # rec steps -> stored Top-N list
+            seq_steps = seq_len_full - 1
+            hist_offset = hist_len - 1
+            topk_seq_steps = []
+            for t in range(seq_steps):
+                rec_t = t - hist_offset
+                if 0 <= rec_t < len(rec_topk_i):
+                    # ensure length == metrics_topnum
+                    recs = rec_topk_i[rec_t][:self.metrics_topnum]
+                    if len(recs) < self.metrics_topnum:
+                        recs = recs + [Constants.PAD] * (self.metrics_topnum - len(recs))
+                    topk_seq_steps.append(recs)
+                else:
+                    topk_seq_steps.append([])
+            topk_sequence = [topk_seq_steps]
 
             seq_tensor = torch.tensor([full_seq_i], device=device, dtype=self.original_tgt.dtype)
             ans_tensor = torch.tensor([full_ans_i], device=device, dtype=self.original_ans.dtype)
 
             ts_i = self.original_tgt_timestamp[i:i+1] if self.original_tgt_timestamp is not None else None
             idx_i = self.original_tgt_idx[i:i+1] if self.original_tgt_idx is not None else None
-            ts_i = _pad_and_concat_like(ts_i, len(rec_i), pad_value=0)
-            idx_i = _pad_and_concat_like(idx_i, len(rec_i), pad_value=0)
+            ts_i = _pad_and_concat_like(ts_i, len(rec_chosen_i), pad_value=0)
+            idx_i = _pad_and_concat_like(idx_i, len(rec_chosen_i), pad_value=0)
 
             pred_probs_1, yt_1, hidden = self._forward_base(seq_tensor, ts_i, idx_i, ans_tensor)
-            # pred_probs_1: [1, steps_full, num_skills]
-            # yt_1:        [1, steps_full, num_skills]
 
             yt_before = yt_1
             yt_after = torch.zeros_like(yt_before)
@@ -332,7 +328,7 @@ class LearningPathEnv:
 
             pred_probs_flat = pred_probs_1.reshape(-1, pred_probs_1.size(-1)).detach().cpu().numpy()
 
-            metrics = self.metric.combined_metrics(
+            m = self.metric.combined_metrics(
                 yt_before=yt_before,
                 yt_after=yt_after,
                 topk_sequence=topk_sequence,
@@ -342,19 +338,37 @@ class LearningPathEnv:
                 batch_size=1,
                 seq_len=seq_len_full,
                 pred_probs=pred_probs_flat,
-                topnum=self.metrics_topnum,
+                topnum=self.metrics_topnum,   # ✅ >=2 now
                 T=self.metrics_T,
             )
 
-            r = (
-                self.final_weights["effectiveness"] * float(metrics.get("effectiveness", 0.0))
-                + self.final_weights["adaptivity"] * float(metrics.get("adaptivity", 0.0))
-                + self.final_weights["diversity"] * float(metrics.get("diversity", 0.0))
-                + self.final_weights["preference"] * float(metrics.get("preference", 0.0))
-            )
-            final_reward[i] = r
+            eff = float(m.get("effectiveness", 0.0))
+            ada = float(m.get("adaptivity", 0.0))
+            div = float(m.get("diversity", 0.0))
+            pref = float(m.get("preference", 0.0))
 
-        return final_reward
+            eff_t[i] = eff
+            ada_t[i] = ada
+            div_t[i] = div
+            pref_t[i] = pref
+
+            fq_t[i] = (
+                self.final_weights["effectiveness"] * eff
+                + self.final_weights["adaptivity"] * ada
+                + self.final_weights["diversity"] * div
+                + self.final_weights["preference"] * pref
+            )
+
+        return {
+            "effectiveness": eff_t,
+            "adaptivity": ada_t,
+            "diversity": div_t,
+            "preference": pref_t,
+            "final_quality": fq_t,
+        }
+
+    def compute_final_reward(self) -> torch.Tensor:
+        return self.compute_final_metrics()["final_quality"]
 
 
 # ======================================================
@@ -368,11 +382,9 @@ class PPOTrainer:
         self.entropy_coef = entropy_coef
         self.optimizer = torch.optim.Adam(policy_net.parameters(), lr=lr)
 
-    def collect_trajectory(self, tgt, tgt_timestamp, tgt_idx, ans):
+    def collect_trajectory(self, tgt, tgt_timestamp, tgt_idx, ans, deterministic: bool = False):
         state = self.env.reset(tgt, tgt_timestamp, tgt_idx, ans)
 
-        states_k = []
-        actions_idx = []
         rewards = []
         log_probs = []
         entropies = []
@@ -381,39 +393,57 @@ class PPOTrainer:
         device = tgt.device
 
         for _ in range(self.env.recommendation_length):
-            # Candidate features: use candidate probs as a 1D feature
-            cand_probs = state["cand_probs"]                     # [B, topk]
-            cand_feat = cand_probs.unsqueeze(-1)                 # [B, topk, 1]
+            cand_probs = state["cand_probs"]                 # [B, topk]
+            cand_ids = state["cand_ids"]                     # [B, topk]
+            cand_feat = cand_probs.unsqueeze(-1)             # [B, topk, 1]
 
             logits = self.policy_net(state["knowledge_state"], cand_feat)  # [B, topk]
             dist = Categorical(logits=logits)
 
-            action_index = dist.sample()                         # [B] in [0, topk)
-            log_prob = dist.log_prob(action_index)               # [B]
-            entropy = dist.entropy()                             # [B]
+            if deterministic:
+                action_index = torch.argmax(logits, dim=-1)
+            else:
+                action_index = dist.sample()
 
-            # Map index -> real item id
-            cand_ids = state["cand_ids"]                         # [B, topk]
+            log_prob = dist.log_prob(action_index)
+            entropy = dist.entropy()
+
+            # map index -> chosen item
             chosen_item = cand_ids.gather(1, action_index.view(-1, 1)).squeeze(1)  # [B]
 
-            next_state, step_reward, done = self.env.step(chosen_item)
+            # build Top-2 list for Metrics (chosen + alt)
+            # alt: pick best candidate that is not equal to chosen; fallback to chosen if needed
+            topn = self.env.metrics_topnum
+            # start with first few candidates from cand_ids
+            step_topk = torch.full((B, topn), Constants.PAD, device=device, dtype=cand_ids.dtype)
+            step_topk[:, 0] = chosen_item
 
-            states_k.append(state["knowledge_state"])
-            actions_idx.append(action_index)
+            # fill remaining slots with highest-prob candidates different from already chosen
+            for k in range(1, topn):
+                # choose the first candidate that differs from chosen (or from existing)
+                alt = cand_ids[:, k] if k < cand_ids.size(1) else cand_ids[:, 0]
+                # if equals chosen, try next
+                if k < cand_ids.size(1) - 1:
+                    alt2 = cand_ids[:, k + 1]
+                    alt = torch.where(alt == chosen_item, alt2, alt)
+                step_topk[:, k] = alt
+
+            next_state, step_reward, done = self.env.step(chosen_item, step_topk)
+
             rewards.append(step_reward)
             log_probs.append(log_prob)
             entropies.append(entropy)
 
             state = next_state
 
-        # Episode-level final reward (Metrics), broadcast to each step
-        final_reward = self.env.compute_final_reward()           # [B]
+        # episode final reward (Metrics)
+        final_reward = self.env.compute_final_reward()  # [B]
         for t in range(len(rewards)):
             rewards[t] = rewards[t] + final_reward
 
-        return states_k, actions_idx, rewards, log_probs, entropies
+        return rewards, log_probs, entropies
 
-    def update_policy(self, states_k, actions_idx, rewards, log_probs, entropies):
+    def update_policy(self, rewards, log_probs, entropies):
         T = len(rewards)
         if T == 0:
             return 0.0
@@ -422,18 +452,18 @@ class PPOTrainer:
         logp_t = torch.stack(log_probs, dim=0)      # [T, B]
         ent_t = torch.stack(entropies, dim=0)       # [T, B]
 
-        # Discounted returns
+        # discounted returns
         returns = torch.zeros_like(rewards_t)
         running = torch.zeros_like(rewards_t[0])
         for t in reversed(range(T)):
             running = rewards_t[t] + self.gamma * running
             returns[t] = running
 
-        # Baseline: subtract per-sample mean across time
-        baseline = returns.mean(dim=0, keepdim=True)   # [1, B]
-        advantages = returns - baseline                # [T, B]
+        # baseline: per-sample mean across time
+        baseline = returns.mean(dim=0, keepdim=True)
+        adv = returns - baseline
 
-        pg_loss = -(logp_t * advantages.detach()).mean()
+        pg_loss = -(logp_t * adv.detach()).mean()
         ent_loss = -ent_t.mean()
         loss = pg_loss + self.entropy_coef * ent_loss
 
