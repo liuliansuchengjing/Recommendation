@@ -33,7 +33,7 @@ def train_rl_model(
 
     policy_net = PolicyNetwork(
         knowledge_dim=num_skills,
-        candidate_feature_dim=5,
+        candidate_feature_dim=1,
         hidden_dim=128,
         topk=topk,
     ).to(device)
@@ -45,7 +45,8 @@ def train_rl_model(
         data_name=data_path,
         graph=graph,
         hypergraph_list=hypergraph_list,
-        topnum_for_metrics=1,   # RL 每步 1 个动作
+        policy_topk=topk,  # ✅ 确保 env 候选数与 policy.topk 一致
+        metrics_topnum=1,
         metrics_T=5,
     )
 
