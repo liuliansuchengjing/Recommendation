@@ -289,6 +289,12 @@ class LearningPathEnv:
         B = chosen_item_ids.size(0)
         device = chosen_item_ids.device
 
+        # ====== (A) cache OLD state outputs BEFORE transition ======
+        # old_pred_probs_last: [B, num_skills]
+        # old_knowledge_last:  [B, num_skills]
+        old_pred_probs_last = self._last_pred_probs_full[:, -1, :].detach()
+        old_knowledge_last = self._last_yt_full[:, -1, :].detach()
+
         # 1) update chosen paths
         for i in range(B):
             self.paths[i].append(int(chosen_item_ids[i].item()))
@@ -297,6 +303,13 @@ class LearningPathEnv:
         for i in range(B):
             recs = step_topk_items[i].tolist()
             self.topk_recs[i].append([int(x) for x in recs])
+
+        # ====== (B) compute step reward using OLD state (correct timing) ======
+        step_reward = self._compute_step_reward_from_cached(
+            chosen_item_ids,
+            old_pred_probs_last,
+            old_knowledge_last,
+        )
 
         # 3) build extended inputs
         ext_len = len(self.paths[0])
@@ -309,13 +322,10 @@ class LearningPathEnv:
         pad_ans = torch.zeros(B, ext_len, device=device, dtype=self.original_ans.dtype)
         ext_ans = torch.cat([self.original_ans, pad_ans], dim=1)
 
-        # 4) forward base model for new state
+        # 4) forward base model for NEW state
         self._forward_base(ext_tgt, ext_timestamp, ext_idx, ext_ans)
 
-        # 5) step reward (shaping)
-        step_reward = self._compute_step_reward(chosen_item_ids)
-
-        # 6) done
+        # 5) done
         self.current_step += 1
         done = torch.zeros(B, dtype=torch.bool, device=device)
         if self.current_step >= self.recommendation_length:
@@ -352,6 +362,43 @@ class LearningPathEnv:
                 self._repeat_hist[i].append(is_repeat)
 
             # difficulty proxy
+            if 0 <= item < knowledge_last.size(1):
+                k = knowledge_last[i, item]
+                reward[i] += self.step_weights["difficulty"] * (1 - torch.abs(k - 0.5))
+
+        return reward
+
+    def _compute_step_reward_from_cached(
+            self,
+            chosen_item_ids: torch.Tensor,
+            pred_probs_last: torch.Tensor,  # OLD [B, num_skills]
+            knowledge_last: torch.Tensor,  # OLD [B, num_skills]
+    ) -> torch.Tensor:
+        B = chosen_item_ids.size(0)
+        device = chosen_item_ids.device
+        reward = torch.zeros(B, device=device)
+
+        for i in range(B):
+            item = int(chosen_item_ids[i].item())
+
+            # preference (based on OLD pred_probs)
+            pref_val = 0.0
+            if 0 <= item < pred_probs_last.size(1):
+                pref_val = float(pred_probs_last[i, item].item())
+                reward[i] += self.step_weights["preference"] * pred_probs_last[i, item]
+
+            # repeat penalty (based on chosen path so far; after append is ok because we check[:-1])
+            is_repeat = 1 if item in self.paths[i][:-1] else 0
+            if is_repeat:
+                reward[i] -= self.step_weights["diversity"]
+
+            # record for evaluation (still record OLD preference, correct)
+            if self._pref_hist is not None:
+                self._pref_hist[i].append(pref_val)
+            if self._repeat_hist is not None:
+                self._repeat_hist[i].append(is_repeat)
+
+            # difficulty proxy (based on OLD knowledge state)
             if 0 <= item < knowledge_last.size(1):
                 k = knowledge_last[i, item]
                 reward[i] += self.step_weights["difficulty"] * (1 - torch.abs(k - 0.5))
@@ -485,7 +532,7 @@ class LearningPathEnv:
             for j, item in enumerate(self.paths[i]):
                 item = int(item)
                 if 0 <= item < k_end.size(1):
-                    full_ans[i, L + j] = 1 if (k_end[i, item] >= 0) else 0
+                    full_ans[i, L + j] = 1 if (k_end[i, item] >= 0.5) else 0
                 else:
                     full_ans[i, L + j] = 0
 
