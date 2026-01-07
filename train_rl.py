@@ -7,11 +7,11 @@ import torch
 import argparse
 import os
 from HGAT import MSHGAT
-from rl_adjuster import RLPathOptimizer, evaluate_policy
+from rl_adjuster import RLPathOptimizer, evaluate_policy, EnhancedLearningPathEnv, EnhancedPPOTrainer
 from dataLoader import Split_data, DataLoader
 from graphConstruct import ConRelationGraph, ConHyperGraphList
 import numpy as np
-
+import pickle
 
 def train_rl_model(data_path, opt, pretrained_model, num_skills, batch_size, recommendation_length=5, num_epochs=50, topk=20):
     """
@@ -245,49 +245,300 @@ def run_training_with_pretrained_model(data_path="MOO", model_path=None):
     return rl_optimizer, stats
 
 
+def train_rl_with_enhanced_metrics(data_path="MOO", model_path=None):
+    """
+    使用增强指标计算的强化学习训练
+    """
+    # 设置参数
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-data_name', default=data_path)
+    parser.add_argument('-batch_size', type=int, default=16)
+    parser.add_argument('-d_model', type=int, default=64)
+    parser.add_argument('-initialFeatureSize', type=int, default=64)
+    parser.add_argument('-train_rate', type=float, default=0.8)
+    parser.add_argument('-valid_rate', type=float, default=0.1)
+    parser.add_argument('-n_warmup_steps', type=int, default=1000)
+    parser.add_argument('-dropout', type=float, default=0.3)
+    parser.add_argument('-save_path', default="./checkpoint/DiffusionPrediction.pt")
+    parser.add_argument('-no_cuda', action='store_true')
+    parser.add_argument('-pos_emb', type=bool, default=True)
+
+    opt = parser.parse_args([])
+    opt.d_word_vec = opt.d_model
+
+    # 获取数据信息
+    user_size, _, _, _, _, _ = Split_data(opt.data_name, opt.train_rate, opt.valid_rate, load_dict=True)
+    opt.user_size = user_size
+
+    # 加载预训练模型
+    print("加载预训练模型...")
+    mshgat_model = MSHGAT(opt, dropout=opt.dropout)
+
+    if model_path and os.path.exists(model_path):
+        if not opt.no_cuda and torch.cuda.is_available():
+            mshgat_model.load_state_dict(torch.load(model_path))
+            mshgat_model = mshgat_model.cuda()
+        else:
+            mshgat_model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+
+    mshgat_model.eval()
+    num_skills = user_size
+
+    # 初始化RL优化器（使用增强环境）
+    print("初始化强化学习优化器...")
+    rl_optimizer = RLPathOptimizer(
+        pretrained_model=mshgat_model,
+        num_skills=num_skills,
+        batch_size=opt.batch_size,
+        recommendation_length=5,
+        topk=10,
+        data_name=opt.data_name
+    )
+
+    # 替换为增强环境
+    rl_optimizer.env = EnhancedLearningPathEnv(
+        batch_size=opt.batch_size,
+        base_model=mshgat_model,
+        policy_net=rl_optimizer.policy_net,
+        recommendation_length=5,
+        topk=10,
+        data_name=opt.data_name
+    )
+
+    # 替换为增强训练器
+    rl_optimizer.trainer = EnhancedPPOTrainer(
+        policy_net=rl_optimizer.policy_net,
+        env=rl_optimizer.env,
+        lr=3e-4,
+        gamma=0.99,
+        clip_epsilon=0.2
+    )
+
+    # 获取数据
+    user_size, total_cascades, timestamps, train, valid, test = Split_data(
+        opt.data_name, opt.train_rate, opt.valid_rate, load_dict=True
+    )
+
+    train_data = DataLoader(train, batch_size=opt.batch_size, load_dict=True,
+                            cuda=not opt.no_cuda and torch.cuda.is_available())
+
+    # 训练循环
+    num_epochs = 20
+    training_stats = {
+        'epoch_losses': [],
+        'avg_rewards': [],
+        'final_qualities': [],
+        'reward_breakdown': []
+    }
+
+    for epoch in range(num_epochs):
+        epoch_losses = []
+        epoch_rewards = []
+        epoch_final_qualities = []
+
+        for batch_idx, batch in enumerate(train_data):
+            if batch_idx >= 10:  # 限制批次数量
+                break
+
+            # 准备数据
+            if not opt.no_cuda and torch.cuda.is_available():
+                tgt, tgt_timestamp, tgt_idx, ans = (item.cuda() for item in batch)
+            else:
+                tgt, tgt_timestamp, tgt_idx, ans = batch
+
+            # 收集轨迹
+            trajectory = rl_optimizer.trainer.collect_trajectory(
+                tgt, tgt_timestamp, tgt_idx, ans,
+                rl_optimizer.env.original_graph,
+                rl_optimizer.env.original_hypergraph_list
+            )
+
+            # 更新策略
+            loss = rl_optimizer.trainer.update_policy()
+
+            # 记录统计
+            if trajectory['rewards'].numel() > 0:
+                avg_reward = trajectory['rewards'].mean().item()
+                epoch_rewards.append(avg_reward)
+
+            if trajectory['final_quality'] is not None:
+                avg_final_quality = trajectory['final_quality'].mean().item()
+                epoch_final_qualities.append(avg_final_quality)
+
+            epoch_losses.append(loss)
+
+            if batch_idx % 2 == 0:
+                print(f"Epoch {epoch}, Batch {batch_idx}: "
+                      f"Loss={loss:.4f}, "
+                      f"Reward={avg_reward if 'avg_reward' in locals() else 0:.4f}, "
+                      f"Final Quality={avg_final_quality if 'avg_final_quality' in locals() else 0:.4f}")
+
+        # 记录epoch统计
+        training_stats['epoch_losses'].append(np.mean(epoch_losses) if epoch_losses else 0)
+        training_stats['avg_rewards'].append(np.mean(epoch_rewards) if epoch_rewards else 0)
+        training_stats['final_qualities'].append(np.mean(epoch_final_qualities) if epoch_final_qualities else 0)
+
+        print(f"Epoch {epoch} 完成: "
+              f"平均损失={training_stats['epoch_losses'][-1]:.4f}, "
+              f"平均奖励={training_stats['avg_rewards'][-1]:.4f}, "
+              f"平均最终质量={training_stats['final_qualities'][-1]:.4f}")
+
+    # 保存模型
+    save_dir = "checkpoints"
+    os.makedirs(save_dir, exist_ok=True)
+
+    policy_path = os.path.join(save_dir, "enhanced_rl_policy.pth")
+    torch.save(rl_optimizer.policy_net.state_dict(), policy_path)
+
+    # 保存训练统计
+    stats_path = os.path.join(save_dir, "training_stats.pkl")
+    with open(stats_path, 'wb') as f:
+        pickle.dump(training_stats, f)
+
+    print(f"训练完成！模型已保存到 {policy_path}")
+    print(f"训练统计已保存到 {stats_path}")
+
+    # 分析最终训练结果
+    print("\n最终训练结果分析:")
+    print(f"最终平均奖励: {training_stats['avg_rewards'][-1]:.4f}")
+    print(f"最终平均质量: {training_stats['final_qualities'][-1]:.4f}")
+    print(f"总指标: {training_stats['avg_rewards'][-1] + training_stats['final_qualities'][-1]:.4f}")
+
+    # 绘制训练曲线
+    if len(training_stats['epoch_losses']) > 1:
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+        # 损失曲线
+        axes[0, 0].plot(training_stats['epoch_losses'])
+        axes[0, 0].set_title('Training Loss')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+
+        # 奖励曲线
+        axes[0, 1].plot(training_stats['avg_rewards'])
+        axes[0, 1].set_title('Average Reward')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Reward')
+
+        # 最终质量曲线
+        axes[1, 0].plot(training_stats['final_qualities'])
+        axes[1, 0].set_title('Final Quality')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Quality')
+
+        # 总指标曲线
+        total_scores = [r + q for r, q in zip(training_stats['avg_rewards'], training_stats['final_qualities'])]
+        axes[1, 1].plot(total_scores)
+        axes[1, 1].set_title('Total Score (Reward + Quality)')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Score')
+
+        plt.tight_layout()
+        plot_path = os.path.join(save_dir, "training_curves.png")
+        plt.savefig(plot_path)
+        print(f"训练曲线已保存到 {plot_path}")
+
+    return rl_optimizer, training_stats
+
+
+def evaluate_enhanced_rl_model(rl_optimizer, test_data_path):
+    """
+    评估增强RL模型的性能
+    """
+    # 加载测试数据
+    _, _, _, _, _, test = Split_data(test_data_path, 0.8, 0.1, load_dict=True)
+    test_data = DataLoader(test, batch_size=16, load_dict=True, cuda=True)
+
+    all_metrics = []
+
+    for batch in test_data:
+        tgt, tgt_timestamp, tgt_idx, ans = (item.cuda() for item in batch)
+
+        # 使用RL模型生成推荐
+        state = rl_optimizer.env.reset(tgt, tgt_timestamp, tgt_idx, ans,
+                                       rl_optimizer.env.original_graph,
+                                       rl_optimizer.env.original_hypergraph_list)
+
+        # 运行轨迹
+        for _ in range(rl_optimizer.env.recommendation_length):
+            with torch.no_grad():
+                scores = rl_optimizer.policy_net(
+                    state['knowledge_state'],
+                    state['candidate_features']
+                )
+                actions = torch.argmax(scores, dim=-1)  # 确定性策略
+                state, _, _ = rl_optimizer.env.step(actions)
+
+        # 获取轨迹指标
+        batch_metrics = []
+        for i in range(tgt.size(0)):
+            trajectory_data = rl_optimizer.env.trajectory_manager.get_trajectory_data(i)
+            metrics = rl_optimizer.env.metrics_evaluator.evaluate_trajectory(trajectory_data)
+            batch_metrics.append(metrics)
+
+        all_metrics.extend(batch_metrics)
+
+    # 计算平均指标
+    avg_metrics = {
+        'effectiveness': np.mean([m['effectiveness'] for m in all_metrics]),
+        'adaptivity': np.mean([m['adaptivity'] for m in all_metrics]),
+        'diversity': np.mean([m['diversity'] for m in all_metrics]),
+        'preference': np.mean([m['preference'] for m in all_metrics]),
+        'final_quality': np.mean([m['final_quality'] for m in all_metrics])
+    }
+
+    print("\n增强RL模型评估结果:")
+    for metric, value in avg_metrics.items():
+        print(f"  {metric}: {value:.4f}")
+
+    return avg_metrics
+
 if __name__ == "__main__":
-    print("="*60)
-    print("强化学习路径优化模型训练")
-    print("此脚本将使用预训练模型进行强化学习训练")
-    print("优化目标：有效性、适应性、多样性、偏好保持")
-    print("="*60)
-    
-    # 运行训练
-    try:
-        rl_optimizer, stats = run_training_with_pretrained_model()
-        print("\n训练成功完成！")
-        
-        if 'final_validity' in stats and 'final_diversity' in stats and 'final_adaptivity' in stats:
-            print(f"\n最终强化学习优化效果:")
-            print(f"  有效性 (Validity): {stats['final_validity']:.4f}")
-            print(f"  多样性 (Diversity): {stats['final_diversity']:.4f}")
-            print(f"  适应性 (Adaptivity): {stats['final_adaptivity']:.4f}")
-            print(f"  平均奖励: {stats['avg_rewards'][-1] if stats['avg_rewards'] else 0:.4f}")
-        
-        # print("您可以使用训练好的模型进行推理：")
-        # print("  rl_recommender = RLPathRecommender(rl_optimizer)")
-        # print("  recommended_path, scores = rl_recommender.recommend_path(user_history)")
-        #
-        # # 提供使用示例
-        # print("\n使用示例:")
-        # print("# 加载训练好的推荐器")
-        # print("recommender = RLPathRecommender(rl_optimizer)")
-        # print("")
-        # print("# 为单个用户推荐路径")
-        # print("user_history = torch.randint(1, num_skills, (10,))  # 示例历史")
-        # print("path, scores = recommender.recommend_path(user_history)")
-        # print("print('推荐路径:', path)")
-        # print("")
-        # print("# 批量推荐")
-        # print("user_histories = torch.randint(1, num_skills, (batch_size, seq_len))")
-        # print("paths, all_scores = recommender.batch_recommend(user_histories)")
-        # print("print('批量推荐路径形状:', paths.shape)")
-        # print("")
-        # print("# 评估推荐路径质量")
-        # print("quality_results = recommender.evaluate_path_quality(user_histories)")
-        # print("print('路径质量评估:', quality_results)")
-        
-    except Exception as e:
-        print(f"训练过程中出现错误: {e}")
-        import traceback
-        traceback.print_exc()
+    rl_optimizer, stats = train_rl_with_enhanced_metrics()
+    # print("="*60)
+    # print("强化学习路径优化模型训练")
+    # print("此脚本将使用预训练模型进行强化学习训练")
+    # print("优化目标：有效性、适应性、多样性、偏好保持")
+    # print("="*60)
+    #
+    # # 运行训练
+    # try:
+    #     rl_optimizer, stats = run_training_with_pretrained_model()
+    #     print("\n训练成功完成！")
+    #
+    #     if 'final_validity' in stats and 'final_diversity' in stats and 'final_adaptivity' in stats:
+    #         print(f"\n最终强化学习优化效果:")
+    #         print(f"  有效性 (Validity): {stats['final_validity']:.4f}")
+    #         print(f"  多样性 (Diversity): {stats['final_diversity']:.4f}")
+    #         print(f"  适应性 (Adaptivity): {stats['final_adaptivity']:.4f}")
+    #         print(f"  平均奖励: {stats['avg_rewards'][-1] if stats['avg_rewards'] else 0:.4f}")
+    #
+    #     # print("您可以使用训练好的模型进行推理：")
+    #     # print("  rl_recommender = RLPathRecommender(rl_optimizer)")
+    #     # print("  recommended_path, scores = rl_recommender.recommend_path(user_history)")
+    #     #
+    #     # # 提供使用示例
+    #     # print("\n使用示例:")
+    #     # print("# 加载训练好的推荐器")
+    #     # print("recommender = RLPathRecommender(rl_optimizer)")
+    #     # print("")
+    #     # print("# 为单个用户推荐路径")
+    #     # print("user_history = torch.randint(1, num_skills, (10,))  # 示例历史")
+    #     # print("path, scores = recommender.recommend_path(user_history)")
+    #     # print("print('推荐路径:', path)")
+    #     # print("")
+    #     # print("# 批量推荐")
+    #     # print("user_histories = torch.randint(1, num_skills, (batch_size, seq_len))")
+    #     # print("paths, all_scores = recommender.batch_recommend(user_histories)")
+    #     # print("print('批量推荐路径形状:', paths.shape)")
+    #     # print("")
+    #     # print("# 评估推荐路径质量")
+    #     # print("quality_results = recommender.evaluate_path_quality(user_histories)")
+    #     # print("print('路径质量评估:', quality_results)")
+    #
+    # except Exception as e:
+    #     print(f"训练过程中出现错误: {e}")
+    #     import traceback
+    #     traceback.print_exc()
