@@ -7,6 +7,12 @@ from torch.distributions import Categorical
 import Constants
 from Metrics import Metrics
 
+# 尝试导入 KTOnlyModel（在 HGAT.py 中定义）
+try:
+    from HGAT import KTOnlyModel
+except Exception:
+    KTOnlyModel = None
+
 
 # ======================================================
 # Policy Network
@@ -63,19 +69,93 @@ def _reshape_pred_flat(pred_flat: torch.Tensor, batch_size: int, steps: int) -> 
     return pred_flat.view(batch_size, steps, -1)
 
 
+def _safe_to_cpu_list_1d(x: torch.Tensor):
+    return x.detach().cpu().tolist()
+
+
+# ======================================================
+# Learning Simulation (NO change to Metrics)
+# ======================================================
+@torch.no_grad()
+def simulate_learning_for_metrics(
+    kt_model,
+    original_seqs,
+    original_ans,
+    topk_sequence,
+    graph,
+    yt_before: torch.Tensor,
+    batch_size: int,
+    topnum: int,
+):
+    """
+    按照 calculate_muti_obj.py 的思想，把推荐资源插入序列并用 KTOnlyModel 跑出 yt_after。
+    这是为了给 Metrics.combined_metrics 提供正确的 yt_after。
+
+    输入：
+      - original_seqs: List[List[int]] 长度 batch_size
+      - original_ans:  List[List[int]] 长度 batch_size
+      - topk_sequence: List[List[List[int]]] 形状 [B][seq_len-1][topnum or less]
+      - yt_before: Tensor [B, seq_len-1, num_skills]（来自 base_model 输出的 yt/knowledge state）
+    输出：
+      - yt_after: Tensor [B, seq_len-1, num_skills]
+    """
+    device = yt_before.device
+    B = batch_size
+    seq_len_minus_1 = yt_before.size(1)
+    num_skills = yt_before.size(2)
+
+    yt_after = torch.zeros((B, seq_len_minus_1, num_skills), device=device, dtype=yt_before.dtype)
+
+    for b in range(B):
+        original_seq = list(original_seqs[b])
+        original_answer = list(original_ans[b])
+
+        for t in range(seq_len_minus_1):
+            recs = topk_sequence[b][t] if (b < len(topk_sequence) and t < len(topk_sequence[b])) else []
+            # 只保留有效推荐（非 PAD）
+            recommended = [int(r) for r in recs[:topnum] if int(r) != int(Constants.PAD)]
+
+            insert_pos = t + 1
+            new_seq = original_seq[:insert_pos] + recommended + original_seq[insert_pos:]
+
+            # 推荐项的“伪答题结果”：用 yt_before 在阈值 0.5 上二值化
+            if len(recommended) > 0:
+                pred_probs = yt_before[b, t, torch.tensor(recommended, device=device)]
+                pred_answers = (pred_probs >= 0.5).long().detach().cpu().tolist()
+            else:
+                pred_answers = []
+
+            new_answer = original_answer[:insert_pos] + pred_answers + original_answer[insert_pos:]
+
+            # padding 到 max_len（与原始长度一致，否则 KT 输出长度会变）
+            max_len = len(original_seq)
+            if len(new_seq) < max_len:
+                new_seq = new_seq + [Constants.PAD] * (max_len - len(new_seq))
+                new_answer = new_answer + [0] * (max_len - len(new_answer))
+            else:
+                new_seq = new_seq[:max_len]
+                new_answer = new_answer[:max_len]
+
+            new_seq_tensor = torch.tensor([new_seq], device=device, dtype=torch.long)
+            new_ans_tensor = torch.tensor([new_answer], device=device, dtype=torch.long)
+
+            # KTOnlyModel.forward: (input_seq, answers, graph) -> yt_all  [B, seq_len, num_skills]
+            yt_all = kt_model(new_seq_tensor, new_ans_tensor, graph)
+            # 对齐取 t 位置（对应 yt_before 的 t）
+            yt_after[b, t, :] = yt_all[0, t, :]
+
+    return yt_after
+
+
 # ======================================================
 # Learning Path Environment
 # ======================================================
 class LearningPathEnv:
     """
-    Vectorized (batch) environment:
+    Vectorized (batch) environment.
     - reset(...) takes a batch of student histories.
     - step(chosen_item_ids, step_topk_items) appends to each student's path.
-    - state includes candidate list to allow "action_index -> real item id" mapping.
-
-    IMPORTANT:
-    - For Metrics.diversity, topnum must be >=2; we keep metrics_topnum=2 by default,
-      and record per-step top-2 recommendations as [chosen, alt].
+    - compute_final_metrics() uses Metrics.combined_metrics with yt_after built by KTOnlyModel simulate_learning.
     """
     def __init__(
         self,
@@ -118,6 +198,14 @@ class LearningPathEnv:
             "diversity": 0.2,
             "preference": 0.1,
         }
+
+        # KT model for simulate_learning
+        self.kt_model = None
+        if KTOnlyModel is not None:
+            try:
+                self.kt_model = KTOnlyModel(self.base_model)
+            except Exception:
+                self.kt_model = None
 
         self._clear_episode_cache()
 
@@ -200,7 +288,6 @@ class LearningPathEnv:
             self.paths[i].append(int(chosen_item_ids[i].item()))
 
         # 2) record step Top-N recs for Metrics
-        # ensure python list with ints
         for i in range(B):
             recs = step_topk_items[i].tolist()
             self.topk_recs[i].append([int(x) for x in recs])
@@ -261,11 +348,16 @@ class LearningPathEnv:
         """
         Return per-sample metrics tensors:
           effectiveness, adaptivity, diversity, preference, final_quality
-
-        Uses Metrics.combined_metrics per-sample (batch_size=1) to ensure reward depends on each path.
         """
         if self.original_tgt is None:
             z = torch.zeros(self.batch_size)
+            return {
+                "effectiveness": z, "adaptivity": z, "diversity": z, "preference": z, "final_quality": z
+            }
+
+        if self.kt_model is None:
+            # 没有 KTOnlyModel 时，无法构造 yt_after，避免输出胡乱的 effectiveness
+            z = torch.zeros(self.batch_size, device=self.original_tgt.device)
             return {
                 "effectiveness": z, "adaptivity": z, "diversity": z, "preference": z, "final_quality": z
             }
@@ -284,32 +376,31 @@ class LearningPathEnv:
         fq_t = torch.zeros(B, device=device)
 
         for i in range(B):
-            orig_seq_i = self.original_tgt[i].detach().cpu().tolist()
-            orig_ans_i = self.original_ans[i].detach().cpu().tolist()
+            orig_seq_i = _safe_to_cpu_list_1d(self.original_tgt[i])
+            orig_ans_i = _safe_to_cpu_list_1d(self.original_ans[i])
 
             rec_chosen_i = self.paths[i]
-            rec_topk_i = self.topk_recs[i]  # list length rec_len, each is list length metrics_topnum
+            rec_topk_i = self.topk_recs[i]
 
             full_seq_i = orig_seq_i + rec_chosen_i
             full_ans_i = orig_ans_i + [0] * len(rec_chosen_i)
 
             # build topk_sequence for Metrics: [1, seq_len-1, topnum]
-            # history steps -> []
-            # rec steps -> stored Top-N list
             seq_steps = seq_len_full - 1
             hist_offset = hist_len - 1
+
             topk_seq_steps = []
             for t in range(seq_steps):
                 rec_t = t - hist_offset
                 if 0 <= rec_t < len(rec_topk_i):
-                    # ensure length == metrics_topnum
                     recs = rec_topk_i[rec_t][:self.metrics_topnum]
                     if len(recs) < self.metrics_topnum:
                         recs = recs + [Constants.PAD] * (self.metrics_topnum - len(recs))
                     topk_seq_steps.append(recs)
                 else:
                     topk_seq_steps.append([])
-            topk_sequence = [topk_seq_steps]
+
+            topk_sequence = [topk_seq_steps]  # batch_size=1 list
 
             seq_tensor = torch.tensor([full_seq_i], device=device, dtype=self.original_tgt.dtype)
             ans_tensor = torch.tensor([full_ans_i], device=device, dtype=self.original_ans.dtype)
@@ -319,12 +410,19 @@ class LearningPathEnv:
             ts_i = _pad_and_concat_like(ts_i, len(rec_chosen_i), pad_value=0)
             idx_i = _pad_and_concat_like(idx_i, len(rec_chosen_i), pad_value=0)
 
-            pred_probs_1, yt_1, hidden = self._forward_base(seq_tensor, ts_i, idx_i, ans_tensor)
+            pred_probs_1, yt_before, hidden = self._forward_base(seq_tensor, ts_i, idx_i, ans_tensor)
 
-            yt_before = yt_1
-            yt_after = torch.zeros_like(yt_before)
-            yt_after[:, :-1, :] = yt_before[:, 1:, :]
-            yt_after[:, -1, :] = yt_before[:, -1, :]
+            # ✅ 正确构造 yt_after：用 KTOnlyModel + simulate_learning
+            yt_after = simulate_learning_for_metrics(
+                kt_model=self.kt_model,
+                original_seqs=[full_seq_i],
+                original_ans=[full_ans_i],
+                topk_sequence=topk_sequence,
+                graph=self.graph,
+                yt_before=yt_before,
+                batch_size=1,
+                topnum=self.metrics_topnum,
+            )
 
             pred_probs_flat = pred_probs_1.reshape(-1, pred_probs_1.size(-1)).detach().cpu().numpy()
 
@@ -338,7 +436,7 @@ class LearningPathEnv:
                 batch_size=1,
                 seq_len=seq_len_full,
                 pred_probs=pred_probs_flat,
-                topnum=self.metrics_topnum,   # ✅ >=2 now
+                topnum=self.metrics_topnum,
                 T=self.metrics_T,
             )
 
@@ -375,7 +473,7 @@ class LearningPathEnv:
 # Policy Gradient Trainer (REINFORCE + baseline)
 # ======================================================
 class PPOTrainer:
-    def __init__(self, policy_net: PolicyNetwork, env: LearningPathEnv, lr=3e-4, gamma=0.99, entropy_coef=0.001):
+    def __init__(self, policy_net: PolicyNetwork, env: LearningPathEnv, lr=3e-4, gamma=0.99, entropy_coef=0.0001):
         self.policy_net = policy_net
         self.env = env
         self.gamma = gamma
@@ -408,21 +506,14 @@ class PPOTrainer:
             log_prob = dist.log_prob(action_index)
             entropy = dist.entropy()
 
-            # map index -> chosen item
             chosen_item = cand_ids.gather(1, action_index.view(-1, 1)).squeeze(1)  # [B]
 
-            # build Top-2 list for Metrics (chosen + alt)
-            # alt: pick best candidate that is not equal to chosen; fallback to chosen if needed
+            # Metrics top-2: chosen + best alternative
             topn = self.env.metrics_topnum
-            # start with first few candidates from cand_ids
             step_topk = torch.full((B, topn), Constants.PAD, device=device, dtype=cand_ids.dtype)
             step_topk[:, 0] = chosen_item
-
-            # fill remaining slots with highest-prob candidates different from already chosen
             for k in range(1, topn):
-                # choose the first candidate that differs from chosen (or from existing)
                 alt = cand_ids[:, k] if k < cand_ids.size(1) else cand_ids[:, 0]
-                # if equals chosen, try next
                 if k < cand_ids.size(1) - 1:
                     alt2 = cand_ids[:, k + 1]
                     alt = torch.where(alt == chosen_item, alt2, alt)
@@ -436,12 +527,11 @@ class PPOTrainer:
 
             state = next_state
 
-        # episode final reward (Metrics)
+        # episode final reward (Metrics) —— ✅ 只在最后一步加
         final_reward = self.env.compute_final_reward()  # [B]
-        for t in range(len(rewards)):
-            rewards[t] = rewards[t] + final_reward
+        rewards[-1] = rewards[-1] + final_reward
 
-        return rewards, log_probs, entropies
+        return rewards, log_probs, entropies, final_reward
 
     def update_policy(self, rewards, log_probs, entropies):
         T = len(rewards)
@@ -463,6 +553,10 @@ class PPOTrainer:
         baseline = returns.mean(dim=0, keepdim=True)
         adv = returns - baseline
 
+        # 可选：adv 标准化（避免 adv_std 太小导致训练不动）
+        adv_std = adv.detach().std(dim=0, keepdim=True).clamp_min(1e-6)
+        adv = adv / adv_std
+
         pg_loss = -(logp_t * adv.detach()).mean()
         ent_loss = -ent_t.mean()
         loss = pg_loss + self.entropy_coef * ent_loss
@@ -472,4 +566,139 @@ class PPOTrainer:
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
 
+        print(f"pg_loss={pg_loss.item():.6f}  entropy={ent_t.mean().item():.6f}  adv_std={adv.detach().std().item():.6f}")
         return float(loss.item())
+
+
+# ======================================================
+# High-level wrappers (keep your old interface needs)
+# ======================================================
+class RLPathOptimizer:
+    def __init__(
+        self,
+        pretrained_model,
+        num_skills,
+        batch_size,
+        recommendation_length,
+        topk,
+        data_name,
+        graph=None,
+        hypergraph_list=None,
+        hidden_dim=128,
+        lr=3e-4,
+        gamma=0.99,
+        entropy_coef=1e-4,
+        metrics_topnum=2,
+        metrics_T=5,
+        device=None,
+    ):
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
+
+        self.env = LearningPathEnv(
+            batch_size=batch_size,
+            base_model=pretrained_model,
+            recommendation_length=recommendation_length,
+            data_name=data_name,
+            graph=graph,
+            hypergraph_list=hypergraph_list,
+            policy_topk=topk,
+            metrics_topnum=metrics_topnum,
+            metrics_T=metrics_T,
+        )
+
+        self.policy_net = PolicyNetwork(
+            knowledge_dim=num_skills,
+            candidate_feature_dim=1,   # ✅ cand_probs 只有 1 维
+            hidden_dim=hidden_dim,
+            topk=topk,
+        ).to(device)
+
+        self.trainer = PPOTrainer(
+            policy_net=self.policy_net,
+            env=self.env,
+            lr=lr,
+            gamma=gamma,
+            entropy_coef=entropy_coef,
+        )
+
+
+@torch.no_grad()
+def evaluate_policy(env: LearningPathEnv, policy_net: PolicyNetwork, data_loader, device, max_batches=20):
+    """
+    在给定 data_loader 上，用确定性策略（argmax）生成路径，
+    输出推荐路径的平均指标：effectiveness/adaptivity/diversity/preference/final_quality
+    """
+    policy_net.eval()
+
+    all_eff = []
+    all_ada = []
+    all_div = []
+    all_pref = []
+    all_fq = []
+
+    for bidx, batch in enumerate(data_loader):
+        if bidx >= max_batches:
+            break
+
+        tgt, tgt_timestamp, tgt_idx, ans = batch
+        tgt = tgt.to(device)
+        tgt_timestamp = tgt_timestamp.to(device)
+        tgt_idx = tgt_idx.to(device)
+        ans = ans.to(device)
+
+        state = env.reset(tgt, tgt_timestamp, tgt_idx, ans)
+
+        for _ in range(env.recommendation_length):
+            cand_probs = state["cand_probs"]                 # [B, topk]
+            cand_feat = cand_probs.unsqueeze(-1)             # [B, topk, 1]
+            logits = policy_net(state["knowledge_state"], cand_feat)
+            action_index = torch.argmax(logits, dim=-1)
+
+            cand_ids = state["cand_ids"]
+            chosen_item = cand_ids.gather(1, action_index.view(-1, 1)).squeeze(1)
+
+            # step top-2
+            B = tgt.size(0)
+            topn = env.metrics_topnum
+            step_topk = torch.full((B, topn), Constants.PAD, device=device, dtype=cand_ids.dtype)
+            step_topk[:, 0] = chosen_item
+            for k in range(1, topn):
+                alt = cand_ids[:, k] if k < cand_ids.size(1) else cand_ids[:, 0]
+                if k < cand_ids.size(1) - 1:
+                    alt2 = cand_ids[:, k + 1]
+                    alt = torch.where(alt == chosen_item, alt2, alt)
+                step_topk[:, k] = alt
+
+            state, _, _ = env.step(chosen_item, step_topk)
+
+        metrics = env.compute_final_metrics()
+        all_eff.append(metrics["effectiveness"].detach().cpu())
+        all_ada.append(metrics["adaptivity"].detach().cpu())
+        all_div.append(metrics["diversity"].detach().cpu())
+        all_pref.append(metrics["preference"].detach().cpu())
+        all_fq.append(metrics["final_quality"].detach().cpu())
+
+    if len(all_eff) == 0:
+        return {
+            "effectiveness": 0.0,
+            "adaptivity": 0.0,
+            "diversity": 0.0,
+            "preference": 0.0,
+            "final_quality": 0.0,
+        }
+
+    eff = torch.cat(all_eff).mean().item()
+    ada = torch.cat(all_ada).mean().item()
+    div = torch.cat(all_div).mean().item()
+    pref = torch.cat(all_pref).mean().item()
+    fq = torch.cat(all_fq).mean().item()
+
+    return {
+        "effectiveness": eff,
+        "adaptivity": ada,
+        "diversity": div,
+        "preference": pref,
+        "final_quality": fq,
+    }
