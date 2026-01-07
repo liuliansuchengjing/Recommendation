@@ -48,7 +48,8 @@ def train_rl_model(data_path, opt, pretrained_model, num_skills, batch_size, rec
         'epoch_losses': [],
         'avg_rewards': [],
         'validity_scores': [],
-        'diversity_scores': []
+        'diversity_scores': [],
+        'adaptivity_scores': []
     }
     
     # 训练循环
@@ -83,6 +84,9 @@ def train_rl_model(data_path, opt, pretrained_model, num_skills, batch_size, rec
             loss = rl_optimizer.trainer.update_policy()
             epoch_losses.append(loss)
 
+            # 分析奖励构成
+            rl_optimizer.trainer.analyze_reward_components(trajectory)
+
             # 每几个批次打印一次信息
             if batch_idx % 5 == 0:
                 print(f"Epoch {epoch}, Batch {batch_idx}: Loss={loss:.4f}, Reward={avg_reward:.4f}")
@@ -100,6 +104,8 @@ def train_rl_model(data_path, opt, pretrained_model, num_skills, batch_size, rec
                 rl_optimizer.env,
                 rl_optimizer.policy_net,
                 valid_data,
+                relation_graph = relation_graph,
+                hypergraph_list = hypergraph_list,
                 num_episodes=5
             )
             training_stats['validity_scores'].append(validity)
@@ -125,6 +131,8 @@ def train_rl_model(data_path, opt, pretrained_model, num_skills, batch_size, rec
         rl_optimizer.env,
         rl_optimizer.policy_net,
         valid_data,
+        relation_graph,
+        hypergraph_list,
         num_episodes=10  # 使用更多episode获取更稳定的评估结果
     )
     
