@@ -532,7 +532,7 @@ class LearningPathEnv:
             for j, item in enumerate(self.paths[i]):
                 item = int(item)
                 if 0 <= item < k_end.size(1):
-                    full_ans[i, L + j] = 1 if (k_end[i, item] >= 0.5) else 0
+                    full_ans[i, L + j] = 1 if (k_end[i, item] >= 0) else 0
                 else:
                     full_ans[i, L + j] = 0
 
