@@ -224,6 +224,9 @@ class LearningPathEnv:
         self._last_pred_probs_full = None  # [B, steps, num_skills]
         self._last_yt_full = None          # [B, steps, num_skills]
         self._last_hidden = None
+        # --------- for evaluation metrics (no Metrics.combined_metrics) ----------
+        self._pref_hist = None      # List[List[float]] per sample per step
+        self._repeat_hist = None    # List[List[int]] 1 if repeated else 0
 
     def _forward_base(self, seq, timestamp, idx, ans):
         """
@@ -272,6 +275,8 @@ class LearningPathEnv:
         self.paths = [[] for _ in range(B)]
         self.topk_recs = [[] for _ in range(B)]
         self.current_step = 0
+        self._pref_hist = [[] for _ in range(B)]
+        self._repeat_hist = [[] for _ in range(B)]
 
         self._forward_base(tgt, tgt_timestamp, tgt_idx, ans)
         return self._make_state_from_last()
@@ -330,12 +335,21 @@ class LearningPathEnv:
             item = int(chosen_item_ids[i].item())
 
             # preference
+            pref_val = 0.0
             if 0 <= item < pred_probs_last.size(1):
+                pref_val = float(pred_probs_last[i, item].item())
                 reward[i] += self.step_weights["preference"] * pred_probs_last[i, item]
 
             # repeat penalty
-            if item in self.paths[i][:-1]:
+            is_repeat = 1 if item in self.paths[i][:-1] else 0
+            if is_repeat:
                 reward[i] -= self.step_weights["diversity"]
+
+            # -------- record for evaluation --------
+            if self._pref_hist is not None:
+                self._pref_hist[i].append(pref_val)
+            if self._repeat_hist is not None:
+                self._repeat_hist[i].append(is_repeat)
 
             # difficulty proxy
             if 0 <= item < knowledge_last.size(1):
@@ -347,7 +361,9 @@ class LearningPathEnv:
     # ---------------- Metrics outputs ----------------
     def compute_final_metrics(self):
         """
-        Return per-sample metrics tensors:
+        Episode-level metrics for appended-path RL setting.
+        DOES NOT call Metrics.combined_metrics (avoids eff_valid_count==0 division).
+        Returns per-sample tensors:
           effectiveness, adaptivity, diversity, preference, final_quality
         """
         if self.original_tgt is None:
@@ -356,107 +372,67 @@ class LearningPathEnv:
                 "effectiveness": z, "adaptivity": z, "diversity": z, "preference": z, "final_quality": z
             }
 
-        if self.kt_model is None:
-            # 没有 KTOnlyModel 时，无法构造 yt_after，避免输出胡乱的 effectiveness
-            z = torch.zeros(self.batch_size, device=self.original_tgt.device)
-            return {
-                "effectiveness": z, "adaptivity": z, "diversity": z, "preference": z, "final_quality": z
-            }
-
         device = self.original_tgt.device
         B = self.batch_size
 
-        rec_len = self.recommendation_length
-        hist_len = self.original_tgt.size(1)
-        seq_len_full = hist_len + rec_len
+        # 1) effectiveness: use the same as training final reward (episode gain)
+        eff_t = self._effectiveness_episode_gain()  # [B]
 
-        eff_t = torch.zeros(B, device=device)
-        ada_t = torch.zeros(B, device=device)
-        div_t = torch.zeros(B, device=device)
+        # 2) preference: average predicted prob of chosen items (recorded during steps)
         pref_t = torch.zeros(B, device=device)
-        fq_t = torch.zeros(B, device=device)
+        if self._pref_hist is not None:
+            for i in range(B):
+                if len(self._pref_hist[i]) > 0:
+                    pref_t[i] = float(sum(self._pref_hist[i]) / max(1, len(self._pref_hist[i])))
 
+        # 3) diversity: simple proxy based on repeats / unique ratio
+        div_t = torch.zeros(B, device=device)
         for i in range(B):
-            orig_seq_i = _safe_to_cpu_list_1d(self.original_tgt[i])
-            orig_ans_i = _safe_to_cpu_list_1d(self.original_ans[i])
+            path = self.paths[i] if self.paths is not None else []
+            if len(path) > 0:
+                unique_ratio = len(set(path)) / len(path)          # in (0,1]
+                div_t[i] = float(unique_ratio)
+            else:
+                div_t[i] = 0.0
 
-            rec_chosen_i = self.paths[i]
-            rec_topk_i = self.topk_recs[i]
+        # 4) adaptivity: (safe placeholder) you can refine later
+        # --- adaptivity (original definition from Metrics.calculate_adaptivity) ---
+        # original_seqs / original_ans: 用真实历史（不要加 PAD，不要加推荐）
+        original_seqs = self.original_tgt.detach().cpu().tolist()  # [B, L]
+        original_ans = self.original_ans.detach().cpu().tolist()  # [B, L]
 
-            full_seq_i = orig_seq_i + [Constants.PAD] * rec_len
-            full_ans_i = orig_ans_i + [0] * rec_len
+        B = self.batch_size
+        L = len(original_seqs[0])
+        topnum = self.metrics_topnum
 
-            # build topk_sequence for Metrics: [1, seq_len-1, topnum]
-            seq_steps = seq_len_full - 1
-            hist_offset = hist_len - 1
+        # 构造对齐的 topk_sequence: [B, L-1, topnum] (用 list 形式即可)
+        topk_sequence_aligned = []
+        for i in range(B):
+            recs = [[] for _ in range(L - 1)]
+            # 取 RL 最终路径的前 topnum 个作为“最后一步推荐”
+            last_recs = (self.paths[i][:topnum] if (self.paths is not None and len(self.paths[i]) > 0) else [])
+            recs[L - 2] = [int(x) for x in last_recs]
+            topk_sequence_aligned.append(recs)
 
-            topk_seq_steps = []
-            for t in range(seq_steps):
-                rec_t = t - hist_offset
-                if 0 <= rec_t < len(rec_topk_i):
-                    recs = rec_topk_i[rec_t][:self.metrics_topnum]
-                    if len(recs) < self.metrics_topnum:
-                        recs = recs + [Constants.PAD] * (self.metrics_topnum - len(recs))
-                    topk_seq_steps.append(recs)
-                else:
-                    topk_seq_steps.append([])
+        # Metrics.calculate_adaptivity 返回的是一个“全局平均标量”
+        adaptivity_scalar = self.metric.calculate_adaptivity(
+            original_seqs=original_seqs,
+            original_ans=original_ans,
+            topk_sequence=topk_sequence_aligned,
+            data_name=self.data_name,
+            T=self.metrics_T
+        )
 
-            topk_sequence = [topk_seq_steps]  # batch_size=1 list
+        # 为了保持 compute_final_metrics 返回 [B] 结构，这里把标量扩展成每个样本同值
+        ada_t = torch.full((B,), float(adaptivity_scalar), device=self.original_tgt.device)
 
-            seq_tensor = torch.tensor([full_seq_i], device=device, dtype=self.original_tgt.dtype)
-            ans_tensor = torch.tensor([full_ans_i], device=device, dtype=self.original_ans.dtype)
-
-            ts_i = self.original_tgt_timestamp[i:i+1] if self.original_tgt_timestamp is not None else None
-            idx_i = self.original_tgt_idx[i:i+1] if self.original_tgt_idx is not None else None
-            ts_i = _pad_and_concat_like(ts_i, len(rec_chosen_i), pad_value=0)
-            idx_i = _pad_and_concat_like(idx_i, len(rec_chosen_i), pad_value=0)
-
-            pred_probs_1, yt_before, hidden = self._forward_base(seq_tensor, ts_i, idx_i, ans_tensor)
-
-            # ✅ 正确构造 yt_after：用 KTOnlyModel + simulate_learning
-            yt_after = simulate_learning_for_metrics(
-                kt_model=self.kt_model,
-                original_seqs=[full_seq_i],
-                original_ans=[full_ans_i],
-                topk_sequence=topk_sequence,
-                graph=self.graph,
-                yt_before=yt_before,
-                batch_size=1,
-                K=self.metrics_topnum,
-            )
-
-            pred_probs_flat = pred_probs_1.reshape(-1, pred_probs_1.size(-1)).detach().cpu().numpy()
-
-            m = self.metric.combined_metrics(
-                yt_before=yt_before,
-                yt_after=yt_after,
-                topk_sequence=topk_sequence,
-                original_seqs=[full_seq_i],
-                hidden=hidden,
-                data_name=self.data_name,
-                batch_size=1,
-                seq_len=seq_len_full,
-                pred_probs=pred_probs_flat,
-                topnum=self.metrics_topnum,
-                T=self.metrics_T,
-            )
-
-            eff = float(m.get("effectiveness", 0.0))
-            ada = float(m.get("adaptivity", 0.0))
-            div = float(m.get("diversity", 0.0))
-            pref = float(m.get("preference", 0.0))
-
-            eff_t[i] = eff
-            ada_t[i] = ada
-            div_t[i] = div
-            pref_t[i] = pref
-
-            fq_t[i] = (
-                self.final_weights["effectiveness"] * eff
-                + self.final_weights["adaptivity"] * ada
-                + self.final_weights["diversity"] * div
-                + self.final_weights["preference"] * pref
-            )
+        # 5) final_quality: weighted sum (you can tune weights)
+        fq_t = (
+            self.final_weights.get("effectiveness", 0.4) * eff_t
+            + self.final_weights.get("diversity", 0.2) * div_t
+            + self.final_weights.get("preference", 0.1) * pref_t
+            + self.final_weights.get("adaptivity", 0.3) * ada_t
+        )
 
         return {
             "effectiveness": eff_t,
@@ -466,53 +442,73 @@ class LearningPathEnv:
             "final_quality": fq_t,
         }
 
+
+    @torch.no_grad()
+    def _effectiveness_episode_gain(self) -> torch.Tensor:
+        """
+        Episode-level effectiveness reward for appended recommendations:
+        Gain = mean( KT(full_seq)_end - KT(history)_end )
+        返回: [B]
+        """
+        device = self.original_tgt.device
+        B = self.batch_size
+
+        # 没有 KT 模型则无法算增益（兜底返回 0）
+        if self.kt_model is None:
+            return torch.zeros(B, device=device)
+
+        # history
+        hist_seq = self.original_tgt  # [B, L]
+        hist_ans = self.original_ans  # [B, L]
+        L = hist_seq.size(1)
+
+        # append chosen recommendations (paths): list of list[int]
+        rec_len = len(self.paths[0]) if self.paths is not None and len(self.paths) > 0 else 0
+        if rec_len == 0:
+            return torch.zeros(B, device=device)
+
+        rec_tensor = torch.tensor(self.paths, device=device, dtype=hist_seq.dtype)  # [B, rec_len]
+        full_seq = torch.cat([hist_seq, rec_tensor], dim=1)  # [B, L+rec_len]
+
+        # === 构造推荐题的伪答案 ===
+        # 先跑一次 KT 得到 history 末端知识状态（作为伪答题依据）
+        # KTOnlyModel.forward: (seq, ans, graph) -> yt_all [B, len, num_skills]
+        yt_hist = self.kt_model(hist_seq, hist_ans, self.graph)  # [B, L, K]
+        k_end = yt_hist[:, -1, :]  # [B, K]
+
+        # 用 “>=0.5” 或者你原来 “>=0” 的规则生成伪答案（建议先用 >=0.5，更像概率）
+        # 这里对每个推荐题取 k_end[item] 作为答对概率阈值生成答案
+        full_ans = torch.zeros((B, L + rec_len), device=device, dtype=hist_ans.dtype)
+        full_ans[:, :L] = hist_ans
+
+        for i in range(B):
+            for j, item in enumerate(self.paths[i]):
+                item = int(item)
+                if 0 <= item < k_end.size(1):
+                    full_ans[i, L + j] = 1 if (k_end[i, item] >= 0) else 0
+                else:
+                    full_ans[i, L + j] = 0
+
+        # === 跑 KT 得到 full 末端知识状态 ===
+        yt_full = self.kt_model(full_seq, full_ans, self.graph)  # [B, L+rec_len, K]
+        # gain = (yt_full[:, -1, :] - yt_hist[:, -1, :]).mean(dim=-1)  # [B]
+        # skills involved in the appended recs for each sample
+        gain = torch.zeros(B, device=device)
+        for i in range(B):
+            idx = torch.tensor(list(set(self.paths[i])), device=device, dtype=torch.long)
+            idx = idx[(idx >= 0) & (idx < yt_hist.size(2))]
+            if idx.numel() == 0:
+                continue
+            gain[i] = (yt_full[i, -1, idx] - yt_hist[i, -1, idx]).mean()
+
+        return gain
+
     def compute_final_reward(self) -> torch.Tensor:
-        """
-        使用原始 calculate_muti_obj.py 中的逻辑，
-        计算 episode-level 的 effectiveness / final_quality
-        """
-        device = self.device
-        batch_size = self.batch_size
+        # episode-level effectiveness only (no Metrics.combined_metrics, no division by zero)
+        return self._effectiveness_episode_gain()
 
-        # 1️⃣ 原始历史序列（不加 PAD、不加推荐）
-        original_seqs = self.original_tgt.tolist()  # [B, seq_len]
-        original_ans = self.original_ans.tolist()  # [B, seq_len]
 
-        # 2️⃣ yt_before：来自 base_model（你之前就是这么算的）
-        # shape: [B, seq_len-1, num_skills]
-        yt_before = self.yt_before.detach()
 
-        # 3️⃣ topk_sequence：RL 过程中记录的推荐
-        # 形状必须对齐你原来的逻辑：
-        # [B][seq_len-1][topnum]
-        topk_sequence = self.topk_sequence_for_metrics
-
-        # 4️⃣ 调用你原来已经验证正确的 simulate_learning
-        yt_after = simulate_learning(
-            self.kt_model,
-            original_seqs,
-            original_ans,
-            topk_sequence,
-            self.graph,
-            yt_before,
-            batch_size,
-            self.metrics_topnum,
-        )
-
-        # 5️⃣ 计算 effectiveness（你原来怎么调，现在一模一样）
-        effectiveness = self.metric.compute_effectiveness(
-            original_seqs,
-            yt_before,
-            yt_after,
-            topk_sequence
-        )
-
-        # 6️⃣ 只返回一个 episode-level reward（标量或 [B]）
-        # 如果 effectiveness 是标量：
-        if not torch.is_tensor(effectiveness):
-            effectiveness = torch.tensor(effectiveness, device=device)
-
-        return effectiveness
 
 
 # ======================================================
