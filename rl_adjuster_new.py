@@ -234,40 +234,64 @@ class LearningPathEnv:
         return self._make_state_from_last()
 
     def _forward_base(self, seq, ts, idx, ans):
-            """
-            Forward the pretrained/base model (MSHGAT) to obtain:
-              - next-item probability distribution over items (from `pred_flat`)
-              - KT outputs `yt` (mastery probabilities)
-              - item graph embeddings `hidden` (for diversity)
-            MSHGAT forward returns:
-                pred_flat: [(B*(T)), N] where T = seq_len-1
-                pred_res:  [B, T] (DKT next-question prob for the actual next question)
-                kt_mask:   [B, T]
-                yt:        [B, T, N] (mastery probs aligned to next-question)
-                hidden:    [N, D] (graph embedding for each item)
-            """
-            self.base_model.eval()
-            with torch.no_grad():
-                pred_flat, pred_res, kt_mask, yt, hidden, status_emb = self.base_model(
-                    seq, ts, idx, ans, self.graph, self.hypergraph_list
-                )
+        """
+        Forward the pretrained/base model (MSHGAT) to obtain:
+          - next-item logits over all items (flattened) -> reshape to [B, T, N]
+          - KT outputs yt -> [B, T, N]
+          - item graph embeddings hidden -> [N, D] (for diversity)
 
-            B = seq.size(0)
-            # In MSHGAT, predictions are aligned to next step, so T = seq_len - 1
-            T = max(int(seq.size(1)) - 1, 1)
-            N = pred_flat.size(-1)
+        IMPORTANT (robustness):
+        - Do NOT assume T == seq_len-1 because your dataloader pads to max_len (e.g. 200)
+          but the model may internally drop padded steps and output a shorter flattened tensor.
+        - Therefore infer T from pred_flat.shape[0] // B when possible.
+        """
+        self.base_model.eval()
+        with torch.no_grad():
+            outs = self.base_model(seq, ts, idx, ans, self.graph, self.hypergraph_list)
 
-            # pred_flat is logits+mask (not softmaxed). Convert to probabilities.
-            pred_probs = torch.softmax(pred_flat.view(B, T, N), dim=-1)  # [B,T,N]
-            self._last_pred_probs_full = pred_probs
+        # Your calculate_muti_obj.py uses: pred, pred_res, kt_mask, yt_before, hidden = model(...)
+        # Some versions may return extra tensors; we only rely on the first 5.
+        if isinstance(outs, (list, tuple)):
+            if len(outs) < 5:
+                raise RuntimeError(f"base_model should return at least 5 tensors, got {len(outs)}")
+            pred_flat, pred_res, kt_mask, yt, hidden = outs[:5]
+        else:
+            raise RuntimeError("base_model forward must return a tuple/list")
 
-            # yt is already probabilities (sigmoid in DKT). It is [B,T,N] in your DKT.
-            if yt.dim() == 2:
-                yt = yt.view(B, T, -1)
-            self._last_yt_full = yt
+        B = int(seq.size(0))
 
-            # hidden is [N,D] item embeddings from GNN
-            self._last_hidden = hidden
+        # pred_flat must be [B*T, N]
+        if pred_flat.dim() != 2:
+            raise RuntimeError(f"pred_flat must be 2D [B*T, N], got {tuple(pred_flat.shape)}")
+
+        N = int(pred_flat.size(-1))
+        T = int(pred_flat.size(0) // B) if pred_flat.size(0) % B == 0 else max(int(seq.size(1)) - 1, 1)
+
+        pred_flat = pred_flat[:B*T]  # safe truncate
+        pred_probs = torch.softmax(pred_flat.view(B, T, N), dim=-1)  # [B,T,N]
+        self._last_pred_probs_full = pred_probs
+
+        # yt should be [B,T,N] (DKT sigmoid probabilities). Truncate/pad to match T.
+        if yt.dim() == 2:
+            # occasionally returned flattened -> reshape like pred_flat with unknown N'
+            ytN = int(yt.size(-1))
+            ytT = int(yt.size(0) // B) if yt.size(0) % B == 0 else T
+            yt = yt[:B*ytT].view(B, ytT, ytN)
+        elif yt.dim() == 3:
+            pass
+        else:
+            raise RuntimeError(f"yt must be 2D or 3D, got {tuple(yt.shape)}")
+
+        # Align length to T
+        if yt.size(1) >= T:
+            yt = yt[:, :T, :]
+        else:
+            # pad time dimension if needed
+            pad_t = T - yt.size(1)
+            yt = torch.cat([yt, yt[:, -1:, :].repeat(1, pad_t, 1)], dim=1)
+
+        self._last_yt_full = yt.detach()  # keep as probs
+        self._last_hidden = hidden.detach() if isinstance(hidden, torch.Tensor) else hidden
 
     def _make_state_from_last(self):
         pred_last = self._last_pred_probs_full[:, -1, :]  # [B,N]
@@ -363,17 +387,17 @@ class LearningPathEnv:
         return r
 
     # ---------------- final metrics ----------------
+
     def _pairwise_diversity(self, emb: torch.Tensor) -> torch.Tensor:
-        """emb: [M,D]; return scalar diversity in [0,1] approx (mean 1-cos over pairs)."""
+        """emb: [M,D]; return mean(1 - cosine_sim) over unordered pairs (upper triangle excl diag)."""
         M = emb.size(0)
         if M < 2:
             return torch.tensor(0.0, device=emb.device)
         emb = F.normalize(emb, p=2, dim=-1)
-        sim = emb @ emb.t()  # [M,M]
-        # upper triangle excluding diag
-        triu = torch.triu(sim, diagonal=1)
-        cnt = M * (M - 1) / 2
-        div = (1.0 - triu).sum() / (cnt + 1e-8)
+        sim = emb @ emb.t()  # [M,M], cosine sim in [-1,1]
+        idx = torch.triu_indices(M, M, offset=1, device=emb.device)
+        sim_pairs = sim[idx[0], idx[1]]  # [M*(M-1)/2]
+        div = (1.0 - sim_pairs).mean()
         return div
 
     def _path_level_adaptivity(self) -> torch.Tensor:
@@ -434,9 +458,27 @@ class LearningPathEnv:
                 sim_ans[:, t] = (probs > 0.5).long().to(sim_ans.dtype)
         full_ans = torch.cat([self.original_ans, sim_ans], dim=1)
 
-        yt_before_all = self._simulate_yt_after(self.original_tgt, self.original_ans)   # [B, L, N]
-        yt_after_all = self._simulate_yt_after(full_seq, full_ans)                       # [B, L+ext, N]
+        # --- KT before/after for effectiveness ---
+        yt_hist = self._simulate_yt_after(self.original_tgt, self.original_ans)  # [B, Th, N] or [B, Th+1, N]
+        if yt_hist.dim() != 3:
+            raise RuntimeError(f"kt_model output must be [B,T,N], got {tuple(yt_hist.shape)}")
 
+        # Standardize yt_hist to [B, L_hist-1, N]
+        L_hist = int(self.original_tgt.size(1))
+        if yt_hist.size(1) == L_hist:
+            yt_hist = yt_hist[:, :-1, :]
+        elif yt_hist.size(1) > L_hist:
+            yt_hist = yt_hist[:, :L_hist - 1, :]
+
+        last_state = yt_hist[:, -1, :]  # [B,N]
+        yt_before_all = torch.cat([yt_hist, last_state.unsqueeze(1).repeat(1, ext_len, 1)], dim=1)  # [B, L_hist-1+ext, N]
+
+        yt_after_all = self._simulate_yt_after(full_seq, full_ans)  # [B, Tf, N] or [B, Tf+1, N]
+        full_L = int(full_seq.size(1))
+        if yt_after_all.size(1) == full_L:
+            yt_after_all = yt_after_all[:, :-1, :]
+        elif yt_after_all.size(1) > full_L:
+            yt_after_all = yt_after_all[:, :full_L - 1, :]
         # build topk_indices tensor aligned to full_seq length-1, filled with PAD(0)
         L_full = full_seq.size(1)
         K = self.metrics_topnum
