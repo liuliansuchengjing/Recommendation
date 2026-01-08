@@ -1,11 +1,18 @@
+
 # -*- coding: utf-8 -*-
 """
-rl_adjuster.py
-强化学习路径优化：候选集合内的策略分布 top-k + Metrics 口径的终端指标（按样本计算）
-- 保留对 train_rl.py / 旧接口的兼容：PolicyNetwork / LearningPathEnv / PPOTrainer / RLPathOptimizer / evaluate_policy
-"""
-from __future__ import annotations
+rl_adjuster_new.py
 
+修正版要点（按你确认的口径）：
+1) Metrics 口径：历史每个时间步都有 topk
+   - history: 使用 base model (MSHGAT) 在全资源 softmax 后的 top-k
+   - appended(RL): 使用 policy 分布 top-k 覆盖对应时间步
+2) step reward 的 preference / difficulty：使用 step 前旧 state（旧 forward）计算
+3) 不修改 Metrics.py：在本文件内实现 per-sample wrapper（避免 global mean / 除零）
+4) diversity：严格 1 - cosine，相同公式；只对真实 pair 统计（避免下三角 0 误计）
+"""
+
+from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -14,36 +21,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
-import pickle
-
 import Constants
 from Metrics import Metrics
 
 try:
-    from dataLoader import Options
-except Exception:
-    Options = None
-
-try:
-    # HGAT.py 里定义了 KTOnlyModel
-    from HGAT import KTOnlyModel
+    from HGAT import KTOnlyModel  # 你的 HGAT.py 里定义了 KTOnlyModel
 except Exception:
     KTOnlyModel = None
 
 
 def _ensure_2d(x: torch.Tensor) -> torch.Tensor:
-    """Ensure tensor is [B, L]."""
-    if x.dim() == 1:
-        return x.unsqueeze(0)
-    return x
+    return x.unsqueeze(0) if x.dim() == 1 else x
 
 
 def _pad_and_concat_like(original_2d: torch.Tensor, ext_len: int, pad_value: int = 0) -> torch.Tensor:
-    """
-    original_2d: [B, L]
-    return: [B, L + ext_len] where the new tail is pad_value
-    """
+    """original_2d: [B,L] -> [B,L+ext_len]"""
     original_2d = _ensure_2d(original_2d)
+    if ext_len <= 0:
+        return original_2d
     B = original_2d.size(0)
     pad = torch.full((B, ext_len), pad_value, device=original_2d.device, dtype=original_2d.dtype)
     return torch.cat([original_2d, pad], dim=1)
@@ -51,786 +46,661 @@ def _pad_and_concat_like(original_2d: torch.Tensor, ext_len: int, pad_value: int
 
 class PolicyNetwork(nn.Module):
     """
-    简单 policy：对候选集合内每个 item 输出一个 logit
-    输入:
-      knowledge_state: [B, N]  (N=num_skills/items)
-      candidate_features: [B, K, 1]  (这里仅用 cand_probs)
-    输出:
-      logits: [B, K]
+    输入：候选集合的特征（例如 base 模型 embedding/状态拼接后的向量）
+    输出：候选集合上的 logits（用于 Categorical）
     """
-
-    def __init__(self, knowledge_dim: int, candidate_feature_dim: int = 1, hidden_dim: int = 128, topk: int = 10):
+    def __init__(self, in_dim: int, hidden_dim: int = 128):
         super().__init__()
-        self.knowledge_dim = int(knowledge_dim)
-        self.topk = int(topk)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),  # per-candidate logit
+        )
 
-        self.know_proj = nn.Linear(self.knowledge_dim, hidden_dim)
-        self.cand_proj = nn.Linear(candidate_feature_dim, hidden_dim)
-        self.out = nn.Linear(hidden_dim, 1)
-
-    def forward(self, knowledge_state: torch.Tensor, candidate_features: torch.Tensor) -> torch.Tensor:
-        # knowledge_state: [B,N]
-        # candidate_features: [B,K,1]
-        B, K, _ = candidate_features.shape
-        h = torch.tanh(self.know_proj(knowledge_state))  # [B,H]
-        c = torch.tanh(self.cand_proj(candidate_features))  # [B,K,H]
-        h = h.unsqueeze(1).expand(-1, K, -1)  # [B,K,H]
-        logits = self.out(h + c).squeeze(-1)  # [B,K]
-        return logits
+    def forward(self, cand_feat: torch.Tensor) -> torch.Tensor:
+        """
+        cand_feat: [B, Kcand, Din]
+        return logits: [B, Kcand]
+        """
+        B, K, D = cand_feat.shape
+        x = self.mlp(cand_feat).view(B, K)
+        return x
 
 
 class LearningPathEnv:
     """
-    环境：给定学生历史序列（tgt/...），每一步在候选集合上选择一个 item 追加到路径末端。
-    关键点（已按你们讨论的方案落地）：
-    1) step-level 奖励中的 preference/difficulty **基于 step 前（旧 state）的输出**。
-    2) 记录 step_topk_items：候选集合内的“策略分布 top-k”（由 policy logits 取 top-k）。
-    3) 终端指标 compute_final_metrics：按样本计算（不做 global mean 再复制）。
-    4) diversity：严格按 Metrics 口径（使用 base_model.gnn 的 hidden 作 item embedding，计算 1-cosine 相似度的均值）。
-    5) adaptivity：默认用 yt_before 在“相关 item 子集”（本条推荐路径）上的能力聚合 + 真实难度聚合。
-       （保留 simulated-answer 版本的备注入口，但默认不启用）
+    环境封装：
+    - reset() 传入一个 batch 的历史序列与图结构
+    - step(action_idx_in_candidate) 扩展路径一步
+    - 记录：
+        self.paths[b] : RL 选中的 item id 序列
+        self.topk_recs[b][t] : 每一步 policy 分布 top-k 的 item id（动作空间内映射到全局 id）
+    - 最终：
+        compute_final_metrics()：按样本输出 effectiveness/adaptivity/diversity/preference/final_quality
     """
-
     def __init__(
-            self,
-            batch_size: int,
-            base_model,
-            recommendation_length: int,
-            data_name: str,
-            graph=None,
-            hypergraph_list=None,
-            policy_topk: int = 10,
-            metrics_topnum: Optional[int] = None,
-            metrics_T: int = 5,
-            final_weights: Optional[Dict[str, float]] = None,
+        self,
+        pretrained_model: nn.Module,
+        num_skills: int,
+        recommendation_length: int = 5,
+        policy_topk: int = 20,
+        metrics_topnum: int = 20,
+        final_weights: Optional[Dict[str, float]] = None,
+        step_weights: Optional[Dict[str, float]] = None,
+        device: Optional[torch.device] = None,
     ):
-        self.batch_size = int(batch_size)
-        self.base_model = base_model
+        self.base_model = pretrained_model
+        self.num_skills = int(num_skills)
         self.recommendation_length = int(recommendation_length)
-        self.data_name = data_name
-        self.graph = graph
-        self.hypergraph_list = hypergraph_list
-
         self.policy_topk = int(policy_topk)
-        self.metrics_topnum = int(metrics_topnum if metrics_topnum is not None else policy_topk)
-        self.metrics_topnum = max(1, min(self.metrics_topnum, self.policy_topk))
-        self.metrics_T = int(metrics_T)
+        self.metrics_topnum = int(metrics_topnum)
+        self.final_weights = final_weights or {"effectiveness": 0.4, "adaptivity": 0.3, "diversity": 0.2, "preference": 0.1}
+        self.step_weights = step_weights or {"preference": 0.5, "difficulty": 0.5}
+        self.device = device or next(pretrained_model.parameters()).device
 
+        # Metrics evaluator (不改动 Metrics.py)
         self.metric = Metrics()
-        self.final_weights = final_weights or {
-            "effectiveness": 0.4,
-            "adaptivity": 0.3,
-            "diversity": 0.2,
-            "preference": 0.1,
-        }
 
-        # difficulty cache (idx -> diff_int in {1,2,3})
-        self.idx2u = None
-        self.difficulty_data: Dict[int, int] = {}
-        self._load_difficulty_data()
+        # KTOnlyModel for effectiveness (不改动 Metrics.py)
+        self.kt_model = KTOnlyModel(pretrained_model).to(self.device) if KTOnlyModel is not None else None
+        if self.kt_model is not None:
+            self.kt_model.eval()
 
-        # KT-only model for effectiveness simulation
-        self.kt_model = None
-        if KTOnlyModel is not None:
-            try:
-                self.kt_model = KTOnlyModel(self.base_model)
-            except Exception:
-                self.kt_model = None
+        # runtime buffers
+        self.graph = None
+        self.hypergraph_list = None
 
-        self._reset_episode()
-
-    def _load_difficulty_data(self):
-        if Options is None:
-            return
-        try:
-            opt = Options(self.data_name)
-            with open(opt.idx2u_dict, "rb") as f:
-                self.idx2u = pickle.load(f)
-            diff = {}
-            with open(opt.difficult_file, "r") as f:
-                next(f)
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = line.split(",")
-                    if len(parts) < 2:
-                        continue
-                    try:
-                        cid = int(parts[0].strip())
-                        d = int(parts[1].strip())
-                        diff[cid] = d
-                    except Exception:
-                        continue
-            self.difficulty_data = diff
-        except Exception:
-            # fall back to empty
-            self.idx2u = None
-            self.difficulty_data = {}
-
-    def _diff_norm(self, item_ids: torch.Tensor) -> torch.Tensor:
-        """
-        item_ids: [B] long
-        return diff_norm: [B] float in {0.0,0.5,1.0}
-        """
-        item_ids = item_ids.long()
-        out = torch.zeros(item_ids.size(0), device=item_ids.device, dtype=torch.float)
-        if self.idx2u is None or not self.difficulty_data:
-            return out
-        # idx2u maps idx -> original_id (challenge_id)
-        for i in range(item_ids.size(0)):
-            idx = int(item_ids[i].item())
-            try:
-                oid = int(self.idx2u[idx])
-            except Exception:
-                oid = None
-            d = self.difficulty_data.get(oid, 1) if oid is not None else 1
-            # normalize 1/2/3 -> 0/0.5/1
-            out[i] = float(max(1, min(3, int(d))) - 1) / 2.0
-        return out
-
-    def _reset_episode(self):
         self.original_tgt = None
         self.original_tgt_timestamp = None
         self.original_tgt_idx = None
         self.original_ans = None
 
+        self.batch_size = 0
+        self.t = 0
+
+        # cached from last base forward on current extended seq
+        self._last_pred_probs_full: Optional[torch.Tensor] = None  # [B, T, N]
+        self._last_yt_full: Optional[torch.Tensor] = None          # [B, T, S]
+        self._last_hidden: Optional[torch.Tensor] = None           # [N, d] or [B,...] depending on model
+
+        # step-time caches (old state)
+        self._old_pred_last: Optional[torch.Tensor] = None  # [B, N]
+        self._old_yt_last: Optional[torch.Tensor] = None    # [B, S]
+
+        # episode records
         self.paths: List[List[int]] = []
-        self.topk_recs: List[List[List[int]]] = []  # per sample: list of steps, each step list of topn item ids
+        self.topk_recs: List[List[List[int]]] = []
+        self.chosen_actions: List[List[int]] = []
 
-        self.current_step = 0
-
-        # caches from last forward
-        self._last_pred_probs_full = None  # [B, L, N]
-        self._last_yt_full = None  # [B, L, N]
-        self._last_hidden = None  # [N, D]
-
-        # caches at reset
-        self._yt_before = None  # [B, N]
-
-        # step-level logs for preference
-        self._pref_hist: List[List[float]] = []
-        self._repeat_hist: List[List[int]] = []
-
-    def reset(self, tgt, tgt_timestamp, tgt_idx, ans, graph=None, hypergraph_list=None):
-        self._reset_episode()
-        self.original_tgt = _ensure_2d(tgt)
-        self.original_tgt_timestamp = _ensure_2d(tgt_timestamp)
-        self.original_tgt_idx = _ensure_2d(tgt_idx)
-        self.original_ans = _ensure_2d(ans)
-
-        if graph is not None:
-            self.graph = graph
-        if hypergraph_list is not None:
-            self.hypergraph_list = hypergraph_list
-
-        B = self.original_tgt.size(0)
-        self.paths = [[] for _ in range(B)]
-        self.topk_recs = [[] for _ in range(B)]
-        self._pref_hist = [[] for _ in range(B)]
-        self._repeat_hist = [[] for _ in range(B)]
-        self.current_step = 0
-
-        self._forward_base(self.original_tgt, self.original_tgt_timestamp, self.original_tgt_idx, self.original_ans)
-        self._yt_before = self._last_yt_full[:, -1, :].detach()
-        return self._make_state_from_last()
-
-    def _forward_base(self, seq, ts, idx, ans):
-        """
-        Forward the pretrained/base model (MSHGAT) to obtain:
-          - next-item logits over all items (flattened) -> reshape to [B, T, N]
-          - KT outputs yt -> [B, T, N]
-          - item graph embeddings hidden -> [N, D] (for diversity)
-
-        IMPORTANT (robustness):
-        - Do NOT assume T == seq_len-1 because your dataloader pads to max_len (e.g. 200)
-          but the model may internally drop padded steps and output a shorter flattened tensor.
-        - Therefore infer T from pred_flat.shape[0] // B when possible.
-        """
-        self.base_model.eval()
-        with torch.no_grad():
-            outs = self.base_model(seq, ts, idx, ans, self.graph, self.hypergraph_list)
-
-        # Your calculate_muti_obj.py uses: pred, pred_res, kt_mask, yt_before, hidden = model(...)
-        # Some versions may return extra tensors; we only rely on the first 5.
-        if isinstance(outs, (list, tuple)):
-            if len(outs) < 5:
-                raise RuntimeError(f"base_model should return at least 5 tensors, got {len(outs)}")
-            pred_flat, pred_res, kt_mask, yt, hidden = outs[:5]
-        else:
-            raise RuntimeError("base_model forward must return a tuple/list")
-
-        B = int(seq.size(0))
-
-        # pred_flat must be [B*T, N]
-        if pred_flat.dim() != 2:
-            raise RuntimeError(f"pred_flat must be 2D [B*T, N], got {tuple(pred_flat.shape)}")
-
-        N = int(pred_flat.size(-1))
-        T = int(pred_flat.size(0) // B) if pred_flat.size(0) % B == 0 else max(int(seq.size(1)) - 1, 1)
-
-        pred_flat = pred_flat[:B * T]  # safe truncate
-        pred_probs = torch.softmax(pred_flat.view(B, T, N), dim=-1)  # [B,T,N]
-        self._last_pred_probs_full = pred_probs
-
-        # yt should be [B,T,N] (DKT sigmoid probabilities). Truncate/pad to match T.
-        if yt.dim() == 2:
-            # occasionally returned flattened -> reshape like pred_flat with unknown N'
-            ytN = int(yt.size(-1))
-            ytT = int(yt.size(0) // B) if yt.size(0) % B == 0 else T
-            yt = yt[:B * ytT].view(B, ytT, ytN)
-        elif yt.dim() == 3:
-            pass
-        else:
-            raise RuntimeError(f"yt must be 2D or 3D, got {tuple(yt.shape)}")
-
-        # Align length to T
-        if yt.size(1) >= T:
-            yt = yt[:, :T, :]
-        else:
-            # pad time dimension if needed
-            pad_t = T - yt.size(1)
-            yt = torch.cat([yt, yt[:, -1:, :].repeat(1, pad_t, 1)], dim=1)
-
-        self._last_yt_full = yt.detach()  # keep as probs
-        self._last_hidden = hidden.detach() if isinstance(hidden, torch.Tensor) else hidden
-
-    def _make_state_from_last(self):
-        pred_last = self._last_pred_probs_full[:, -1, :]  # [B,N]
-        yt_last = self._last_yt_full[:, -1, :]  # [B,N]
-
-        topk = self.policy_topk
-        K = min(topk, pred_last.size(1))
-        cand_probs, cand_ids = torch.topk(pred_last, k=K, dim=-1)  # [B,K]
-        return {
-            "knowledge_state": yt_last,
-            "cand_probs": cand_probs,
-            "cand_ids": cand_ids,
-        }
-
-    def step(self, chosen_item_ids: torch.Tensor, step_topk_items: torch.Tensor):
-        """
-        chosen_item_ids: [B] item ids (NOT indices in candidate list)
-        step_topk_items: [B, topn] item ids computed from policy distribution top-k within candidate space
-        """
-        B = chosen_item_ids.size(0)
-        device = chosen_item_ids.device
-
-        # -------- cache OLD outputs (step-timing correctness) --------
-        old_pred_last = self._last_pred_probs_full[:, -1, :].detach()  # [B,N]
-        old_yt_last = self._last_yt_full[:, -1, :].detach()  # [B,N]
-
-        # record path and topk
-        for i in range(B):
-            self.paths[i].append(int(chosen_item_ids[i].item()))
-            self.topk_recs[i].append([int(x) for x in step_topk_items[i].tolist()])
-
-        # step reward
-        step_reward = self._step_reward(chosen_item_ids, old_pred_last, old_yt_last)
-
-        # build extended inputs (history + appended path so far)
-        ext_len = len(self.paths[0])
-        path_tensor = torch.tensor(self.paths, device=device, dtype=self.original_tgt.dtype)  # [B, ext_len]
-        ext_tgt = torch.cat([self.original_tgt, path_tensor], dim=1)
-        ext_timestamp = _pad_and_concat_like(self.original_tgt_timestamp, ext_len, pad_value=0)
-        ext_idx = _pad_and_concat_like(self.original_tgt_idx, ext_len, pad_value=0)
-        pad_ans = torch.zeros(B, ext_len, device=device, dtype=self.original_ans.dtype)
-        ext_ans = torch.cat([self.original_ans, pad_ans], dim=1)
-
-        self._forward_base(ext_tgt, ext_timestamp, ext_idx, ext_ans)
-
-        self.current_step += 1
-        done = torch.zeros(B, dtype=torch.bool, device=device)
-        if self.current_step >= self.recommendation_length:
-            done[:] = True
-
-        return self._make_state_from_last(), step_reward, done
-
-    def _step_reward(self, chosen_item_ids, pred_last, yt_last):
-        """
-        即时奖励（按旧 state 计算）：
-          preference: pred_last[item]
-          difficulty match: 1 - | ability(item) - diff_norm(item) |
-          diversity: repeat penalty
-        """
-        B = chosen_item_ids.size(0)
-        device = chosen_item_ids.device
-        r = torch.zeros(B, device=device)
-
-        # weights (保持你原来口径，可在外部调)
-        w_pref = 0.10
-        w_diff = 0.10
-        w_div = 0.05
-
-        diff_norm = self._diff_norm(chosen_item_ids)  # [B]
-
-        for i in range(B):
-            item = int(chosen_item_ids[i].item())
-
-            # preference
-            if 0 <= item < pred_last.size(1):
-                pref = pred_last[i, item]
-                r[i] += w_pref * pref
-                self._pref_hist[i].append(float(pref.item()))
-            else:
-                self._pref_hist[i].append(0.0)
-
-            # diversity: repeat penalty
-            is_repeat = 1 if item in self.paths[i][:-1] else 0
-            self._repeat_hist[i].append(is_repeat)
-            if is_repeat:
-                r[i] -= w_div
-
-            # difficulty match (ability is yt probability on this item)
-            if 0 <= item < yt_last.size(1):
-                ability = yt_last[i, item]
-                r[i] += w_diff * (1.0 - torch.abs(ability - diff_norm[i]))
-
-        return r
-
-    # ---------------- final metrics ----------------
-
-    def _pairwise_diversity(self, emb: torch.Tensor) -> torch.Tensor:
-        """emb: [M,D]; return mean(1 - cosine_sim) over unordered pairs (upper triangle excl diag)."""
-        M = emb.size(0)
-        if M < 2:
-            return torch.tensor(0.0, device=emb.device)
-        emb = F.normalize(emb, p=2, dim=-1)
-        sim = emb @ emb.t()  # [M,M], cosine sim in [-1,1]
-        idx = torch.triu_indices(M, M, offset=1, device=emb.device)
-        sim_pairs = sim[idx[0], idx[1]]  # [M*(M-1)/2]
-        div = (1.0 - sim_pairs).mean()
-        return div
-
-    def _path_level_adaptivity(self) -> torch.Tensor:
-        """
-        per-sample adaptivity:
-          ability_path = mean( yt_before[item] for item in path )
-          diff_path = mean( diff_norm(item) for item in path )
-          score = 1 - |ability_path - diff_path|
-        """
-        B = self.batch_size
-        device = self.original_tgt.device
-        out = torch.zeros(B, device=device)
-        if self._yt_before is None:
-            return out
-
-        for i in range(B):
-            path = [int(x) for x in self.paths[i] if int(x) > 1]
-            if len(path) == 0:
-                continue
-            items = torch.tensor(path, device=device, dtype=torch.long)
-            items = items.clamp(0, self._yt_before.size(1) - 1)
-            ability = self._yt_before[i].gather(0, items).mean()
-            diff = self._diff_norm(items).mean()
-            out[i] = 1.0 - torch.abs(ability - diff)
-        return out
+        # difficulty mapping (1/2/3) -> normalized to [0,1]
+        # 如果你后面要从文件读取真实难度，可在这里替换
+        self.item_difficulty = None  # Optional[torch.Tensor] shape [N] values in {1,2,3}
 
     @torch.no_grad()
-    def _simulate_yt_after(self, full_seq: torch.Tensor, full_ans: torch.Tensor) -> torch.Tensor:
+    def _forward_base(self, seq: torch.Tensor, ts: torch.Tensor, idx: torch.Tensor, ans: torch.Tensor):
         """
-        Run KTOnlyModel to obtain yt_all: [B, L, N]
+        MSHGAT(seq, ts, idx, ans, graph, hypergraph_list) -> (pred_flat, pred_res, kt_mask, yt, hidden, status_emb)
+        我们只依赖：
+          pred_flat: [B*T, N] logits(+mask)
+          yt:        [B, T, S] or [B, T, S]（来自 ktmodel）
+          hidden:    item embedding [N, d]
+        """
+        self.base_model.eval()
+        out = self.base_model(seq, ts, idx, ans, self.graph, self.hypergraph_list)
+
+        # 兼容返回值数量不同
+        if isinstance(out, (tuple, list)):
+            pred_flat = out[0]
+            yt = out[3] if len(out) > 3 else None
+            hidden = out[4] if len(out) > 4 else None
+        else:
+            raise RuntimeError("base_model forward must return tuple/list")
+
+        B = seq.size(0)
+        T = pred_flat.size(0) // B
+        pred_logits = pred_flat.view(B, T, -1)               # [B,T,N]
+        pred_probs = F.softmax(pred_logits, dim=-1)          # [B,T,N]
+
+        self._last_pred_probs_full = pred_probs
+        self._last_yt_full = yt
+        self._last_hidden = hidden
+
+        return pred_probs, yt, hidden
+
+    @torch.no_grad()
+    def _kt_forward(self, seq: torch.Tensor, ans: torch.Tensor) -> torch.Tensor:
+        """
+        返回 yt_all: [B, (L-1), S]，与 Metrics.compute_effectiveness 口径一致
         """
         if self.kt_model is None:
-            # fallback: use last cached yt
+            # fallback：如果没法单独跑 KT，就用 base forward 的 yt（需已 forward）
+            if self._last_yt_full is None:
+                raise AttributeError("kt_model is None and _last_yt_full is None")
             return self._last_yt_full
-        return self.kt_model(full_seq, full_ans, self.graph)
+        yt_all = self.kt_model(seq, ans, self.graph)  # HGAT.KTOnlyModel: yt_all
+        return yt_all
 
-    def compute_final_metrics(self) -> Dict[str, torch.Tensor]:
-        """Compute per-sample metrics on the *full* trajectory (history + recommended path).
+    def reset(self, tgt, tgt_timestamp, tgt_idx, ans, graph=None, hypergraph_list=None) -> Dict[str, torch.Tensor]:
+        self.graph = graph
+        self.hypergraph_list = hypergraph_list
 
-        IMPORTANT (matches user's original setup):
-        - topk_indices exists at EVERY time step (t = 0..L_full-2). For the history part we use
-          base-model top-k; for the appended RL steps we overwrite with policy top-k.
-        - preference follows Metrics.combined_metrics definition: mean predicted probability of the recommended items.
-        - diversity uses 1 - cosine similarity on embeddings from the base model's graph hidden.
+        self.original_tgt = _ensure_2d(tgt).to(self.device)
+        self.original_tgt_timestamp = _ensure_2d(tgt_timestamp).to(self.device)
+        self.original_tgt_idx = _ensure_2d(tgt_idx).to(self.device)
+        self.original_ans = _ensure_2d(ans).to(self.device)
+
+        self.batch_size = self.original_tgt.size(0)
+        self.t = 0
+
+        self.paths = [[] for _ in range(self.batch_size)]
+        self.topk_recs = [[] for _ in range(self.batch_size)]
+        self.chosen_actions = [[] for _ in range(self.batch_size)]
+
+        # base forward on history (初始化 old state)
+        pred_probs, yt, hidden = self._forward_base(self.original_tgt, self.original_tgt_timestamp, self.original_tgt_idx, self.original_ans)
+
+        # old state is last time-step of history prediction horizon
+        self._old_pred_last = pred_probs[:, -1, :]           # [B,N]
+        self._old_yt_last = yt[:, -1, :] if yt is not None else None
+
+        return self._build_state()
+
+    def _build_state(self) -> Dict[str, torch.Tensor]:
         """
-        if self.original_tgt is None:
-            z = torch.zeros(self.batch_size)
-            return {"effectiveness": z, "adaptivity": z, "diversity": z, "preference": z, "final_quality": z}
+        state for policy:
+          - candidate_ids: [B, Kcand]
+          - candidate_features: [B, Kcand, Din]
+        """
+        assert self._old_pred_last is not None
+        B = self.batch_size
+        Kcand = self.policy_topk
 
-        device = self.original_tgt.device
-        B = int(self.batch_size)
-
-        # -------------------------
-        # 1) Build full sequence: history + path
-        # -------------------------
-        ext_len = len(self.paths[0]) if (self.paths is not None and len(self.paths) > 0) else 0
-        if ext_len <= 0:
-            z = torch.zeros(B, device=device)
-            return {"effectiveness": z, "adaptivity": z, "diversity": z, "preference": z, "final_quality": z}
-
-        path_tensor = torch.tensor(self.paths, device=device, dtype=self.original_tgt.dtype)  # [B, ext_len]
-        full_seq = torch.cat([self.original_tgt, path_tensor], dim=1)  # [B, L_hist + ext_len]
-        L_hist = int(self.original_tgt.size(1))
-        L_full = int(full_seq.size(1))
-
-        # -------------------------
-        # 2) Build full answers: history ans + simulated answers for appended items
-        # -------------------------
-        full_ans = torch.zeros_like(full_seq, dtype=torch.float32, device=device)
-        full_ans[:, :L_hist] = self.original_ans.float()
-
-        # Simulated answers for appended items: use yt_before (history last state) probability threshold 0.5
-        yt_hist_all = self._kt_forward(self.original_tgt, self.original_ans)  # [B, L_hist, num_skills] (yt_all)
-        if yt_hist_all.dim() == 3 and yt_hist_all.size(1) == L_hist:
-            yt_hist = yt_hist_all[:, :-1, :]  # [B, L_hist-1, num_skills]
+        # candidates from old_pred_last (base model distribution over ALL resources)
+        cand_probs, cand_ids = torch.topk(self._old_pred_last, k=Kcand, dim=-1)  # [B,Kcand]
+        # candidate features: [prob, (optional) ability_on_item]
+        if self._old_yt_last is not None:
+            ability = self._old_yt_last.gather(1, cand_ids.clamp(0, self._old_yt_last.size(1)-1))
+            cand_feat = torch.stack([cand_probs, ability], dim=-1)  # [B,K,2]
         else:
-            # fallback: treat as already [B, L_hist-1, K]
-            yt_hist = yt_hist_all
+            cand_feat = cand_probs.unsqueeze(-1)  # [B,K,1]
 
-        last_state = yt_hist[:, -1, :]  # [B, num_skills]
-        for t in range(ext_len):
-            items = path_tensor[:, t].long()  # [B]
-            prob = last_state.gather(1, items.unsqueeze(1)).squeeze(1)  # [B]
-            full_ans[:, L_hist + t] = (prob > 0.5).float()
+        return {
+            "candidate_ids": cand_ids,
+            "candidate_features": cand_feat,
+        }
 
-        # -------------------------
-        # 3) Get yt_before_all and yt_after_all aligned to L_full-1
-        # -------------------------
-        yt_before_all = torch.cat([yt_hist, last_state.unsqueeze(1).repeat(1, ext_len, 1)], dim=1)  # [B, L_full-1, K]
-
-        yt_after_all = self._kt_forward(full_seq, full_ans)  # yt_all: [B, L_full, K]
-        if yt_after_all.size(1) == L_full:
-            yt_after = yt_after_all[:, :-1, :]  # [B, L_full-1, K]
+    def _diff_norm(self, item_ids: torch.Tensor) -> torch.Tensor:
+        """
+        item difficulty in {1,2,3} -> [0,1]
+        若未提供真实难度，则用 2 作为中等难度占位
+        """
+        if self.item_difficulty is None:
+            d = torch.full_like(item_ids, 2, dtype=torch.float32)
         else:
-            yt_after = yt_after_all
-            if yt_after.size(1) > (L_full - 1):
-                yt_after = yt_after[:, :L_full - 1, :]
+            d = self.item_difficulty[item_ids.clamp(0, self.item_difficulty.numel()-1)].float()
+        return (d - 1.0) / 2.0
 
-        # -------------------------
-        # 4) Build topk_indices for EVERY time step (history: base top-k; appended: policy top-k)
-        # -------------------------
-        # Forward base model on full_seq to obtain pred logits for each time step (flattened)
-        pred_flat, _, kt_mask, _, hidden, _ = self._base_forward(full_seq, full_ans)  # pred_flat: [B*T, N]
-        # Infer T from pred_flat length; we expect T == L_full-1, but be robust.
-        N = int(pred_flat.size(-1))
-        T = int(pred_flat.size(0) // B)
-        pred_logits = pred_flat.view(B, T, N)  # [B, T, N]
-        pred_probs = torch.softmax(pred_logits, dim=-1)
+    def _step_reward(self, chosen_global_ids: torch.Tensor, old_pred_last: torch.Tensor, old_yt_last: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        即时奖励：基于旧 state（旧 forward）
+        - preference: old_pred_last[b, chosen]
+        - difficulty: 1 - | ability - diff |
+        """
+        device = old_pred_last.device
+        B = old_pred_last.size(0)
 
-        # Create a dense [B, L_full-1, N] by placing steps according to kt_mask when needed.
-        # In your DKT, kt_mask = (questions[:, 1:] >= 2).float(), so it is [B, L_full-1].
-        # If T == L_full-1 we can use directly; otherwise we scatter by mask order.
-        if T == (L_full - 1):
-            pred_probs_full = pred_probs  # [B, L_full-1, N]
+        # preference (full softmax prob)
+        pref = old_pred_last.gather(1, chosen_global_ids.view(B, 1)).squeeze(1).clamp_min(0.0)
+
+        # difficulty match
+        if old_yt_last is None:
+            diff_reward = torch.zeros(B, device=device)
         else:
-            pred_probs_full = torch.zeros(B, L_full - 1, N, device=device)
-            if kt_mask is not None and kt_mask.dim() == 2 and kt_mask.size(1) == (L_full - 1):
-                # Fill valid positions sequentially from pred_probs' time axis.
-                for b in range(B):
-                    idx = (kt_mask[b] > 0).nonzero(as_tuple=False).squeeze(1).tolist()
-                    take = min(len(idx), T)
-                    if take > 0:
-                        pred_probs_full[b, idx[:take], :] = pred_probs[b, :take, :]
-            else:
-                # Last resort: align to the tail
-                take = min(T, L_full - 1)
-                pred_probs_full[:, :take, :] = pred_probs[:, :take, :]
+            ability = old_yt_last.gather(1, chosen_global_ids.view(B, 1)).squeeze(1)  # yt is probability
+            diff = self._diff_norm(chosen_global_ids)
+            diff_reward = (1.0 - (ability - diff).abs()).clamp(0.0, 1.0)
 
-        K = int(self.metrics_topnum)
-        base_topk = pred_probs_full.topk(K, dim=-1).indices.long()  # [B, L_full-1, K]
-        topk_indices = base_topk.clone()
+        w_p = float(self.step_weights.get("preference", 0.5))
+        w_d = float(self.step_weights.get("difficulty", 0.5))
+        return w_p * pref + w_d * diff_reward
 
-        # Overwrite appended steps with POLICY top-k (candidate-space policy distribution top-k already stored in self.topk_recs)
-        # Mapping: recommendation step r=0 predicts item at position L_hist (t = L_hist-1 in metrics loop).
+    def step(self, action_idx: torch.Tensor, policy_topk_items: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, bool]:
+        """
+        action_idx: [B] index in candidate set
+        policy_topk_items: [B, K] global item ids for this step (策略分布 top-k)
+        """
+        action_idx = action_idx.to(self.device).long()
+        policy_topk_items = policy_topk_items.to(self.device).long()
+
+        state = self._build_state()
+        cand_ids = state["candidate_ids"]  # [B,Kcand]
+        B = cand_ids.size(0)
+
+        # map to global id
+        chosen_global = cand_ids.gather(1, action_idx.view(B, 1)).squeeze(1)  # [B]
+
+        # record
         for b in range(B):
-            for r, recs in enumerate(self.topk_recs[b]):
-                pos = (L_hist - 1) + r
-                if 0 <= pos < (L_full - 1):
-                    rr = recs[:K] + [0] * max(0, K - len(recs))
-                    topk_indices[b, pos, :] = torch.tensor(rr, device=device, dtype=torch.long)
+            self.paths[b].append(int(chosen_global[b].item()))
+            self.topk_recs[b].append([int(x) for x in policy_topk_items[b].tolist()])
+            self.chosen_actions[b].append(int(action_idx[b].item()))
 
-        # -------------------------
-        # 5) Effectiveness (per sample) using Metrics.compute_effectiveness_tensor (preferred) to avoid global mean
-        # -------------------------
-        try:
-            gain_tensor, _ = self.metric.compute_effectiveness_tensor(full_seq, yt_before_all, yt_after, topk_indices)
-            # per-sample effectiveness: average non-zero gains over time & K
-            eff = torch.zeros(B, device=device)
-            for b in range(B):
-                g = gain_tensor[b]  # [L_full-1, K]
-                mask_g = (g != 0)
-                if mask_g.any():
-                    eff[b] = g[mask_g].mean()
-        except Exception:
-            eff = torch.zeros(B, device=device)
+        # step reward uses OLD state cached
+        assert self._old_pred_last is not None
+        step_reward = self._step_reward(chosen_global, self._old_pred_last, self._old_yt_last)
 
-        # -------------------------
-        # 6) Preference (per sample) - EXACTLY like Metrics.combined_metrics but per sample (no global mean)
-        # -------------------------
-        pref = torch.zeros(B, device=device)
+        # extend inputs
+        ext_len = len(self.paths[0])
+        path_tensor = torch.tensor(self.paths, device=self.device, dtype=self.original_tgt.dtype)  # [B, ext_len]
+        ext_seq = torch.cat([self.original_tgt, path_tensor], dim=1)
+
+        ext_ts = _pad_and_concat_like(self.original_tgt_timestamp, ext_len, pad_value=0)
+        ext_idx = _pad_and_concat_like(self.original_tgt_idx, ext_len, pad_value=0)
+
+        # simulate answers for appended part using old_yt_last on chosen item (simple)
+        pad_ans = torch.zeros(B, ext_len, device=self.device, dtype=self.original_ans.dtype)
+        if self._old_yt_last is not None:
+            prob = self._old_yt_last.gather(1, chosen_global.view(B, 1)).squeeze(1)
+            pad_ans[:, -1] = (prob > 0.5).long().to(pad_ans.dtype)
+        ext_ans = torch.cat([self.original_ans, pad_ans], dim=1)
+
+        # base forward to update state for next step
+        pred_probs, yt, _ = self._forward_base(ext_seq, ext_ts, ext_idx, ext_ans)
+        self._old_pred_last = pred_probs[:, -1, :]
+        self._old_yt_last = yt[:, -1, :] if yt is not None else None
+
+        self.t += 1
+        done = (self.t >= self.recommendation_length)
+        return self._build_state(), step_reward, done
+
+    # ---------- per-sample wrappers (对齐 Metrics 口径，但避免 batch mean) ----------
+
+    @torch.no_grad()
+    def _per_sample_effectiveness(self, original_seqs: torch.Tensor, yt_before: torch.Tensor, yt_after: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
+        """
+        按 Metrics.compute_effectiveness 的公式逐样本计算：
+        - 对每个 t，取 valid_rec
+        - gain_step = mean( yt_after - yt_before on valid_rec )
+        - effectiveness = mean over valid t
+        """
+        B, T, K = topk_indices.shape
+        eff = torch.zeros(B, device=topk_indices.device)
         for b in range(B):
             total = 0.0
             cnt = 0
-            for t in range(L_full - 1):
-                if int(full_seq[b, t].item()) == 0:
+            for t in range(T):
+                if int(original_seqs[b, t].item()) == self.metric.PAD:
                     continue
                 recs = topk_indices[b, t].tolist()
-                for r in recs:
-                    if r != 0:
-                        total += float(pred_probs_full[b, t, r].item()) if r < N else 0.0
-                        cnt += 1
-            pref[b] = (total / cnt) if cnt > 0 else 0.0
+                valid = [r for r in recs if 0 <= r < yt_before.size(-1)]
+                if not valid:
+                    continue
+                gain = 0.0
+                for r in valid:
+                    gain += float(yt_after[b, t, r].item() - yt_before[b, t, r].item())
+                total += gain / max(1, len(valid))
+                cnt += 1
+            eff[b] = total / max(1, cnt)
+        return eff
 
-        # -------------------------
-        # 7) Adaptivity (per sample) - path-level: ability from yt_before on related items; difficulty from file (1/2/3 -> 0/0.5/1)
-        # -------------------------
-        ada = torch.zeros(B, device=device)
+    @torch.no_grad()
+    def _per_sample_preference(self, pred_probs: torch.Tensor, original_seqs: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
+        """
+        对齐 Metrics.combined_metrics 的 preference：
+          per step: mean(pred_probs[t][r] for r in valid_rec)
+          then mean over valid steps
+        pred_probs: [B, T, N]
+        topk_indices: [B, T, K]
+        """
+        B, T, K = topk_indices.shape
+        pref = torch.zeros(B, device=pred_probs.device)
         for b in range(B):
-            items = self.paths[b]
-            if len(items) == 0:
-                continue
-            # ability_path = mean(yt_before_last[item])
-            ab = []
-            df = []
-            for it in items:
-                if it == 0:
+            total = 0.0
+            cnt = 0
+            for t in range(T):
+                if int(original_seqs[b, t].item()) == self.metric.PAD:
                     continue
-                ab.append(float(last_state[b, it].item()) if it < last_state.size(1) else 0.0)
-                df.append(float(self._diff_norm(it)))
-            if len(ab) > 0 and len(df) > 0:
-                ability = sum(ab) / len(ab)
-                diffm = sum(df) / len(df)
-                ada[b] = 1.0 - abs(ability - diffm)
+                recs = topk_indices[b, t].tolist()
+                valid = [r for r in recs if 0 <= r < pred_probs.size(-1)]
+                if not valid:
+                    continue
+                psum = 0.0
+                for r in valid:
+                    psum += float(pred_probs[b, t, r].item())
+                total += psum / max(1, len(valid))
+                cnt += 1
+            pref[b] = total / max(1, cnt)
+        return pref
 
-        # -------------------------
-        # 8) Diversity (per sample) - 1 - cosine similarity on base-model hidden embeddings (graph hidden)
-        # -------------------------
-        div = torch.zeros(B, device=device)
-        if hidden is not None and hidden.dim() == 2:
-            # hidden: [num_items, dim]
-            for b in range(B):
-                items = [it for it in self.paths[b] if it != 0 and it < hidden.size(0)]
-                M = len(items)
-                if M < 2:
-                    div[b] = 0.0
+    @torch.no_grad()
+    def _per_sample_diversity(self, hidden_item: torch.Tensor, original_seqs: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
+        """
+        对齐 Metrics 的 diversity（同公式）：
+          per step: mean_{i<j}(1 - cos(e_i, e_j))
+          then mean over valid steps
+        hidden_item: [N, d]
+        """
+        B, T, K = topk_indices.shape
+        div = torch.zeros(B, device=topk_indices.device)
+        for b in range(B):
+            total = 0.0
+            cnt = 0
+            for t in range(T):
+                if int(original_seqs[b, t].item()) == self.metric.PAD:
                     continue
-                emb = hidden[torch.tensor(items, device=device, dtype=torch.long)]  # [M, D]
-                emb = torch.nn.functional.normalize(emb, dim=-1)
-                sim = emb @ emb.t()  # [M, M]
-                idx = torch.triu_indices(M, M, offset=1, device=device)
+                recs = topk_indices[b, t].tolist()
+                valid = [r for r in recs if 0 <= r < hidden_item.size(0)]
+                if len(valid) < 2:
+                    continue
+                emb = hidden_item[torch.tensor(valid, device=hidden_item.device)]
+                emb = F.normalize(emb, dim=-1)
+                sim = emb @ emb.t()
+                idx = torch.triu_indices(sim.size(0), sim.size(1), offset=1, device=sim.device)
                 sim_pairs = sim[idx[0], idx[1]]
-                div[b] = (1.0 - sim_pairs).mean()
+                d = (1.0 - sim_pairs).mean().item()
+                total += d
+                cnt += 1
+            div[b] = total / max(1, cnt)
+        return div
 
-        # -------------------------
-        # 9) Final quality (per sample)
-        # -------------------------
-        final_quality = (
-                self.w_eff * eff +
-                self.w_ada * ada +
-                self.w_div * div +
-                self.w_pre * pref
-        )
+    @torch.no_grad()
+    def _per_sample_adaptivity(self, original_seqs: torch.Tensor, yt_before: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
+        """
+        你确认的 A 方案（path-level / step-level 都可），这里按 Metrics style：
+          ability_t = mean( yt_before[b,t, r] ) over rec
+          diff_t    = mean( diff_norm(r) ) over rec
+          ada_step  = 1 - |ability_t - diff_t|
+          adaptivity = mean over valid steps
+        """
+        B, T, K = topk_indices.shape
+        ada = torch.zeros(B, device=topk_indices.device)
+        for b in range(B):
+            total = 0.0
+            cnt = 0
+            for t in range(T):
+                if int(original_seqs[b, t].item()) == self.metric.PAD:
+                    continue
+                recs = topk_indices[b, t].tolist()
+                valid = [r for r in recs if 0 <= r < yt_before.size(-1)]
+                if not valid:
+                    continue
+                ab = 0.0
+                df = 0.0
+                for r in valid:
+                    ab += float(yt_before[b, t, r].item())
+                    df += float(self._diff_norm(torch.tensor(r, device=topk_indices.device)).item())
+                ab /= max(1, len(valid))
+                df /= max(1, len(valid))
+                total += max(0.0, 1.0 - abs(ab - df))
+                cnt += 1
+            ada[b] = total / max(1, cnt)
+        return ada
 
-        return {
-            "effectiveness": eff,
-            "adaptivity": ada,
-            "diversity": div,
-            "preference": pref,
-            "final_quality": final_quality
-        }
+    @torch.no_grad()
+    def compute_final_metrics(self) -> Dict[str, torch.Tensor]:
+        if self.original_tgt is None:
+            z = torch.zeros(self.batch_size, device=self.device)
+            return {"effectiveness": z, "adaptivity": z, "diversity": z, "preference": z, "final_quality": z}
+
+        device = self.device
+        B = self.batch_size
+        ext_len = len(self.paths[0])
+
+        # full sequence
+        if ext_len > 0:
+            path_tensor = torch.tensor(self.paths, device=device, dtype=self.original_tgt.dtype)  # [B,ext]
+            full_seq = torch.cat([self.original_tgt, path_tensor], dim=1)
+        else:
+            full_seq = self.original_tgt
+
+        L_hist = self.original_tgt.size(1)
+        L_full = full_seq.size(1)
+        T_full = L_full - 1
+
+        # full answers: history + simulated (simple, based on yt_before last state for that appended item)
+        full_ans = self.original_ans
+        if ext_len > 0:
+            sim_ans = torch.zeros(B, ext_len, device=device, dtype=self.original_ans.dtype)
+            # 用当前 episode 中每一步选中 item 对应的旧能力来模拟（简单版本）
+            # 这里不影响“口径正确性”，只影响数值质量；后续可升级为滚动模拟
+            if self._last_yt_full is not None:
+                last_hist_yt = self._kt_forward(self.original_tgt, self.original_ans)[:, -1, :]  # [B,S]
+                for t in range(ext_len):
+                    items_t = path_tensor[:, t].long()
+                    prob = last_hist_yt.gather(1, items_t.view(B, 1)).squeeze(1)
+                    sim_ans[:, t] = (prob > 0.5).long().to(sim_ans.dtype)
+            full_ans = torch.cat([self.original_ans, sim_ans], dim=1)
+
+        # yt_after on full_seq
+        yt_after = self._kt_forward(full_seq, full_ans)  # [B, T_full, S]  (KTOnlyModel: seq_len-1)
+        yt_hist = self._kt_forward(self.original_tgt, self.original_ans)  # [B, L_hist-1, S]
+
+        # yt_before_all: extend history last state to full length-1
+        if yt_hist.size(1) < T_full:
+            pad_steps = T_full - yt_hist.size(1)
+            last = yt_hist[:, -1:, :].repeat(1, pad_steps, 1)
+            yt_before = torch.cat([yt_hist, last], dim=1)
+        else:
+            yt_before = yt_hist[:, :T_full, :]
+
+        # ensure pred_probs for full_seq exists (after last step it should already be for full_seq)
+        if self._last_pred_probs_full is None or self._last_pred_probs_full.size(1) != T_full:
+            # build dummy ts/idx for appended
+            ext_ts = _pad_and_concat_like(self.original_tgt_timestamp, ext_len, pad_value=0)
+            ext_idx = _pad_and_concat_like(self.original_tgt_idx, ext_len, pad_value=0)
+            self._forward_base(full_seq, ext_ts, ext_idx, full_ans)
+
+        pred_probs = self._last_pred_probs_full  # [B,T_full,N]
+        hidden_item = self._last_hidden  # [N,d]
+
+        K = self.metrics_topnum
+        # history topk from base model for ALL steps
+        _, base_topk = torch.topk(pred_probs, k=K, dim=-1)  # [B,T_full,K]
+        topk_indices = base_topk.clone()
+
+        # override appended steps with policy topk (策略分布 top-k)
+        # appended step 0 corresponds to predicting item at index L_hist (t = L_hist-1)
+        for b in range(B):
+            for t, recs in enumerate(self.topk_recs[b]):
+                pos = (L_hist - 1) + t
+                if 0 <= pos < T_full:
+                    rr = recs[:K] + [0] * max(0, K - len(recs))
+                    topk_indices[b, pos] = torch.tensor(rr, device=device, dtype=torch.long)
+
+        # original_seqs for Metrics loop is the "sequence used to decide valid t"
+        # Metrics uses original_seqs[b][t] != PAD for t in [0, T_full-1]
+        original_for_metrics = full_seq[:, :T_full]
+
+        eff = self._per_sample_effectiveness(original_for_metrics, yt_before, yt_after, topk_indices)
+        pref = self._per_sample_preference(pred_probs, original_for_metrics, topk_indices)
+
+        if hidden_item is None or (isinstance(hidden_item, torch.Tensor) and hidden_item.dim() < 2):
+            div = torch.zeros(B, device=device)
+        else:
+            div = self._per_sample_diversity(hidden_item, original_for_metrics, topk_indices)
+
+        ada = self._per_sample_adaptivity(original_for_metrics, yt_before, topk_indices)
+
+        fq = (float(self.final_weights.get("effectiveness", 0.4)) * eff
+              + float(self.final_weights.get("adaptivity", 0.3)) * ada
+              + float(self.final_weights.get("diversity", 0.2)) * div
+              + float(self.final_weights.get("preference", 0.1)) * pref)
+
+        return {"effectiveness": eff, "adaptivity": ada, "diversity": div, "preference": pref, "final_quality": fq}
 
     def compute_final_reward(self) -> torch.Tensor:
-        """Final scalar reward per sample (used by trainer)."""
         return self.compute_final_metrics()["final_quality"]
 
 
 class PPOTrainer:
     """
-    轻量 PG (REINFORCE)：
-    - 每条轨迹 T 步收集 rewards/log_probs/entropy
-    - 最后一步 rewards += final_reward
-    - returns = discounted sum
+    轻量 Policy Gradient（REINFORCE + entropy）：
+      - 轨迹 rewards（step）+ final_reward（加到最后一步）
+      - returns = discounted sum
+      - advantage = (returns - returns.mean)/std
     """
-
-    def __init__(self, policy_net: PolicyNetwork, env: LearningPathEnv, lr=3e-4, gamma=0.99, entropy_coef=1e-4):
+    def __init__(self, policy_net: PolicyNetwork, env: LearningPathEnv, lr=3e-4, gamma=0.99, entropy_coef=1e-3):
         self.policy_net = policy_net
         self.env = env
         self.gamma = float(gamma)
         self.entropy_coef = float(entropy_coef)
-        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=float(lr))
 
-    def collect_trajectory(self, tgt, tgt_timestamp, tgt_idx, ans, graph=None, hypergraph_list=None,
-                           deterministic: bool = False):
+        self._traj_rewards = []
+        self._traj_logp = []
+        self._traj_ent = []
+
+    def collect_trajectory(self, tgt, tgt_timestamp, tgt_idx, ans, graph=None, hypergraph_list=None):
         state = self.env.reset(tgt, tgt_timestamp, tgt_idx, ans, graph=graph, hypergraph_list=hypergraph_list)
 
-        rewards, log_probs, entropies = [], [], []
-        B = tgt.size(0)
-        device = tgt.device
+        rewards = []
+        logps = []
+        ents = []
 
-        for _ in range(self.env.recommendation_length):
-            cand_probs = state["cand_probs"]  # [B,K]
-            cand_ids = state["cand_ids"]  # [B,K]
-            cand_feat = cand_probs.unsqueeze(-1)  # [B,K,1]
+        done = False
+        while not done:
+            cand_feat = state["candidate_features"]  # [B,Kcand,D]
+            cand_ids = state["candidate_ids"]        # [B,Kcand]
 
-            logits = self.policy_net(state["knowledge_state"], cand_feat)  # [B,K]
+            logits = self.policy_net(cand_feat)      # [B,Kcand]
             dist = Categorical(logits=logits)
+            action = dist.sample()                   # [B]
+            logp = dist.log_prob(action)             # [B]
+            ent = dist.entropy()                     # [B]
 
-            if deterministic:
-                action_index = torch.argmax(logits, dim=-1)
-            else:
-                action_index = dist.sample()
+            # 策略分布 top-k（用 logits 排序）
+            K = min(self.env.metrics_topnum, logits.size(1))
+            _, topk_pos = torch.topk(logits, k=K, dim=-1)
+            step_topk_items = cand_ids.gather(1, topk_pos)  # [B,K] global ids
 
-            log_prob = dist.log_prob(action_index)
-            entropy = dist.entropy()
-
-            chosen_item = cand_ids.gather(1, action_index.view(-1, 1)).squeeze(1)  # [B]
-
-            # policy-distribution top-k within candidate space (用于 Metrics 顶层指标计算)
-            topn = min(self.env.metrics_topnum, cand_ids.size(1))
-            topn_idx = torch.topk(logits, k=topn, dim=-1).indices
-            step_topk = cand_ids.gather(1, topn_idx)
-
-            next_state, step_reward, done = self.env.step(chosen_item, step_topk)
+            next_state, step_reward, done = self.env.step(action, step_topk_items)
 
             rewards.append(step_reward)
-            log_probs.append(log_prob)
-            entropies.append(entropy)
+            logps.append(logp)
+            ents.append(ent)
 
             state = next_state
-            if torch.all(done):
-                break
 
+        # final reward
         final_reward = self.env.compute_final_reward()  # [B]
         rewards[-1] = rewards[-1] + final_reward
 
-        return rewards, log_probs, entropies, final_reward
+        rewards_t = torch.stack(rewards, dim=0)   # [T,B]
+        logps_t = torch.stack(logps, dim=0)       # [T,B]
+        ents_t = torch.stack(ents, dim=0)         # [T,B]
 
-    def update_policy(self, rewards, log_probs, entropies):
-        rewards_t = torch.stack(rewards, dim=0)  # [T,B]
-        logp_t = torch.stack(log_probs, dim=0)  # [T,B]
-        ent_t = torch.stack(entropies, dim=0)  # [T,B]
+        self._traj_rewards = rewards_t
+        self._traj_logp = logps_t
+        self._traj_ent = ents_t
 
-        T = rewards_t.size(0)
-        returns = torch.zeros_like(rewards_t)
-        running = torch.zeros_like(rewards_t[0])
+        return rewards_t, logps_t, ents_t, final_reward
+
+    def update_policy(self):
+        rewards = self._traj_rewards      # [T,B]
+        logps = self._traj_logp           # [T,B]
+        ents = self._traj_ent             # [T,B]
+        T, B = rewards.shape
+
+        # returns
+        returns = torch.zeros_like(rewards)
+        running = torch.zeros(B, device=rewards.device)
         for t in reversed(range(T)):
-            running = rewards_t[t] + self.gamma * running
+            running = rewards[t] + self.gamma * running
             returns[t] = running
 
-        baseline = returns.mean(dim=0, keepdim=True)
-        adv = returns - baseline
-
-        adv_std = adv.detach().std(dim=0, keepdim=True).clamp_min(1e-6)
+        # advantage normalize
+        adv = returns - returns.mean(dim=0, keepdim=True)
+        adv_std = adv.std().clamp_min(1e-6)
         adv = adv / adv_std
 
-        pg_loss = -(logp_t * adv.detach()).mean()
-        ent_loss = -ent_t.mean()
+        pg_loss = -(logps * adv.detach()).mean()
+        ent_loss = -ents.mean()
         loss = pg_loss + self.entropy_coef * ent_loss
 
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 5.0)
         self.optimizer.step()
 
-        print(
-            f"pg_loss={pg_loss.item():.6f}  entropy={ent_t.mean().item():.6f}  adv_std={adv.detach().std().item():.6f}")
+        # 打印诊断（与你之前日志一致）
+        print(f"pg_loss={pg_loss.item():.6f}  entropy={ents.mean().item():.6f}  adv_std={adv_std.item():.6f}")
         return float(loss.item())
 
 
 class RLPathOptimizer:
     """
-    兼容旧接口：封装 env + policy + trainer
+    兼容你现有 train_rl.py 的外层封装
     """
-
     def __init__(
-            self,
-            pretrained_model,
-            num_skills: int,
-            batch_size: int,
-            recommendation_length: int,
-            topk: int,
-            data_name: str,
-            graph=None,
-            hypergraph_list=None,
-            hidden_dim=128,
-            lr=3e-4,
-            gamma=0.99,
-            entropy_coef=1e-4,
-            metrics_topnum: Optional[int] = None,
-            metrics_T: int = 5,
-            device=None,
+        self,
+        pretrained_model,
+        num_skills,
+        batch_size,
+        recommendation_length=5,
+        topk=20,
+        data_name="",
+        graph=None,
+        hypergraph_list=None,
+        policy_hidden_dim=128,
+        lr=3e-4,
+        gamma=0.99,
+        entropy_coef=1e-3,
+        metrics_topnum=None,
+        device=None,
     ):
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = device
-
-        if metrics_topnum is None:
-            metrics_topnum = topk
-        else:
-            metrics_topnum = min(int(metrics_topnum), int(topk))
-
+        self.device = device or next(pretrained_model.parameters()).device
         self.env = LearningPathEnv(
-            batch_size=batch_size,
-            base_model=pretrained_model,
+            pretrained_model=pretrained_model,
+            num_skills=num_skills,
             recommendation_length=recommendation_length,
-            data_name=data_name,
-            graph=graph,
-            hypergraph_list=hypergraph_list,
             policy_topk=topk,
-            metrics_topnum=metrics_topnum,
-            metrics_T=metrics_T,
+            metrics_topnum=metrics_topnum or topk,
+            device=self.device,
         )
 
-        self.policy_net = PolicyNetwork(
-            knowledge_dim=num_skills,
-            candidate_feature_dim=1,
-            hidden_dim=hidden_dim,
-            topk=topk,
-        ).to(device)
+        # candidate_features dim = 2 (prob + ability) or 1 if no yt
+        in_dim = 2
+        self.policy_net = PolicyNetwork(in_dim=in_dim, hidden_dim=policy_hidden_dim).to(self.device)
+        self.trainer = PPOTrainer(self.policy_net, self.env, lr=lr, gamma=gamma, entropy_coef=entropy_coef)
 
-        self.trainer = PPOTrainer(
-            policy_net=self.policy_net,
-            env=self.env,
-            lr=lr,
-            gamma=gamma,
-            entropy_coef=entropy_coef,
-        )
+        self.graph = graph
+        self.hypergraph_list = hypergraph_list
 
 
 @torch.no_grad()
-def evaluate_policy(env: LearningPathEnv, policy_net: PolicyNetwork, data_loader, relation_graph=None,
-                    hypergraph_list=None, num_episodes: int = 5):
+def evaluate_policy(env: LearningPathEnv, policy_net: PolicyNetwork, data_loader, relation_graph=None, hypergraph_list=None, num_episodes=5):
     """
-    用确定性策略评估：返回 batch-mean 的 validity(effectiveness)/diversity/adaptivity
+    简化评估：跑若干 batch，输出平均指标（标量）
     """
-    effs, divs, adas, prefs, fqs = [], [], [], [], []
-    device = next(policy_net.parameters()).device
+    device = env.device
+    metrics_sum = {"effectiveness": 0.0, "adaptivity": 0.0, "diversity": 0.0, "preference": 0.0, "final_quality": 0.0}
+    n = 0
 
-    for _ in range(num_episodes):
-        batch_count = 0
-        for batch in data_loader:
-            if batch_count >= 1:
-                break
-            tgt, tgt_timestamp, tgt_idx, ans = batch
-            tgt = tgt.to(device);
-            tgt_timestamp = tgt_timestamp.to(device);
-            tgt_idx = tgt_idx.to(device);
-            ans = ans.to(device)
+    for batch_idx, batch in enumerate(data_loader):
+        if batch_idx >= num_episodes:
+            break
+        tgt, tgt_ts, tgt_idx, ans = batch
+        tgt = tgt.to(device); tgt_ts = tgt_ts.to(device); tgt_idx = tgt_idx.to(device); ans = ans.to(device)
 
-            state = env.reset(tgt, tgt_timestamp, tgt_idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
-            for _ in range(env.recommendation_length):
-                cand_probs = state["cand_probs"]
-                cand_ids = state["cand_ids"]
-                logits = policy_net(state["knowledge_state"], cand_probs.unsqueeze(-1))
-                action_index = torch.argmax(logits, dim=-1)
-                chosen_item = cand_ids.gather(1, action_index.view(-1, 1)).squeeze(1)
-                topn = min(env.metrics_topnum, cand_ids.size(1))
-                topn_idx = torch.topk(logits, k=topn, dim=-1).indices
-                step_topk = cand_ids.gather(1, topn_idx)
-                state, _, done = env.step(chosen_item, step_topk)
-                if torch.all(done):
-                    break
+        state = env.reset(tgt, tgt_ts, tgt_idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
+        done = False
+        while not done:
+            logits = policy_net(state["candidate_features"])
+            dist = Categorical(logits=logits)
+            action = torch.argmax(logits, dim=-1)  # greedy eval
+            K = min(env.metrics_topnum, logits.size(1))
+            _, topk_pos = torch.topk(logits, k=K, dim=-1)
+            step_topk_items = state["candidate_ids"].gather(1, topk_pos)
+            state, _, done = env.step(action, step_topk_items)
 
-            m = env.compute_final_metrics()
-            effs.append(m["effectiveness"].mean().item())
-            divs.append(m["diversity"].mean().item())
-            adas.append(m["adaptivity"].mean().item())
-            prefs.append(m["preference"].mean().item())
-            fqs.append(m["final_quality"].mean().item())
+        m = env.compute_final_metrics()
+        for k in metrics_sum:
+            metrics_sum[k] += float(m[k].mean().item())
+        n += 1
 
-            batch_count += 1
-
-    return float(sum(effs) / len(effs)), float(sum(divs) / len(divs)), float(sum(adas) / len(adas)), float(
-        sum(prefs) / len(prefs)), float(sum(fqs) / len(fqs))
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    avg = {k: v / n for k, v in metrics_sum.items()}
+    return avg["effectiveness"], avg["diversity"], avg["adaptivity"]

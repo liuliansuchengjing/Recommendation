@@ -14,7 +14,7 @@ from HGAT import MSHGAT
 from dataLoader import Split_data, DataLoader
 from graphConstruct import ConRelationGraph, ConHyperGraphList
 
-from rl_adjuster_new_fixed import RLPathOptimizer, evaluate_policy
+from rl_adjuster_new import RLPathOptimizer, evaluate_policy
 
 
 def train_rl_model(
