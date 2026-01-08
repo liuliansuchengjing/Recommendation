@@ -1,19 +1,17 @@
-
 """
-train_rl.py
+train_rl_new.py
 强化学习路径优化训练脚本（适配 rl_adjuster_new.py）
 """
+
 import os
 import argparse
 import pickle
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
 
 from HGAT import MSHGAT
 from dataLoader import Split_data, DataLoader
 from graphConstruct import ConRelationGraph, ConHyperGraphList
-
 from rl_adjuster_new import RLPathOptimizer, evaluate_policy
 
 
@@ -24,7 +22,7 @@ def train_rl_model(
     num_skills,
     batch_size,
     recommendation_length=5,
-    num_epochs=10,
+    num_epochs=5,
     topk=10,
     graph=None,
     hypergraph_list=None,
@@ -45,7 +43,7 @@ def train_rl_model(
         graph=graph,
         hypergraph_list=hypergraph_list,
         device=device,
-        metrics_topnum=topk,   # ✅ 与 policy_topk 对齐
+        metrics_topnum=topk,  # ✅ 与 policy_topk 对齐
     )
 
     # data
@@ -55,40 +53,66 @@ def train_rl_model(
     train_loader = DataLoader(train, batch_size=batch_size, load_dict=True, cuda=(device.type == "cuda"))
     valid_loader = DataLoader(valid, batch_size=batch_size, load_dict=True, cuda=(device.type == "cuda"))
 
-    stats = {"epoch_loss": [], "avg_step_reward": [], "avg_final_reward": [], "valid_final_quality": []}
+    stats = {
+        "epoch_loss": [],
+        "avg_step_reward": [],
+        "avg_final_reward": [],
+        "valid_effectiveness": [],
+        "valid_adaptivity": [],
+        "valid_diversity": [],
+        "valid_preference": [],
+        "valid_final_quality": [],
+    }
 
     for epoch in range(num_epochs):
-        losses = []
-        step_rs = []
-        final_rs = []
+        losses, step_rs, final_rs = [], [], []
 
         for bidx, batch in enumerate(train_loader):
             if bidx >= 20:
                 break
-            tgt, tgt_timestamp, tgt_idx, ans = batch
-            tgt = tgt.to(device); tgt_timestamp = tgt_timestamp.to(device); tgt_idx = tgt_idx.to(device); ans = ans.to(device)
 
-            rewards, log_probs, entropies, final_reward = rl.trainer.collect_trajectory(
+            tgt, tgt_timestamp, tgt_idx, ans = batch
+            tgt = tgt.to(device)
+            tgt_timestamp = tgt_timestamp.to(device)
+            tgt_idx = tgt_idx.to(device)
+            ans = ans.to(device)
+
+            # ✅ collect_trajectory 返回 (rewards_t, logps_t, ents_t, final_reward)
+            rewards_t, logps_t, ents_t, final_reward = rl.trainer.collect_trajectory(
                 tgt, tgt_timestamp, tgt_idx, ans,
                 graph=graph, hypergraph_list=hypergraph_list,
-                deterministic=False
+                deterministic=False,
             )
-            loss = rl.trainer.update_policy(rewards, log_probs, entropies)
+
+            # ✅ update_policy 不带参数（使用 trainer 内部缓存）
+            loss = rl.trainer.update_policy()
             losses.append(loss)
 
-            step_rs.append(torch.stack(rewards).mean().item())
+            step_rs.append(rewards_t.mean().item())
             final_rs.append(final_reward.mean().item())
 
             if bidx % 5 == 0:
-                print(f"[Epoch {epoch} | Batch {bidx}] Loss={loss:.4f}, StepReward={step_rs[-1]:.4f}, FinalReward={final_rs[-1]:.4f}")
+                print(
+                    f"[Epoch {epoch} | Batch {bidx}] "
+                    f"Loss={loss:.4f}, StepReward={step_rs[-1]:.4f}, FinalReward={final_rs[-1]:.4f}"
+                )
 
         stats["epoch_loss"].append(float(np.mean(losses) if losses else 0.0))
         stats["avg_step_reward"].append(float(np.mean(step_rs) if step_rs else 0.0))
         stats["avg_final_reward"].append(float(np.mean(final_rs) if final_rs else 0.0))
 
-        # quick eval
-        eff, div, ada, pref, fq = evaluate_policy(rl.env, rl.policy_net, valid_loader, relation_graph=graph, hypergraph_list=hypergraph_list, num_episodes=3)
-        stats["valid_final_quality"].append(fq)
+        # quick eval（返回 5 个标量）
+        eff, div, ada, pref, fq = evaluate_policy(
+            rl.env, rl.policy_net, valid_loader,
+            relation_graph=graph, hypergraph_list=hypergraph_list,
+            num_episodes=3,
+        )
+
+        stats["valid_effectiveness"].append(float(eff))
+        stats["valid_diversity"].append(float(div))
+        stats["valid_adaptivity"].append(float(ada))
+        stats["valid_preference"].append(float(pref))
+        stats["valid_final_quality"].append(float(fq))
 
         print(f"Epoch {epoch} Done | Loss={stats['epoch_loss'][-1]:.4f}, StepReward={stats['avg_step_reward'][-1]:.4f}, FinalReward={stats['avg_final_reward'][-1]:.4f}")
         print("\n[Evaluation Metrics on Recommended Paths]")
@@ -98,7 +122,6 @@ def train_rl_model(
         print(f"  preference:    {pref:.4f}")
         print(f"  final_quality: {fq:.4f}\n")
 
-    # save
     os.makedirs("checkpoints", exist_ok=True)
     torch.save(rl.policy_net.state_dict(), "checkpoints/rl_policy_net.pth")
     with open("checkpoints/rl_training_stats.pkl", "wb") as f:
@@ -122,7 +145,9 @@ def run_training_with_pretrained_model(data_path="MOO", model_path="./checkpoint
     # ✅ run.py 里需要的字段
     opt.d_word_vec = opt.d_model
 
-    user_size, total_cascades, timestamps, train, valid, test = Split_data(opt.data_name, opt.train_rate, opt.valid_rate, load_dict=True)
+    user_size, total_cascades, timestamps, train, valid, test = Split_data(
+        opt.data_name, opt.train_rate, opt.valid_rate, load_dict=True
+    )
     opt.user_size = user_size
 
     relation_graph = ConRelationGraph(opt.data_name)
@@ -157,7 +182,7 @@ def run_training_with_pretrained_model(data_path="MOO", model_path="./checkpoint
         num_epochs=5,
         topk=10,
         graph=relation_graph,
-        hypergraph_list=hypergraph_list
+        hypergraph_list=hypergraph_list,
     )
     return policy_net, rl, stats
 

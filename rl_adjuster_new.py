@@ -497,6 +497,10 @@ class LearningPathEnv:
 
         K = self.metrics_topnum
         # history topk from base model for ALL steps
+        pad_id = int(getattr(Constants, "PAD", 0))
+        pred_probs = pred_probs.clone()
+        pred_probs[..., pad_id] = -1e9  # 或者 0.0 后再用 topk 前改成 -inf；这里用 -1e9 最稳
+
         _, base_topk = torch.topk(pred_probs, k=K, dim=-1)  # [B,T_full,K]
         topk_indices = base_topk.clone()
 
@@ -506,7 +510,9 @@ class LearningPathEnv:
             for t, recs in enumerate(self.topk_recs[b]):
                 pos = (L_hist - 1) + t
                 if 0 <= pos < T_full:
-                    rr = recs[:K] + [0] * max(0, K - len(recs))
+                    pad_id = int(getattr(Constants, "PAD", 0))
+                    rr = recs[:K] + [pad_id] * max(0, K - len(recs))
+
                     topk_indices[b, pos] = torch.tensor(rr, device=device, dtype=torch.long)
 
         # original_seqs for Metrics loop is the "sequence used to decide valid t"
