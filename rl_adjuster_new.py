@@ -552,7 +552,18 @@ class PPOTrainer:
         self._traj_logp = []
         self._traj_ent = []
 
-    def collect_trajectory(self, tgt, tgt_timestamp, tgt_idx, ans, graph=None, hypergraph_list=None):
+    def collect_trajectory(
+            self,
+            tgt,
+            tgt_timestamp,
+            tgt_idx,
+            ans,
+            graph=None,
+            hypergraph_list=None,
+            deterministic: bool = False,
+            **kwargs
+    ):
+
         state = self.env.reset(tgt, tgt_timestamp, tgt_idx, ans, graph=graph, hypergraph_list=hypergraph_list)
 
         rewards = []
@@ -564,11 +575,17 @@ class PPOTrainer:
             cand_feat = state["candidate_features"]  # [B,Kcand,D]
             cand_ids = state["candidate_ids"]        # [B,Kcand]
 
-            logits = self.policy_net(cand_feat)      # [B,Kcand]
+            logits = self.policy_net(cand_feat)  # [B, Kcand]
             dist = Categorical(logits=logits)
-            action = dist.sample()                   # [B]
-            logp = dist.log_prob(action)             # [B]
-            ent = dist.entropy()                     # [B]
+
+            if deterministic:
+                action = torch.argmax(logits, dim=-1)  # [B] 贪心
+            else:
+                action = dist.sample()  # [B] 采样探索
+
+            logp = dist.log_prob(action)  # [B]
+            ent = dist.entropy()  # [B]
+
 
             # 策略分布 top-k（用 logits 排序）
             K = min(self.env.metrics_topnum, logits.size(1))
