@@ -234,24 +234,40 @@ class LearningPathEnv:
         return self._make_state_from_last()
 
     def _forward_base(self, seq, ts, idx, ans):
-        """
-        base_model forward (MSHGAT):
-          returns: pred_flat, pred_res, kt_mask, yt, hidden, status_emb
-        We need pred probs, yt, hidden.
-        """
-        self.base_model.eval()
-        with torch.no_grad():
-            pred_flat, pred_res, kt_mask, yt, hidden, status_emb = self.base_model(seq, ts, idx, ans, self.graph, self.hypergraph_list)
+            """
+            Forward the pretrained/base model (MSHGAT) to obtain:
+              - next-item probability distribution over items (from `pred_flat`)
+              - KT outputs `yt` (mastery probabilities)
+              - item graph embeddings `hidden` (for diversity)
+            MSHGAT forward returns:
+                pred_flat: [(B*(T)), N] where T = seq_len-1
+                pred_res:  [B, T] (DKT next-question prob for the actual next question)
+                kt_mask:   [B, T]
+                yt:        [B, T, N] (mastery probs aligned to next-question)
+                hidden:    [N, D] (graph embedding for each item)
+            """
+            self.base_model.eval()
+            with torch.no_grad():
+                pred_flat, pred_res, kt_mask, yt, hidden, status_emb = self.base_model(
+                    seq, ts, idx, ans, self.graph, self.hypergraph_list
+                )
 
-        # pred_res: [B, L, N] (already probs after softmax in HGAT)
-        if pred_res.dim() == 2:
-            # [B*L, N] -> reshape
-            B, L = seq.size(0), seq.size(1)
-            pred_res = pred_res.view(B, L, -1)
+            B = seq.size(0)
+            # In MSHGAT, predictions are aligned to next step, so T = seq_len - 1
+            T = max(int(seq.size(1)) - 1, 1)
+            N = pred_flat.size(-1)
 
-        self._last_pred_probs_full = pred_res
-        self._last_yt_full = yt  # [B, L, N]
-        self._last_hidden = hidden  # [N, D]
+            # pred_flat is logits+mask (not softmaxed). Convert to probabilities.
+            pred_probs = torch.softmax(pred_flat.view(B, T, N), dim=-1)  # [B,T,N]
+            self._last_pred_probs_full = pred_probs
+
+            # yt is already probabilities (sigmoid in DKT). It is [B,T,N] in your DKT.
+            if yt.dim() == 2:
+                yt = yt.view(B, T, -1)
+            self._last_yt_full = yt
+
+            # hidden is [N,D] item embeddings from GNN
+            self._last_hidden = hidden
 
     def _make_state_from_last(self):
         pred_last = self._last_pred_probs_full[:, -1, :]  # [B,N]
