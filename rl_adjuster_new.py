@@ -529,8 +529,11 @@ class LearningPathEnv:
 
         ada = self._per_sample_adaptivity(original_for_metrics, yt_before, topk_indices)
 
-        fq = (float(self.final_weights.get("effectiveness", 0.4)) * eff
-              + float(self.final_weights.get("adaptivity", 0.3)) * ada
+        # fq = (float(self.final_weights.get("effectiveness", 0.4)) * eff
+        #       + float(self.final_weights.get("adaptivity", 0.3)) * ada
+        #       + float(self.final_weights.get("diversity", 0.2)) * div
+        #       + float(self.final_weights.get("preference", 0.1)) * pref)
+        fq = (float(self.final_weights.get("adaptivity", 0.3)) * ada
               + float(self.final_weights.get("diversity", 0.2)) * div
               + float(self.final_weights.get("preference", 0.1)) * pref)
 
