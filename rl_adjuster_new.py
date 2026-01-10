@@ -729,4 +729,4 @@ def evaluate_policy(env: LearningPathEnv, policy_net: PolicyNetwork, data_loader
     if n == 0:
         return 0.0, 0.0, 0.0
     avg = {k: v / n for k, v in metrics_sum.items()}
-    return avg["effectiveness"], avg["diversity"], avg["adaptivity"]
+    return avg["effectiveness"], avg["diversity"], avg["adaptivity"], avg["preference"], avg["final_quality"]
