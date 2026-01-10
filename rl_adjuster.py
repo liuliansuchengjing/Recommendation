@@ -188,8 +188,8 @@ class LearningPathEnv:
         # step-level shaping weights (NOT Metrics)
         self.step_weights = {
             "preference": 0.05,
-            "diversity": 0.02,
-            "difficulty": 0.00,# "difficulty": 0.02,
+            "diversity": 0.00,# "diversity": 0.02,
+            "difficulty": 0.02,
         }
 
         # final reward weights (Metrics-aligned)
@@ -201,8 +201,8 @@ class LearningPathEnv:
         # }
         self.final_weights = {
             "effectiveness": 0.4,
-            "adaptivity": 0.0,# "adaptivity": 0.3,
-            "diversity": 0.2,
+            "adaptivity": 0.3,
+            "diversity": 0.0,# "diversity": 0.2,
             "preference": 0.1,
         }
 
@@ -404,10 +404,10 @@ class LearningPathEnv:
             if self._repeat_hist is not None:
                 self._repeat_hist[i].append(is_repeat)
 
-            # # difficulty proxy (based on OLD knowledge state)
-            # if 0 <= item < knowledge_last.size(1):
-            #     k = knowledge_last[i, item]
-            #     reward[i] += self.step_weights["difficulty"] * (1 - torch.abs(k - 0.5))
+            # difficulty proxy (based on OLD knowledge state)
+            if 0 <= item < knowledge_last.size(1):
+                k = knowledge_last[i, item]
+                reward[i] += self.step_weights["difficulty"] * (1 - torch.abs(k - 0.5))
 
         return reward
 
@@ -488,9 +488,9 @@ class LearningPathEnv:
         # )
         fq_t = (
                 self.final_weights.get("effectiveness", 0.4) * eff_t
-                + self.final_weights.get("diversity", 0.2) * div_t
+                + 0.0 * div_t
                 + self.final_weights.get("preference", 0.1) * pref_t
-                + 0.0 * ada_t
+                + self.final_weights.get("adaptivity", 0.3) * ada_t
         )
 
         return {
