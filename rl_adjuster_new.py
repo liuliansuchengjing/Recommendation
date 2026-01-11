@@ -318,8 +318,8 @@ class OnlineLearningPathEnv:
         device: torch.device,
         pad_val: int = 0,
         topk: int = 10,
-        cand_k: int = 50,
-        history_window_T: int = 10,
+        cand_k: int = 20,
+        history_window_T: int = 5,
         epsilon: float = 1e-5,
         w_step: Optional[Dict[str, float]] = None,
     ):
@@ -761,14 +761,21 @@ class OnlineLearningPathEnv:
             self.topk_recs_policy[b].append([int(x) for x in topk_global[b].detach().cpu().tolist()])
 
     @torch.no_grad()
-    def compute_final_quality(self, policy_weight: Optional[Dict[str,float]] = None) -> Dict[str, torch.Tensor]:
+    def compute_final_quality(self, policy_weight: Optional[Dict[str,float]] = None, compute_all: bool = False) -> Dict[str, torch.Tensor]:
         """
         Return per-sample metrics + final_quality = weighted sum.
         """
         w = policy_weight or {"effectiveness": 1.0, "adaptivity": 1.0, "diversity": 1.0}
+        need_eff = compute_all or (w.get("effectiveness", 0.0) != 0.0)
+        need_adp = compute_all or (w.get("adaptivity", 0.0) != 0.0)
+        need_div = compute_all or (w.get("diversity", 0.0) != 0.0)
 
         B, L = self.orig_seq.shape
         K = self.topk
+
+        eff_scores = torch.zeros((B,), device=self.device)
+        adapt_scores = torch.zeros((B,), device=self.device)
+        div_scores = torch.zeros((B,), device=self.device)
 
         # build topk tensor [B, L-1, K] (pad with pad_val)
         topk_tensor = torch.full((B, L-1, K), self.pad_val, device=self.device, dtype=torch.long)
@@ -784,136 +791,139 @@ class OnlineLearningPathEnv:
                     recs = recs + [self.pad_val] * (K - len(recs))
                 topk_tensor[b, t] = torch.tensor(recs, device=self.device, dtype=torch.long)
 
-        # -------- adaptivity Eq.(19) over all recs --------
-        adapt_scores = torch.zeros((B,), device=self.device)
-        if self.diff_map is None:
-            adapt_scores[:] = 0.0
-        else:
-            for b in range(B):
-                valid_len = int(self.valid_lens[b].item())
-                if valid_len <= 1:
-                    continue
-
-                # history diffs/results from generated sequence up to valid_len
-                hist_items = self.gen_seq[b, :valid_len].detach().cpu().numpy().tolist()
-                hist_ans = self.gen_ans[b, :valid_len].detach().cpu().numpy().tolist()
-
-                # pre-compute per time step delta_t (as in Metrics.calculate_adaptivity_tensor)
-                history_diffs = []
-                history_results = []
-                for t in range(valid_len - 1):
-                    it = hist_items[t]
-                    if it != self.pad_val and it > 1:
-                        history_diffs.append(self.diff_map.get_difficulty_norm(it, default=2))
-                        history_results.append(float(hist_ans[t]))
-
-                total = 0.0
-                cnt = 0
-                for t in range(min(valid_len - 1, topk_tensor.size(1))):
-                    if len(history_diffs[:t]) < self.T // 2:
-                        delta = 1.0
-                    else:
-                        start = max(0, t - self.T)
-                        recent_diffs = history_diffs[start:t]
-                        recent_res = history_results[start:t]
-                        if len(recent_diffs) > 0:
-                            num = sum(d*r for d,r in zip(recent_diffs, recent_res))
-                            den = sum(recent_res) + self.eps
-                            delta = num / den
-                        else:
-                            delta = 1.0
-
-                    for k in range(K):
-                        rec = int(topk_tensor[b, t, k].item())
-                        if rec != self.pad_val and rec > 1:
-                            rec_diff = self.diff_map.get_difficulty_norm(rec, default=2)
-                            val = 1.0 - abs(delta - rec_diff)
-                            total += val
-                            cnt += 1
-                adapt_scores[b] = total / max(1, cnt)
-
-        # -------- effectiveness Eq.(20) over all recs --------
-        # pb: KT on original, pa: KT on generated
-        # We need yt tensors [B, L-1, N]; try to get from base_model if it provides yt for full sequence.
-        def _run_kt_like(seq, ts, idx, ans):
-            out = self.base_model(seq, ts, idx, ans, self.graph, self.hypergraph_list)
-            if isinstance(out, dict):
-                yt = out.get("yt", None)
+        if need_adp:
+            # -------- adaptivity Eq.(19) over all recs --------
+            # adapt_scores = torch.zeros((B,), device=self.device)
+            if self.diff_map is None:
+                adapt_scores[:] = 0.0
             else:
-                yt = out[3] if len(out) > 3 else None
-            if yt is None:
-                return None
-            if yt.dim() == 3 and yt.size(1) >= 1:
-                return yt  # [B, L-1, S]
-            return None
-
-        yt_before = _run_kt_like(self.orig_seq, self.orig_ts, self.orig_idx, self.orig_ans)
-        yt_after = _run_kt_like(self.gen_seq, self.orig_ts, self.orig_idx, self.gen_ans)
-        eff_scores = torch.zeros((B,), device=self.device)
-
-        if yt_before is None or yt_after is None:
-            eff_scores[:] = 0.0
-        else:
-            # ensure same time dim
-            Tm = min(yt_before.size(1), yt_after.size(1), L-1)
-            yt_before = yt_before[:, :Tm]
-            yt_after = yt_after[:, :Tm]
-            S = yt_before.size(-1)
-
-            for b in range(B):
-                valid_len = int(self.valid_lens[b].item())
-                if valid_len <= 1:
-                    continue
-                total = 0.0
-                cnt = 0
-                for t in range(min(valid_len - 1, Tm)):
-                    if int(self.orig_seq[b, t].item()) == self.pad_val:
+                for b in range(B):
+                    valid_len = int(self.valid_lens[b].item())
+                    if valid_len <= 1:
                         continue
-                    recs = topk_tensor[b, t]  # [K]
-                    for k in range(K):
-                        r = int(recs[k].item())
-                        if r == self.pad_val:
-                            continue
-                        if 0 <= r < S:
-                            pb = float(yt_before[b, t, r].item())
-                            pa = float(yt_after[b, t, r].item())
-                            if pb < 0.9 and pa > 0:
-                                gain = (pa - pb) / (1.0 - pb)
-                                total += gain
-                                cnt += 1
-                eff_scores[b] = total / max(1, cnt)
 
-        # -------- diversity Eq.(21) over all recs (per-sample) --------
-        div_scores = torch.zeros((B,), device=self.device)
-        if self.hidden_item is None:
-            div_scores[:] = 0.0
-        else:
-            emb = self.hidden_item  # [N,d]
-            for b in range(B):
-                valid_len = int(self.valid_lens[b].item())
-                if valid_len <= 1:
-                    continue
-                # collect all recommended items in valid time steps
-                items: List[int] = []
-                for t in range(min(valid_len - 1, topk_tensor.size(1))):
-                    for k in range(K):
-                        r = int(topk_tensor[b, t, k].item())
-                        if r != self.pad_val and r > 1:
-                            items.append(r)
-                if len(items) < 2:
-                    div_scores[b] = 0.0
-                    continue
-                e = emb[torch.tensor(items, device=self.device)]  # [M,d]
-                e = e / (e.norm(dim=-1, keepdim=True) + 1e-8)
-                sim = e @ e.t()  # [M,M]
-                # upper triangle without diagonal
-                M = sim.size(0)
-                triu = torch.triu(sim, diagonal=1)
-                vals = triu[triu != 0]
-                if vals.numel() == 0:
-                    div_scores[b] = 0.0
+                    # history diffs/results from generated sequence up to valid_len
+                    hist_items = self.gen_seq[b, :valid_len].detach().cpu().numpy().tolist()
+                    hist_ans = self.gen_ans[b, :valid_len].detach().cpu().numpy().tolist()
+
+                    # pre-compute per time step delta_t (as in Metrics.calculate_adaptivity_tensor)
+                    history_diffs = []
+                    history_results = []
+                    for t in range(valid_len - 1):
+                        it = hist_items[t]
+                        if it != self.pad_val and it > 1:
+                            history_diffs.append(self.diff_map.get_difficulty_norm(it, default=2))
+                            history_results.append(float(hist_ans[t]))
+
+                    total = 0.0
+                    cnt = 0
+                    for t in range(min(valid_len - 1, topk_tensor.size(1))):
+                        if len(history_diffs[:t]) < self.T // 2:
+                            delta = 1.0
+                        else:
+                            start = max(0, t - self.T)
+                            recent_diffs = history_diffs[start:t]
+                            recent_res = history_results[start:t]
+                            if len(recent_diffs) > 0:
+                                num = sum(d * r for d, r in zip(recent_diffs, recent_res))
+                                den = sum(recent_res) + self.eps
+                                delta = num / den
+                            else:
+                                delta = 1.0
+
+                        for k in range(K):
+                            rec = int(topk_tensor[b, t, k].item())
+                            if rec != self.pad_val and rec > 1:
+                                rec_diff = self.diff_map.get_difficulty_norm(rec, default=2)
+                                val = 1.0 - abs(delta - rec_diff)
+                                total += val
+                                cnt += 1
+                    adapt_scores[b] = total / max(1, cnt)
+
+        if need_eff:
+            # -------- effectiveness Eq.(20) over all recs --------
+            # pb: KT on original, pa: KT on generated
+            # We need yt tensors [B, L-1, N]; try to get from base_model if it provides yt for full sequence.
+            def _run_kt_like(seq, ts, idx, ans):
+                out = self.base_model(seq, ts, idx, ans, self.graph, self.hypergraph_list)
+                if isinstance(out, dict):
+                    yt = out.get("yt", None)
                 else:
-                    div_scores[b] = (1.0 - vals).mean()
+                    yt = out[3] if len(out) > 3 else None
+                if yt is None:
+                    return None
+                if yt.dim() == 3 and yt.size(1) >= 1:
+                    return yt  # [B, L-1, S]
+                return None
+
+            yt_before = _run_kt_like(self.orig_seq, self.orig_ts, self.orig_idx, self.orig_ans)
+            yt_after = _run_kt_like(self.gen_seq, self.orig_ts, self.orig_idx, self.gen_ans)
+            # eff_scores = torch.zeros((B,), device=self.device)
+
+            if yt_before is None or yt_after is None:
+                eff_scores[:] = 0.0
+            else:
+                # ensure same time dim
+                Tm = min(yt_before.size(1), yt_after.size(1), L - 1)
+                yt_before = yt_before[:, :Tm]
+                yt_after = yt_after[:, :Tm]
+                S = yt_before.size(-1)
+
+                for b in range(B):
+                    valid_len = int(self.valid_lens[b].item())
+                    if valid_len <= 1:
+                        continue
+                    total = 0.0
+                    cnt = 0
+                    for t in range(min(valid_len - 1, Tm)):
+                        if int(self.orig_seq[b, t].item()) == self.pad_val:
+                            continue
+                        recs = topk_tensor[b, t]  # [K]
+                        for k in range(K):
+                            r = int(recs[k].item())
+                            if r == self.pad_val:
+                                continue
+                            if 0 <= r < S:
+                                pb = float(yt_before[b, t, r].item())
+                                pa = float(yt_after[b, t, r].item())
+                                if pb < 0.9 and pa > 0:
+                                    gain = (pa - pb) / (1.0 - pb)
+                                    total += gain
+                                    cnt += 1
+                    eff_scores[b] = total / max(1, cnt)
+
+        if need_div:
+            # -------- diversity Eq.(21) over all recs (per-sample) --------
+            # div_scores = torch.zeros((B,), device=self.device)
+            if self.hidden_item is None:
+                div_scores[:] = 0.0
+            else:
+                emb = self.hidden_item  # [N,d]
+                for b in range(B):
+                    valid_len = int(self.valid_lens[b].item())
+                    if valid_len <= 1:
+                        continue
+                    # collect all recommended items in valid time steps
+                    items: List[int] = []
+                    for t in range(min(valid_len - 1, topk_tensor.size(1))):
+                        for k in range(K):
+                            r = int(topk_tensor[b, t, k].item())
+                            if r != self.pad_val and r > 1:
+                                items.append(r)
+                    if len(items) < 2:
+                        div_scores[b] = 0.0
+                        continue
+                    e = emb[torch.tensor(items, device=self.device)]  # [M,d]
+                    e = e / (e.norm(dim=-1, keepdim=True) + 1e-8)
+                    sim = e @ e.t()  # [M,M]
+                    # upper triangle without diagonal
+                    M = sim.size(0)
+                    triu = torch.triu(sim, diagonal=1)
+                    vals = triu[triu != 0]
+                    if vals.numel() == 0:
+                        div_scores[b] = 0.0
+                    else:
+                        div_scores[b] = (1.0 - vals).mean()
 
         final_quality = (
             w["effectiveness"] * eff_scores +
@@ -1004,7 +1014,8 @@ class RLPathOptimizer:
     def collect_trajectory(
         self,
         tgt, tgt_timestamp, tgt_idx, ans,
-        graph=None, hypergraph_list=None
+        graph=None, hypergraph_list=None,
+        compute_all=False
     ) -> Dict[str, torch.Tensor]:
         """
         Rollout policy for one batch, over all valid time steps.
@@ -1058,7 +1069,7 @@ class RLPathOptimizer:
                 break
 
         # terminal reward (final quality)
-        final_metrics = self.env.compute_final_quality(self.final_reward_weights)
+        final_metrics = self.env.compute_final_quality(self.final_reward_weights, compute_all)
         terminal_r = final_metrics["final_quality"] * self.terminal_reward_scale  # [B]
         # add terminal reward to last collected reward step (for each sample that had at least 1 step)
         if len(all_rewards) > 0:
@@ -1127,7 +1138,8 @@ def evaluate_policy(
     graph,
     hypergraph_list,
     device: torch.device,
-    max_batches: int = 50
+    max_batches: int = 20,
+    compute_all=True
 ) -> Dict[str, float]:
     """
     Evaluation over a few batches: report mean final metrics.
@@ -1149,7 +1161,7 @@ def evaluate_policy(
         tgt, tgt_timestamp, tgt_idx, ans = batch[0], batch[1], batch[2], batch[3]
         tgt = tgt.to(device); tgt_timestamp = tgt_timestamp.to(device); tgt_idx = tgt_idx.to(device); ans = ans.to(device)
 
-        rollout = rl.collect_trajectory(tgt, tgt_timestamp, tgt_idx, ans, graph=graph, hypergraph_list=hypergraph_list)
+        rollout = rl.collect_trajectory(tgt, tgt_timestamp, tgt_idx, ans, graph=graph, hypergraph_list=hypergraph_list, compute_all=compute_all)
         fm = rollout["final_metrics"]
         for k in agg:
             agg[k] += float(fm[k].mean().detach().cpu())

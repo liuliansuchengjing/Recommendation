@@ -72,7 +72,7 @@ def build_args():
 
     # ===== same as run.py essentials =====
     p.add_argument("-data_name", default="MOO")
-    p.add_argument("-batch_size", type=int, default=64)
+    p.add_argument("-batch_size", type=int, default=16)
     p.add_argument("-d_model", type=int, default=64)
     p.add_argument("-initialFeatureSize", type=int, default=64)
     p.add_argument("-train_rate", type=float, default=0.8)
@@ -169,7 +169,7 @@ def main():
         print(f"  train: {tr}  (elapsed {(time.time() - t0) / 60:.2f} min)")
 
         valid_loader = DataLoader(valid, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"), test=True)
-        val = evaluate_policy(rl=rl, data_loader=valid_loader, graph=relation_graph, hypergraph_list=hypergraph_list, device=device)
+        val = evaluate_policy(rl=rl, data_loader=valid_loader, graph=relation_graph, hypergraph_list=hypergraph_list, device=device, compute_all=True)
         print("  valid:", val)
 
         if val.get("final_quality", -1e18) > best_val:
