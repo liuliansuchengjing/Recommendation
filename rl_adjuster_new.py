@@ -336,7 +336,7 @@ class OnlineLearningPathEnv:
         # weights for step reward
         self.w_step = w_step or {
             "preference": 1.0,
-            "adaptivity": 1.0,
+            "adaptivity": 0,
             "novelty": 0.2,
         }
 
@@ -703,10 +703,15 @@ class OnlineLearningPathEnv:
         else:
             novelty = torch.zeros((B,), device=self.device)
 
+        # reward = (
+        #     self.w_step["preference"] * pref +
+        #     self.w_step["adaptivity"] * adapt +
+        #     self.w_step.get("novelty", 0.0) * novelty
+        # ).float()
         reward = (
-            self.w_step["preference"] * pref +
-            self.w_step["adaptivity"] * adapt +
-            self.w_step.get("novelty", 0.0) * novelty
+                self.w_step["preference"] * pref +
+                # self.w_step["adaptivity"] * adapt +  # 注释掉适应性奖励
+                self.w_step.get("novelty", 0.0) * novelty
         ).float()
 
         # ------- transition: append chosen item & simulated answer -------
@@ -983,7 +988,7 @@ class RLPathOptimizer:
         self.rl_lr = rl_lr
         self.policy_hidden = policy_hidden
         self.ppo_config = ppo_config or PPOConfig()
-        self.final_reward_weights = final_reward_weights or {"effectiveness": 0.0, "adaptivity": 1.0, "diversity": 1.0}
+        self.final_reward_weights = final_reward_weights or {"effectiveness": 1.0, "adaptivity": 0.0, "diversity": 1.0}
         self.terminal_reward_scale = terminal_reward_scale
 
     def _lazy_init(self, feat_dim: int):
