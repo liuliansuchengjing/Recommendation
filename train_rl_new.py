@@ -1,179 +1,186 @@
-
 # -*- coding: utf-8 -*-
 """
-train_rl_new_fixed.py
+train_rl_new.py (fixed v10)
 
-This script trains the RL policy with the reworked rl_adjuster_new_fixed.py:
-- Online RL at every valid time step (PAD masked)
-- PPO (actor-critic, GAE, clipping)
-- Final quality strictly aligned with Eq.(19)(20)(21)
+Fully aligned with your repo's run.py + dataLoader.py + HGAT.py.
+
+Key fixes:
+- DO NOT call rl.policy.train()/eval() before policy exists.
+  RLPathOptimizer is lazy-init; use rl.ensure_initialized(...) once on the first batch.
+- Use rl.collect_trajectory(...) -> dict, and rl.update_policy(dict) (PPO update).
 """
 
 import os
+import time
 import argparse
+import numpy as np
 import torch
 
-from HGAT import MSHGAT
 from dataLoader import Split_data, DataLoader
 from graphConstruct import ConRelationGraph, ConHyperGraphList
+from HGAT import MSHGAT
 
-from rl_adjuster_new import RLPathOptimizer, PPOConfig, evaluate_policy
+from rl_adjuster_new import RLPathOptimizer, evaluate_policy
 
 
-def run_training_with_pretrained_model():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-data_name", type=str, default="assist2009")
-    parser.add_argument("-pretrained_path", type=str, default="saved_model.pth")
+def set_seed(seed: int = 0):
+    torch.backends.cudnn.deterministic = True
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
 
-    parser.add_argument("-batch_size", type=int, default=16)
-    parser.add_argument("-d_model", type=int, default=64)
-    parser.add_argument("-initialFeatureSize", type=int, default=64)
-    parser.add_argument("-train_rate", type=float, default=0.8)
-    parser.add_argument("-valid_rate", type=float, default=0.1)
-    parser.add_argument("-dropout", type=float, default=0.3)
-    parser.add_argument("-no_cuda", action="store_true")
 
-    # RL / PPO
-    parser.add_argument("-topk", type=int, default=10)
-    parser.add_argument("-cand_k", type=int, default=50)
-    parser.add_argument("-history_T", type=int, default=10)
-    parser.add_argument("-epochs", type=int, default=5)
-    parser.add_argument("-rl_lr", type=float, default=3e-4)
-    parser.add_argument("-ppo_epochs", type=int, default=4)
-    parser.add_argument("-minibatch_size", type=int, default=256)
-    parser.add_argument("-clip_eps", type=float, default=0.2)
-    parser.add_argument("-gamma", type=float, default=0.99)
-    parser.add_argument("-gae_lambda", type=float, default=0.95)
-    parser.add_argument("-ent_coef", type=float, default=0.01)
-    parser.add_argument("-vf_coef", type=float, default=0.5)
-    parser.add_argument("-terminal_scale", type=float, default=1.0)
+def _shuffle_cas(cas):
+    # cas is (tgt, timestamp, idx, ans)
+    if cas is None or (not isinstance(cas, (list, tuple))) or len(cas) != 4:
+        return cas
+    tgt, ts, idx, ans = cas
+    n = len(tgt)
+    if n <= 1:
+        return cas
+    perm = np.random.permutation(n)
+    return ([tgt[i] for i in perm],
+            [ts[i] for i in perm],
+            [idx[i] for i in perm],
+            [ans[i] for i in perm])
 
-    opt = parser.parse_args([])  # keep your original "no CLI" behavior
 
-    # ✅ run.py expects:
-    opt.d_word_vec = opt.d_model
-
-    # split data
-    user_size, total_cascades, timestamps, train, valid, test = Split_data(
-        opt.data_name, opt.train_rate, opt.valid_rate, load_dict=True
-    )
-    opt.user_size = user_size
-
-    device = torch.device("cuda" if torch.cuda.is_available() and (not opt.no_cuda) else "cpu")
-    print("device =", device)
-
-    # dataloaders
-    train_loader = DataLoader(train, batch_size=opt.batch_size, cuda=(device.type == "cuda"))
-    valid_loader = DataLoader(valid, batch_size=opt.batch_size, cuda=(device.type == "cuda"))
-
-    # graphs
-    relation_graph = ConRelationGraph(opt.data_name)
-    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)
-
-    # load base model
-    model_path = opt.pretrained_path
-    print("Loading base model:", model_path)
-    mshgat = MSHGAT(opt, dropout=opt.dropout)
-    if os.path.exists(model_path):
-        mshgat.load_state_dict(torch.load(model_path, map_location="cpu"))
-        print("Loaded pretrained weights.")
+def _load_pretrained(model: torch.nn.Module, path: str, device: torch.device):
+    if not path:
+        return False
+    if not os.path.exists(path):
+        print(f"[WARN] not found: {path}  (training from random init is not recommended)")
+        return False
+    ckpt = torch.load(path, map_location=device)
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        state = ckpt["state_dict"]
+    elif isinstance(ckpt, dict) and "model" in ckpt:
+        state = ckpt["model"]
     else:
-        print(f"[WARN] not found: {model_path}  (training from random init is not recommended)")
-    mshgat = mshgat.to(device)
-    mshgat.eval()
+        state = ckpt
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print("[WARN] missing keys:", missing[:20], ("..." if len(missing) > 20 else ""))
+    if unexpected:
+        print("[WARN] unexpected keys:", unexpected[:20], ("..." if len(unexpected) > 20 else ""))
+    print(f"[OK] loaded pretrained base model from: {path}")
+    return True
 
-    num_items = user_size  # your project uses this as node count
 
-    # PPO config
-    ppo_cfg = PPOConfig(
-        gamma=opt.gamma,
-        gae_lambda=opt.gae_lambda,
-        clip_eps=opt.clip_eps,
-        vf_coef=opt.vf_coef,
-        ent_coef=opt.ent_coef,
-        ppo_epochs=opt.ppo_epochs,
-        minibatch_size=opt.minibatch_size,
-    )
+def build_args():
+    p = argparse.ArgumentParser()
 
-    # RL optimizer
-    rl = RLPathOptimizer(
-        base_model=mshgat,
-        num_items=num_items,
-        data_name=opt.data_name,
-        device=device,
-        pad_val=0,
-        topk=opt.topk,
-        cand_k=opt.cand_k,
-        history_window_T=opt.history_T,
-        rl_lr=opt.rl_lr,
-        ppo_config=ppo_cfg,
-        terminal_reward_scale=opt.terminal_scale,
-        # step reward weights (you can tune later)
-        step_reward_weights={
-            "preference": 1.0,
-            "adaptivity": 1.0,
-            "novelty": 0.2,
-        },
-        # final weights for Eq.(19)(20)(21)
-        final_reward_weights={
-            "effectiveness": 1.0,
-            "adaptivity": 1.0,
-            "diversity": 1.0,
-        }
-    )
+    # ===== same as run.py essentials =====
+    p.add_argument("-data_name", default="MOO")
+    p.add_argument("-batch_size", type=int, default=64)
+    p.add_argument("-d_model", type=int, default=64)
+    p.add_argument("-initialFeatureSize", type=int, default=64)
+    p.add_argument("-train_rate", type=float, default=0.8)
+    p.add_argument("-valid_rate", type=float, default=0.1)
+    p.add_argument("-dropout", type=float, default=0.3)
+    p.add_argument("-pos_emb", type=bool, default=True)
 
-    # training loop
-    for epoch in range(1, opt.epochs + 1):
+    p.add_argument("--pretrained_path", type=str, default="./checkpoint/DiffusionPrediction.pt")
+
+    # ===== RL/PPO =====
+    p.add_argument("--rl_epochs", type=int, default=5)
+    p.add_argument("--cand_k", type=int, default=50)
+    p.add_argument("--topk", type=int, default=10)
+    p.add_argument("--history_T", type=int, default=10)
+    p.add_argument("--rl_lr", type=float, default=3e-4)
+    p.add_argument("--seed", type=int, default=0)
+
+    return p.parse_args()
+
+
+def train_one_epoch(rl: RLPathOptimizer, train_loader, graph, hypergraph_list, device):
+    stats = {"policy_loss": [], "value_loss": [], "entropy": [], "total_loss": [],
+             "final_quality": [], "effectiveness": [], "adaptivity": [], "diversity": []}
+
+    for batch in train_loader:
+        tgt, tgt_timestamp, tgt_idx, ans = batch
+        tgt = tgt.to(device)
+        tgt_timestamp = tgt_timestamp.to(device)
+        tgt_idx = tgt_idx.to(device)
+        ans = ans.to(device)
+
+        # Init policy once
+        if rl.policy is None:
+            rl.ensure_initialized(tgt, tgt_timestamp, tgt_idx, ans, graph=graph, hypergraph_list=hypergraph_list)
+
         rl.policy.train()
 
-        epoch_losses = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "total_loss": 0.0}
-        epoch_metrics = {"effectiveness": 0.0, "adaptivity": 0.0, "diversity": 0.0, "final_quality": 0.0}
-        n_batches = 0
+        rollout = rl.collect_trajectory(tgt, tgt_timestamp, tgt_idx, ans, graph=graph, hypergraph_list=hypergraph_list)
+        losses = rl.update_policy(rollout)
 
-        for batch in train_loader:
-            tgt, tgt_timestamp, tgt_idx, ans = batch[0], batch[1], batch[2], batch[3]
-            tgt = tgt.to(device)
-            tgt_timestamp = tgt_timestamp.to(device)
-            tgt_idx = tgt_idx.to(device)
-            ans = ans.to(device)
+        fm = rollout["final_metrics"]
+        stats["policy_loss"].append(losses["policy_loss"])
+        stats["value_loss"].append(losses["value_loss"])
+        stats["entropy"].append(losses["entropy"])
+        stats["total_loss"].append(losses["total_loss"])
+        stats["final_quality"].append(float(fm["final_quality"].mean().detach().cpu()))
+        stats["effectiveness"].append(float(fm["effectiveness"].mean().detach().cpu()))
+        stats["adaptivity"].append(float(fm["adaptivity"].mean().detach().cpu()))
+        stats["diversity"].append(float(fm["diversity"].mean().detach().cpu()))
 
-            rollout = rl.collect_trajectory(
-                tgt, tgt_timestamp, tgt_idx, ans,
-                graph=relation_graph, hypergraph_list=hypergraph_list
-            )
-            losses = rl.update_policy(rollout)
+    return {k: float(np.mean(v)) if v else 0.0 for k, v in stats.items()}
 
-            for k in epoch_losses:
-                epoch_losses[k] += float(losses.get(k, 0.0))
 
-            fm = rollout["final_metrics"]
-            for k in epoch_metrics:
-                epoch_metrics[k] += float(fm[k].mean().detach().cpu())
+def main():
+    args = build_args()
+    set_seed(args.seed)
 
-            n_batches += 1
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("[Device]", device)
 
-        for k in epoch_losses:
-            epoch_losses[k] /= max(1, n_batches)
-        for k in epoch_metrics:
-            epoch_metrics[k] /= max(1, n_batches)
+    user_size, total_cascades, timestamps, train, valid, test = Split_data(
+        args.data_name, args.train_rate, args.valid_rate, load_dict=True
+    )
 
-        print(f"\n[Epoch {epoch}] losses={epoch_losses}")
-        print(f"[Epoch {epoch}] train_metrics={epoch_metrics}")
+    relation_graph = ConRelationGraph(args.data_name)
+    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)
 
-        # validation (few batches)
-        rl.policy.eval()
-        val_metrics = evaluate_policy(
-            rl=rl,
-            data_loader=valid_loader,
-            graph=relation_graph,
-            hypergraph_list=hypergraph_list,
-            device=device,
-            max_batches=20
-        )
-        print(f"[Epoch {epoch}] valid_metrics={val_metrics}\n")
+    args.d_word_vec = args.d_model
+    args.user_size = user_size
+    base_model = MSHGAT(args, dropout=args.dropout).to(device)
+    _load_pretrained(base_model, args.pretrained_path, device)
 
-    return rl
+    rl = RLPathOptimizer(
+        base_model=base_model,
+        num_items=user_size,
+        data_name=args.data_name,
+        device=device,
+        pad_val=0,
+        topk=args.topk,
+        cand_k=args.cand_k,
+        history_window_T=args.history_T,
+        rl_lr=args.rl_lr,
+    )
+
+    best_val = -1e18
+    for epoch in range(args.rl_epochs):
+        print(f"\n[RL Epoch {epoch}]")
+
+        train_shuffled = _shuffle_cas(train)
+        train_loader = DataLoader(train_shuffled, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"))
+
+        t0 = time.time()
+        tr = train_one_epoch(rl, train_loader, relation_graph, hypergraph_list, device)
+        print(f"  train: {tr}  (elapsed {(time.time() - t0) / 60:.2f} min)")
+
+        valid_loader = DataLoader(valid, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"), test=True)
+        val = evaluate_policy(rl=rl, data_loader=valid_loader, graph=relation_graph, hypergraph_list=hypergraph_list, device=device)
+        print("  valid:", val)
+
+        if val.get("final_quality", -1e18) > best_val:
+            best_val = val["final_quality"]
+            torch.save({"policy": rl.policy.state_dict()}, "./checkpoint/rl_policy_best.pt")
+            print("  [OK] saved best RL policy to ./checkpoint/rl_policy_best.pt")
+
+    test_loader = DataLoader(test, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"), test=True)
+    te = evaluate_policy(rl=rl, data_loader=test_loader, graph=relation_graph, hypergraph_list=hypergraph_list, device=device)
+    print("\n[Test]", te)
 
 
 if __name__ == "__main__":
-    run_training_with_pretrained_model()
+    main()
