@@ -983,7 +983,7 @@ class RLPathOptimizer:
         self.rl_lr = rl_lr
         self.policy_hidden = policy_hidden
         self.ppo_config = ppo_config or PPOConfig()
-        self.final_reward_weights = final_reward_weights or {"effectiveness": 1.0, "adaptivity": 1.0, "diversity": 1.0}
+        self.final_reward_weights = final_reward_weights or {"effectiveness": 0.0, "adaptivity": 1.0, "diversity": 1.0}
         self.terminal_reward_scale = terminal_reward_scale
 
     def _lazy_init(self, feat_dim: int):
