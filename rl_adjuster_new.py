@@ -723,7 +723,7 @@ class OnlineLearningPathEnv:
 
             # simulate answer using PRE-STEP mastery of chosen (no leakage)
             p_correct = self._pre_yt.gather(1, chosen.view(-1,1)).squeeze(1)[b].item()
-            self.gen_ans[b, next_pos] = 1 if p_correct >= 0.5 else 0
+            self.gen_ans[b, next_pos] = 1 if p_correct >= 0 else 0
 
         # advance step
         self.step += 1
