@@ -71,7 +71,7 @@ def build_args():
     p = argparse.ArgumentParser()
 
     # ===== same as run.py essentials =====
-    p.add_argument("-data_name", default="MOO")
+    p.add_argument("-data_name", default="Assist")
     p.add_argument("-batch_size", type=int, default=16)
     p.add_argument("-d_model", type=int, default=64)
     p.add_argument("-initialFeatureSize", type=int, default=64)
@@ -80,12 +80,12 @@ def build_args():
     p.add_argument("-dropout", type=float, default=0.3)
     p.add_argument("-pos_emb", type=bool, default=True)
 
-    p.add_argument("--pretrained_path", type=str, default="./checkpoint/DiffusionPrediction.pt")
+    p.add_argument("--pretrained_path", type=str, default="./checkpoint/DiffusionPrediction_a150.pt")
 
     # ===== RL/PPO =====
     p.add_argument("--rl_epochs", type=int, default=5)
     p.add_argument("--cand_k", type=int, default=50)
-    p.add_argument("--topk", type=int, default=10)
+    p.add_argument("--topk", type=int, default=5)
     p.add_argument("--history_T", type=int, default=10)
     p.add_argument("--rl_lr", type=float, default=3e-4)
     p.add_argument("--seed", type=int, default=0)
