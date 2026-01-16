@@ -221,7 +221,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
 
             # forward
             # pred = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
-            pred, pred_res, kt_mask, _, _  = model(tgt, tgt_timestamp, tgt_idx, ans, graph,
+            pred, pred_res, kt_mask, _, _, _  = model(tgt, tgt_timestamp, tgt_idx, ans, graph,
                                             hypergraph_list)  # ==================================
             y_pred = pred.detach().cpu().numpy()
             loss_kt, auc, acc = kt_loss(pred_res.cpu(), ans.cpu(),
