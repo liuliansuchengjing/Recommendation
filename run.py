@@ -87,7 +87,7 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         # training
         optimizer.zero_grad()
         # pred= model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
-        pred, pred_res, kt_mask, yt, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph,
+        pred, pred_res, kt_mask, yt, _, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph,
                                         hypergraph_list)  # ==================================
 
         # loss

@@ -8,6 +8,14 @@ Key fixes:
 - DO NOT call rl.policy.train()/eval() before policy exists.
   RLPathOptimizer is lazy-init; use rl.ensure_initialized(...) once on the first batch.
 - Use rl.collect_trajectory(...) -> dict, and rl.update_policy(dict) (PPO update).
+
+张量维度说明：
+- [B]: Batch size (批处理大小)
+- [N]: Number of items/questions (物品/问题总数)
+- [L]: Sequence length (序列长度)
+- [d]: Embedding dimension (嵌入维度)
+- [K]: Top-k/K candidates (候选项目数量)
+- [T]: Time steps (时间步数)
 """
 
 import os
@@ -97,92 +105,178 @@ def build_args():
 
 
 def train_one_epoch(rl: RLPathOptimizer, train_loader, graph, hypergraph_list, device):
+    """
+    训练一个epoch的数据
+    
+    Args:
+        rl: RLPathOptimizer实例
+        train_loader: 训练数据加载器
+        graph: 关系图
+        hypergraph_list: 超图列表
+        device: 计算设备
+        
+    Returns:
+        stats: 包含各种训练指标的字典
+               - policy_loss: 策略损失 [scalar]
+               - value_loss: 价值函数损失 [scalar]
+               - entropy: 熵值 [scalar]
+               - total_loss: 总损失 [scalar]
+               - final_quality: 最终质量 [scalar]
+               - effectiveness: 有效性 [scalar]
+               - adaptivity: 适应性 [scalar]
+               - diversity: 多样性 [scalar]
+    """
     stats = {"policy_loss": [], "value_loss": [], "entropy": [], "total_loss": [],
              "final_quality": [], "effectiveness": [], "adaptivity": [], "diversity": []}
 
     for batch in train_loader:
+        # batch包含以下张量：
+        # tgt: 目标序列 [B, L] - 每个批次的序列
+        # tgt_timestamp: 时间戳 [B, L] - 每个序列的时间戳
+        # tgt_idx: 索引 [B] - 每个序列的级联ID
+        # ans: 答案 [B, L] - 每个交互的正确性标签
         tgt, tgt_timestamp, tgt_idx, ans = batch
-        tgt = tgt.to(device)
-        tgt_timestamp = tgt_timestamp.to(device)
-        tgt_idx = tgt_idx.to(device)
-        ans = ans.to(device)
+        tgt = tgt.to(device)           # [B, L] - 目标序列，批量大小×序列长度
+        tgt_timestamp = tgt_timestamp.to(device)  # [B, L] - 时间戳张量
+        tgt_idx = tgt_idx.to(device)   # [B] - 级联索引张量
+        ans = ans.to(device)           # [B, L] - 答案张量，标记每个交互的正确性
 
-        # Init policy once
+        # 初始化策略一次
         if rl.policy is None:
+            # 确保策略初始化，输入张量维度：
+            # tgt: [B, L] - 序列数据
+            # tgt_timestamp: [B, L] - 时间戳数据
+            # tgt_idx: [B] - 级联ID
+            # ans: [B, L] - 正确性标签
             rl.ensure_initialized(tgt, tgt_timestamp, tgt_idx, ans, graph=graph, hypergraph_list=hypergraph_list)
 
         rl.policy.train()
 
+        # 收集轨迹，返回字典包含：
+        # - cand_feat: 候选特征 [N*K, F] - N为总时间步，K为候选数，F为特征维数
+        # - actions: 动作 [N*K] - 每个时间步选择的动作索引
+        # - old_logp: 旧对数概率 [N*K] - 旧策略的概率
+        # - old_values: 旧价值 [N*K] - 旧价值估计
+        # - advantages: 优势 [N*K] - 优势函数值
+        # - returns: 回报 [N*K] - 累积回报
+        # - final_metrics: 最终指标字典，包含effectiveness, adaptivity, diversity等 [B]
         rollout = rl.collect_trajectory(tgt, tgt_timestamp, tgt_idx, ans, graph=graph, hypergraph_list=hypergraph_list)
+        
+        # 更新策略，返回损失字典：
+        # - policy_loss: 策略损失标量
+        # - value_loss: 价值损失标量
+        # - entropy: 熵损失标量
+        # - total_loss: 总损失标量
         losses = rl.update_policy(rollout)
 
-        fm = rollout["final_metrics"]
-        stats["policy_loss"].append(losses["policy_loss"])
-        stats["value_loss"].append(losses["value_loss"])
-        stats["entropy"].append(losses["entropy"])
-        stats["total_loss"].append(losses["total_loss"])
+        fm = rollout["final_metrics"]  # 最终评估指标字典
+        stats["policy_loss"].append(losses["policy_loss"])  # 策略损失列表
+        stats["value_loss"].append(losses["value_loss"])    # 价值损失列表
+        stats["entropy"].append(losses["entropy"])          # 熵值列表
+        stats["total_loss"].append(losses["total_loss"])    # 总损失列表
+        # 最终质量平均值 [scalar]
         stats["final_quality"].append(float(fm["final_quality"].mean().detach().cpu()))
+        # 有效性平均值 [scalar]
         stats["effectiveness"].append(float(fm["effectiveness"].mean().detach().cpu()))
+        # 适应性平均值 [scalar]
         stats["adaptivity"].append(float(fm["adaptivity"].mean().detach().cpu()))
+        # 多样性平均值 [scalar]
         stats["diversity"].append(float(fm["diversity"].mean().detach().cpu()))
 
+    # 对所有统计值取平均
     return {k: float(np.mean(v)) if v else 0.0 for k, v in stats.items()}
 
 
 def main():
+    """
+    主训练函数
+    """
     args = build_args()
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[Device]", device)
 
+    # 数据加载返回：
+    # user_size: 用户/物品总数 [scalar]
+    # total_cascades: 总级联数 [list of lists]
+    # timestamps: 时间戳 [list of lists]
+    # train, valid, test: 训练/验证/测试集，格式为(tgt, tgt_timestamp, tgt_idx, ans)
     user_size, total_cascades, timestamps, train, valid, test = Split_data(
         args.data_name, args.train_rate, args.valid_rate, load_dict=True
     )
 
-    relation_graph = ConRelationGraph(args.data_name)
-    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)
+    # 构建关系图和超图
+    relation_graph = ConRelationGraph(args.data_name)  # 关系图结构
+    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)  # 超图列表
 
-    args.d_word_vec = args.d_model
-    args.user_size = user_size
+    args.d_word_vec = args.d_model  # 词向量维度
+    args.user_size = user_size      # 用户/物品总数
+    # 基础模型MSHGAT，接收参数并构建：
+    # - 输入: [B, L] 序列，[B, L] 时间戳，[B] 级联ID，[B, L] 答案
+    # - 输出: 预测概率分布和其他状态信息
     base_model = MSHGAT(args, dropout=args.dropout).to(device)
     _load_pretrained(base_model, args.pretrained_path, device)
 
+    # 创建RL路径优化器
+    # 参数说明：
+    # - base_model: 基础模型
+    # - num_items: 物品总数 [scalar] - 用于张量维度
+    # - data_name: 数据集名称
+    # - device: 计算设备
+    # - topk: 每步记录的top-k推荐 [scalar] - 影响最终评估的推荐路径
+    # - cand_k: 候选集大小 [scalar] - 每步可选项目的数量
+    # - history_window_T: 历史窗口大小 [scalar] - 用于计算适应性指标
     rl = RLPathOptimizer(
         base_model=base_model,
-        num_items=user_size,
+        num_items=user_size,          # 物品总数 N，影响概率分布维度 [N]
         data_name=args.data_name,
         device=device,
-        pad_val=0,
-        topk=args.topk,
-        cand_k=args.cand_k,
-        history_window_T=args.history_T,
-        rl_lr=args.rl_lr,
+        pad_val=0,                    # 填充值
+        topk=args.topk,              # top-k推荐数 K，影响最终评估 [K]
+        cand_k=args.cand_k,          # 候选项目数 Kcand，每步决策空间 [Kcand]
+        history_window_T=args.history_T,  # 历史窗口长度 T，影响适应性计算
+        rl_lr=args.rl_lr,            # 强化学习学习率
     )
 
-    best_val = -1e18
-    for epoch in range(args.rl_epochs):
-        print(f"\n[RL Epoch {epoch}]")
+    best_val = -1e18  # 最佳验证分数
+    for epoch in range(args.rl_epochs):  # RL训练轮次
+        print(f"\\n[RL Epoch {epoch}]")
 
-        train_shuffled = _shuffle_cas(train)
+        train_shuffled = _shuffle_cas(train)  # 打乱训练数据
+        # 创建训练数据加载器，每个batch输出：
+        # - tgt: [B, L] 目标序列
+        # - tgt_timestamp: [B, L] 时间戳
+        # - tgt_idx: [B] 级联ID
+        # - ans: [B, L] 答案标签
         train_loader = DataLoader(train_shuffled, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"))
 
         t0 = time.time()
+        # 训练一个epoch，返回平均指标
         tr = train_one_epoch(rl, train_loader, relation_graph, hypergraph_list, device)
         print(f"  train: {tr}  (elapsed {(time.time() - t0) / 60:.2f} min)")
 
+        # 验证集评估
         valid_loader = DataLoader(valid, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"), test=True)
+        # 评估策略性能，返回：
+        # - final_quality: 最终质量 [scalar]
+        # - effectiveness: 有效性 [scalar]
+        # - adaptivity: 适应性 [scalar]
+        # - diversity: 多样性 [scalar]
         val = evaluate_policy(rl=rl, data_loader=valid_loader, graph=relation_graph, hypergraph_list=hypergraph_list, device=device, compute_all=True)
         print("  valid:", val)
 
+        # 保存最佳模型
         if val.get("final_quality", -1e18) > best_val:
             best_val = val["final_quality"]
+            # 保存策略参数
             torch.save({"policy": rl.policy.state_dict()}, "./checkpoint/a_rl_policy.pt")
             print("  [OK] saved best RL policy to ./checkpoint/a_rl_policy.pt")
 
+    # 测试集评估
     test_loader = DataLoader(test, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"), test=True)
     te = evaluate_policy(rl=rl, data_loader=test_loader, graph=relation_graph, hypergraph_list=hypergraph_list, device=device)
-    print("\n[Test]", te)
+    print("\\n[Test]", te)
 
 
 def test_rl():

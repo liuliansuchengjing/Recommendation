@@ -23,6 +23,16 @@ NOTE:
 - We deliberately keep the external API used by train_rl_new.py:
     * RLPathOptimizer
     * evaluate_policy
+
+张量维度说明：
+- [B]: Batch size (批处理大小)
+- [N]: Number of items/questions (物品/问题总数)
+- [L]: Sequence length (序列长度)
+- [d]: Embedding dimension (嵌入维度)
+- [K]/[Kc]: Number of candidates (候选项目数)
+- [F]: Feature dimension (特征维度)
+- [T]: Time steps (时间步数)
+- [topk]: Top-k推荐数
 """
 
 from __future__ import annotations
@@ -41,11 +51,30 @@ import torch.nn.functional as F
 # ------------------------- small utils -------------------------
 
 def _ensure_2d(x: torch.Tensor) -> torch.Tensor:
+    """
+    确保张量为二维
+    
+    Args:
+        x: 输入张量 [任意维度]
+        
+    Returns:
+        确保为二维的张量 [N, M] 或 [1, N]
+    """
     if x.dim() == 1:
-        return x.unsqueeze(0)
+        return x.unsqueeze(0)  # [N] -> [1, N]
     return x
 
 def _to_device(x, device):
+    """
+    将张量或对象移动到指定设备
+    
+    Args:
+        x: 张量或None或其他对象
+        device: 目标设备
+        
+    Returns:
+        移动到目标设备的对象
+    """
     if x is None:
         return None
     if isinstance(x, torch.Tensor):
@@ -53,15 +82,40 @@ def _to_device(x, device):
     return x
 
 def _cosine_sim(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    # [..., d]
-    a_n = a / (a.norm(dim=-1, keepdim=True) + eps)
-    b_n = b / (b.norm(dim=-1, keepdim=True) + eps)
-    return (a_n * b_n).sum(dim=-1)
+    """
+    计算余弦相似度
+    
+    Args:
+        a: 第一个张量 [..., d] - 任意前导维度，最后一维为嵌入维度
+        b: 第二个张量 [..., d] - 与a形状兼容
+        eps: 防止除零的小值
+        
+    Returns:
+        余弦相似度张量 [...] - 与a和b广播后的形状相同
+    """
+    # 标准化张量 [..., d]
+    a_n = a / (a.norm(dim=-1, keepdim=True) + eps)  # [..., d]
+    b_n = b / (b.norm(dim=-1, keepdim=True) + eps)  # [..., d]
+    # 计算点积得到余弦相似度
+    return (a_n * b_n).sum(dim=-1)  # [...] - 除了最后一个维度外的广播结果
 
 def _masked_mean(x: torch.Tensor, mask: torch.Tensor, dim=None, eps: float = 1e-8) -> torch.Tensor:
-    # mask: broadcastable boolean
-    x = x * mask.to(x.dtype)
-    denom = mask.to(x.dtype).sum(dim=dim, keepdim=True).clamp_min(eps)
+    """
+    基于掩码计算均值
+    
+    Args:
+        x: 输入张量 [任意维度]
+        mask: 掩码张量 [与x广播兼容的布尔张量]
+        dim: 要计算均值的维度
+        eps: 防止除零的小值
+        
+    Returns:
+        掩码均值张量
+    """
+    # mask: 可广播的布尔张量
+    x = x * mask.to(x.dtype)  # 将被掩码部分置为0
+    # 计算非掩码元素的数量，防止除零
+    denom = mask.to(x.dtype).sum(dim=dim, keepdim=True).clamp_min(eps)  # [广播后的形状]
     return (x.sum(dim=dim, keepdim=True) / denom).squeeze(dim if dim is not None else -1)
 
 
@@ -140,42 +194,62 @@ class DifficultyMapping:
 
 class PolicyValueNet(nn.Module):
     """
-    Input:
-        cand_feat: [B, K, F]  (F >= 1)
-    Output:
-        logits: [B, K]
-        value: [B]
+    策略价值网络
+    
+    输入:
+        cand_feat: [B, K, F] - 候选特征，B为批量大小，K为候选数，F为特征维度
+    输出:
+        logits: [B, K] - 动作logits，用于选择下一个项目
+        value: [B] - 状态价值估计
     """
     def __init__(self, feat_dim: int, hidden_dim: int = 128, dropout: float = 0.1):
         super().__init__()
-        self.feat_dim = feat_dim
-        self.hidden_dim = hidden_dim
+        self.feat_dim = feat_dim      # 特征维度 [F]
+        self.hidden_dim = hidden_dim  # 隐藏层维度 [H]
 
+        # 候选项目MLP编码器
+        # 输入: [B, K, F] -> 输出: [B, K, H]
         self.cand_mlp = nn.Sequential(
-            nn.Linear(feat_dim, hidden_dim),
+            nn.Linear(feat_dim, hidden_dim),  # [F, H] - 特征到隐藏层映射
             nn.Tanh(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),  # [H, H] - 隐藏层内部映射
             nn.Tanh(),
         )
-        self.logit_head = nn.Linear(hidden_dim, 1)
+        # Logits头 - 为每个候选项目生成一个logit值
+        # 输入: [B, K, H] -> 输出: [B, K, 1] -> [B, K]
+        self.logit_head = nn.Linear(hidden_dim, 1)  # [H, 1] - 隐藏层到单个logit
 
-        # value head pools candidate representations
+        # 价值头池化候选表示
+        # 使用注意力池化将候选表示聚合为单一状态表示
         self.value_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),  # [H, H] - 状态价值编码
             nn.Tanh(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, 1)  # [H, 1] - 最终价值输出
         )
 
     def forward(self, cand_feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.cand_mlp(cand_feat)            # [B,K,H]
-        logits = self.logit_head(h).squeeze(-1) # [B,K]
+        """
+        前向传播
+        
+        Args:
+            cand_feat: 候选特征 [B, K, F] - B: 批量大小, K: 候选数, F: 特征维度
+            
+        Returns:
+            logits: 动作logits [B, K] - 每个候选项目的logit值
+            value: 状态价值 [B] - 当前状态的价值估计
+        """
+        # 编码候选特征 [B, K, F] -> [B, K, H]
+        h = self.cand_mlp(cand_feat)            # [B, K, H]
+        # 生成动作logits [B, K, H] -> [B, K]
+        logits = self.logit_head(h).squeeze(-1) # [B, K]
 
-        # attention pooling for value
-        att = torch.softmax(logits, dim=-1).unsqueeze(-1)  # [B,K,1]
-        pooled = (h * att).sum(dim=1)                      # [B,H]
-        value = self.value_mlp(pooled).squeeze(-1)         # [B]
+        # 注意力池化计算价值
+        # 使用logits作为注意力权重对候选表示进行加权求和
+        att = torch.softmax(logits, dim=-1).unsqueeze(-1)  # [B, K, 1] - 注意力权重
+        pooled = (h * att).sum(dim=1)                      # [B, H] - 加权池化
+        value = self.value_mlp(pooled).squeeze(-1)         # [B] - 价值估计
         return logits, value
 
 
@@ -193,102 +267,142 @@ class PPOConfig:
     minibatch_size: int = 256
 
 class PPOTrainer:
+    """
+    PPO (Proximal Policy Optimization) 训练器
+    """
     def __init__(self, policy: PolicyValueNet, lr: float = 3e-4, config: Optional[PPOConfig] = None):
         self.policy = policy
         self.config = config or PPOConfig()
+        # PPO优化器，用于更新策略和价值网络参数
         self.opt = torch.optim.Adam(self.policy.parameters(), lr=lr)
 
     @torch.no_grad()
     def compute_gae(
         self,
-        rewards: torch.Tensor,      # [T,B]
-        values: torch.Tensor,       # [T,B]
-        dones: torch.Tensor         # [T,B]  (1 if terminal at t, else 0)
+        rewards: torch.Tensor,      # [T, B] - T时间步，B批量大小的奖励
+        values: torch.Tensor,       # [T, B] - T时间步，B批量大小的状态价值
+        dones: torch.Tensor         # [T, B] - T时间步，B批量大小的终止标志 (1表示该时间步结束，否则为0)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        returns:
-            advantages [T,B]
-            returns    [T,B]
+        计算广义优势估计 (Generalized Advantage Estimation)
+        
+        Args:
+            rewards: 奖励张量 [T, B] - T时间步，B样本数
+            values: 价值张量 [T, B] - T时间步，B样本数的状态价值估计
+            dones: 终止标志 [T, B] - T时间步，B样本数的终止状态
+            
+        Returns:
+            advantages: 优势 [T, B] - 每个时间步的优势值
+            returns: 回报 [T, B] - 每个时间步的累积回报
         """
-        T, B = rewards.shape
-        adv = torch.zeros_like(rewards)
-        last_gae = torch.zeros(B, device=rewards.device, dtype=rewards.dtype)
-        last_value = torch.zeros(B, device=rewards.device, dtype=rewards.dtype)
+        T, B = rewards.shape  # T: 时间步数, B: 批量大小
+        adv = torch.zeros_like(rewards)  # [T, B] - 优势张量
+        last_gae = torch.zeros(B, device=rewards.device, dtype=rewards.dtype)  # [B] - 上一时间步的GAE
+        last_value = torch.zeros(B, device=rewards.device, dtype=rewards.dtype)  # [B] - 上一时间步的价值
 
-        for t in reversed(range(T)):
-            mask = 1.0 - dones[t]  # 0 if done, else 1
-            delta = rewards[t] + self.config.gamma * last_value * mask - values[t]
-            last_gae = delta + self.config.gamma * self.config.gae_lambda * mask * last_gae
-            adv[t] = last_gae
-            last_value = values[t]
+        for t in reversed(range(T)):  # 从后往前计算GAE
+            mask = 1.0 - dones[t]  # [B] - 掩码，0表示已终止，1表示继续
+            # 计算TD误差: r_t + γ*V(s_{t+1}) - V(s_t)
+            delta = rewards[t] + self.config.gamma * last_value * mask - values[t]  # [B]
+            # 计算GAE: δ_t + γλ(mask)*last_gae
+            last_gae = delta + self.config.gamma * self.config.gae_lambda * mask * last_gae  # [B]
+            adv[t] = last_gae  # [B] - 当前时间步的GAE
+            last_value = values[t]  # [B] - 更新上一时间步价值
 
-        returns = adv + values
+        returns = adv + values  # [T, B] - 回报 = 优势 + 价值
         return adv, returns
 
     def update(
         self,
-        cand_feat: torch.Tensor,      # [N, K, F] flattened over (t,b) valid steps
-        actions: torch.Tensor,        # [N]
-        old_logp: torch.Tensor,       # [N]
-        old_values: torch.Tensor,     # [N]
-        advantages: torch.Tensor,     # [N]
-        returns: torch.Tensor         # [N]
+        cand_feat: torch.Tensor,      # [N, K, F] - 展平的候选特征，N为(时间步,批量)的总数
+        actions: torch.Tensor,        # [N] - 动作索引
+        old_logp: torch.Tensor,       # [N] - 旧策略的对数概率
+        old_values: torch.Tensor,     # [N] - 旧价值估计
+        advantages: torch.Tensor,     # [N] - 优势值
+        returns: torch.Tensor         # [N] - 回报值
     ) -> Dict[str, float]:
+        """
+        PPO策略更新
+        
+        Args:
+            cand_feat: 候选特征 [N, K, F] - N: 总样本数(时间步*批量)，K: 候选数，F: 特征维
+            actions: 动作 [N] - 选择的动作索引
+            old_logp: 旧对数概率 [N] - 采样策略下的对数概率
+            old_values: 旧价值 [N] - 旧策略的价值估计
+            advantages: 优势 [N] - 优势函数值
+            returns: 回报 [N] - 累积回报值
+            
+        Returns:
+            损失字典，包含policy_loss, value_loss, entropy, total_loss等标量值
+        """
         cfg = self.config
-        # Detach rollout tensors: PPO should treat collected data as constants.
-        # This prevents "backward through the graph a second time" when doing multiple PPO epochs/minibatches.
-        cand_feat = cand_feat.detach()
-        actions = actions.detach()
-        old_logp = old_logp.detach()
-        old_values = old_values.detach()
-        advantages = advantages.detach()
-        returns = returns.detach()
+        # 分离回放数据张量：PPO应将收集的数据视为常数
+        # 这可以防止在多次PPO周期/小批量处理时出现"通过图第二次反向传播"错误
+        cand_feat = cand_feat.detach()      # [N, K, F] - 候选特征
+        actions = actions.detach()          # [N] - 动作
+        old_logp = old_logp.detach()        # [N] - 旧对数概率
+        old_values = old_values.detach()    # [N] - 旧价值
+        advantages = advantages.detach()    # [N] - 优势
+        returns = returns.detach()          # [N] - 回报
 
-        # normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std().clamp_min(1e-8))
+        # 标准化优势值
+        advantages = (advantages - advantages.mean()) / (advantages.std().clamp_min(1e-8))  # [N]
 
-        N = cand_feat.size(0)
-        idx = torch.randperm(N, device=cand_feat.device)
+        N = cand_feat.size(0)  # 总样本数
+        idx = torch.randperm(N, device=cand_feat.device)  # [N] - 随机排列的索引
 
+        # 初始化损失统计
         losses = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "total_loss": 0.0}
 
-        for _ in range(cfg.ppo_epochs):
-            for start in range(0, N, cfg.minibatch_size):
-                mb = idx[start:start + cfg.minibatch_size]
-                mb_feat = cand_feat[mb]
-                mb_act = actions[mb]
-                mb_old_logp = old_logp[mb]
-                mb_old_val = old_values[mb]
-                mb_adv = advantages[mb]
-                mb_ret = returns[mb]
+        # PPO多轮更新
+        for _ in range(cfg.ppo_epochs):  # cfg.ppo_epochs轮更新
+            for start in range(0, N, cfg.minibatch_size):  # 按小批量处理
+                mb = idx[start:start + cfg.minibatch_size]  # [minibatch_size] - 小批量索引
+                mb_feat = cand_feat[mb]         # [minibatch_size, K, F] - 小批量特征
+                mb_act = actions[mb]            # [minibatch_size] - 小批量动作
+                mb_old_logp = old_logp[mb]      # [minibatch_size] - 小批量旧对数概率
+                mb_old_val = old_values[mb]     # [minibatch_size] - 小批量旧价值
+                mb_adv = advantages[mb]         # [minibatch_size] - 小批量优势
+                mb_ret = returns[mb]            # [minibatch_size] - 小批量回报
 
-                logits, value = self.policy(mb_feat)
-                dist = torch.distributions.Categorical(logits=logits)
-                logp = dist.log_prob(mb_act)
-                entropy = dist.entropy().mean()
+                # 前向传播获取新策略输出
+                logits, value = self.policy(mb_feat)  # [minibatch_size, K], [minibatch_size]
+                
+                # 创建分类分布
+                dist = torch.distributions.Categorical(logits=logits)  # [minibatch_size]
+                logp = dist.log_prob(mb_act)    # [minibatch_size] - 新策略下动作的对数概率
+                entropy = dist.entropy().mean() # 标量 - 策略熵
 
-                ratio = torch.exp(logp - mb_old_logp)
-                surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * mb_adv
-                policy_loss = -torch.min(surr1, surr2).mean()
+                # 计算PPO比率
+                ratio = torch.exp(logp - mb_old_logp)  # [minibatch_size] - 概率比
 
-                value_loss = F.mse_loss(value, mb_ret)
+                # PPO截断策略梯度
+                surr1 = ratio * mb_adv  # [minibatch_size] - 原始策略梯度
+                surr2 = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * mb_adv  # [minibatch_size] - 截断策略梯度
+                policy_loss = -torch.min(surr1, surr2).mean()  # 标量 - 策略损失
 
-                loss = policy_loss + cfg.vf_coef * value_loss - cfg.ent_coef * entropy
+                # 价值函数损失
+                value_loss = F.mse_loss(value, mb_ret)  # 标量 - 价值损失
 
+                # 总损失
+                loss = policy_loss + cfg.vf_coef * value_loss - cfg.ent_coef * entropy  # 标量
+
+                # 反向传播和参数更新
                 self.opt.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
                 self.opt.step()
 
+                # 累积损失值
                 losses["policy_loss"] += float(policy_loss.detach().cpu())
                 losses["value_loss"] += float(value_loss.detach().cpu())
                 losses["entropy"] += float(entropy.detach().cpu())
                 losses["total_loss"] += float(loss.detach().cpu())
 
+        # 计算平均损失
         denom = max(1, cfg.ppo_epochs * math.ceil(N / cfg.minibatch_size))
         for k in losses:
-            losses[k] /= denom
+            losses[k] /= denom  # 平均每个epoch每个minibatch的损失
         return losses
 
 
