@@ -21,6 +21,9 @@ from graphConstruct import ConRelationGraph, ConHyperGraphList
 from HGAT import MSHGAT
 
 from rl_adjuster_new import RLPathOptimizer, evaluate_policy
+from rl_eval_metrics import evaluate_policy_with_ranking_metrics
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def set_seed(seed: int = 0):
@@ -182,5 +185,83 @@ def main():
     print("\n[Test]", te)
 
 
+def test_rl():
+    args = build_args()
+    set_seed(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("[Device]", device)
+
+    user_size, total_cascades, timestamps, train_data, valid_data, test_data = Split_data(
+        args.data_name, args.train_rate, args.valid_rate, load_dict=True
+    )  # 这里返回的 test_data 还是 list 结构，不是 loader :contentReference[oaicite:5]{index=5}
+
+    relation_graph = ConRelationGraph(args.data_name)
+    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)
+
+    #  关键：把 test_data 包装成 DataLoader（与你 RL 训练时一致）
+    test_loader = DataLoader(
+        test_data,
+        batch_size=args.batch_size,
+        load_dict=True,
+        cuda=(device.type == "cuda"),
+        test=True
+    )  # DataLoader 每个 batch 返回 (seq, ts, idx, ans) :contentReference[oaicite:6]{index=6}
+
+    args.d_word_vec = args.d_model
+    args.user_size = user_size
+    base_model = MSHGAT(args, dropout=args.dropout).to(device)
+    _load_pretrained(base_model, args.pretrained_path, device)
+    base_model.eval()
+
+    rl = RLPathOptimizer(
+        base_model=base_model,
+        num_items=user_size,
+        data_name=args.data_name,
+        device=device,
+        pad_val=0,
+        topk=args.topk,
+        cand_k=args.cand_k,
+        history_window_T=args.history_T,
+        rl_lr=args.rl_lr,
+    )
+
+    # 用一个 batch 触发 lazy init
+    first_batch = next(iter(test_loader))
+    tgt, ts, idx, ans = (x.to(device) for x in first_batch)  # 四元组 :contentReference[oaicite:7]{index=7}
+    rl.ensure_initialized(tgt, ts, idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
+
+    # 加载 policy 权重
+    ckpt = torch.load("./checkpoint/rl_policy_best.pt", map_location=device)
+    rl.policy.load_state_dict(ckpt["policy"])
+    rl.policy.eval()
+
+    # 评估（两张表）
+    res = evaluate_policy_with_ranking_metrics(
+        rl=rl,
+        data_loader=test_loader,
+        graph=relation_graph,
+        hypergraph_list=hypergraph_list,
+        device=device,
+        max_batches=999999,
+        k_list=[1, 3, 5, 10],
+        m_list=[3, 5, 7, 9],
+        schemeA_skip_short=True
+    )
+
+    # 打印
+    print("\n[Table 1] Next-item ranking metrics (Base vs Policy)")
+    for k in [1, 3, 5, 10]:
+        print("K=", k,
+              res[f"base_hits@{k}"], res[f"policy_hits@{k}"],
+              res[f"base_NDCG@{k}"], res[f"policy_NDCG@{k}"])
+
+    print("\n[Table 2] Open-loop path planning metrics (Base rollout vs Policy rollout)")
+    for m in [3, 5, 7, 9]:
+        print("m=", m,
+              res[f"base_acc@{m}"], res[f"policy_acc@{m}"],
+              res[f"base_NDCG@{m}"], res[f"policy_NDCG@{m}"],
+              "windows", res[f"policy_windows@{m}"])
+
 if __name__ == "__main__":
-    main()
+    test_rl()
