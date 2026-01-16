@@ -95,7 +95,7 @@ def build_args():
     p.add_argument("--pretrained_path", type=str, default="./checkpoint/DiffusionPrediction_MOO.pt")
 
     # ===== RL/PPO =====
-    p.add_argument("--rl_epochs", type=int, default=5)
+    p.add_argument("--rl_epochs", type=int, default=20)
     p.add_argument("--cand_k", type=int, default=5)
     p.add_argument("--topk", type=int, default=5)
     p.add_argument("--history_T", type=int, default=10)
@@ -274,8 +274,8 @@ def main():
         if val.get("final_quality", -1e18) > best_val:
             best_val = val["final_quality"]
             # 保存策略参数
-            torch.save({"policy": rl.policy.state_dict()}, "./checkpoint/a_rl_policy.pt")
-            print("  [OK] saved best RL policy to ./checkpoint/a_rl_policy.pt")
+            torch.save({"policy": rl.policy.state_dict()}, "./checkpoint/M_rl_policy.pt")
+            print("  [OK] saved best RL policy to ./checkpoint/M_rl_policy.pt")
 
     # 测试集评估
     test_loader = DataLoader(test, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"), test=True)
@@ -331,7 +331,7 @@ def test_rl():
     rl.ensure_initialized(tgt, ts, idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
 
     # 加载 policy 权重
-    ckpt = torch.load("./checkpoint/a_rl_policy.pt", map_location=device)
+    ckpt = torch.load("./checkpoint/M_rl_policy.pt", map_location=device)
     rl.policy.load_state_dict(ckpt["policy"])
     rl.policy.eval()
 
@@ -365,4 +365,4 @@ def test_rl():
 
 if __name__ == "__main__":
     main()
-    test_rl()
+    # test_rl()
