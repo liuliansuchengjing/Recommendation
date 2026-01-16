@@ -164,7 +164,7 @@ def gain_test_epoch(model, kt_model, test_data, graph, hypergraph_list, kt_loss,
             tgt = tgt.cuda()
             ans = ans.cuda()
             # 前向传播，得到预测结果、预测资源、掩码和原始知识状态
-            pred, pred_res, kt_mask, yt_before, hidden = model(tgt, tgt_timestamp.cuda(), tgt_idx.cuda(), ans, graph, hypergraph_list)
+            pred, pred_res, kt_mask, yt_before, hidden, _ = model(tgt, tgt_timestamp.cuda(), tgt_idx.cuda(), ans, graph, hypergraph_list)
             # pred维度: [batch_size*seq_len-1, num_users]
             # pred_res维度: [batch_size, seq_len]
             # kt_mask维度: [batch_size, seq_len]

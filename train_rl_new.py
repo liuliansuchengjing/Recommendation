@@ -83,7 +83,7 @@ def build_args():
     p = argparse.ArgumentParser()
 
     # ===== same as run.py essentials =====
-    p.add_argument("-data_name", default="Assist")
+    p.add_argument("-data_name", default="MOO")
     p.add_argument("-batch_size", type=int, default=16)
     p.add_argument("-d_model", type=int, default=64)
     p.add_argument("-initialFeatureSize", type=int, default=64)
@@ -92,11 +92,11 @@ def build_args():
     p.add_argument("-dropout", type=float, default=0.3)
     p.add_argument("-pos_emb", type=bool, default=True)
 
-    p.add_argument("--pretrained_path", type=str, default="./checkpoint/DiffusionPrediction_a120.pt")
+    p.add_argument("--pretrained_path", type=str, default="./checkpoint/DiffusionPrediction_MOO.pt")
 
     # ===== RL/PPO =====
-    p.add_argument("--rl_epochs", type=int, default=3)
-    p.add_argument("--cand_k", type=int, default=50)
+    p.add_argument("--rl_epochs", type=int, default=5)
+    p.add_argument("--cand_k", type=int, default=5)
     p.add_argument("--topk", type=int, default=5)
     p.add_argument("--history_T", type=int, default=10)
     p.add_argument("--rl_lr", type=float, default=3e-4)
@@ -108,14 +108,14 @@ def build_args():
 def train_one_epoch(rl: RLPathOptimizer, train_loader, graph, hypergraph_list, device):
     """
     训练一个epoch的数据
-    
+
     Args:
         rl: RLPathOptimizer实例
         train_loader: 训练数据加载器
         graph: 关系图
         hypergraph_list: 超图列表
         device: 计算设备
-        
+
     Returns:
         stats: 包含各种训练指标的字典
                - policy_loss: 策略损失 [scalar]
@@ -137,10 +137,10 @@ def train_one_epoch(rl: RLPathOptimizer, train_loader, graph, hypergraph_list, d
         # tgt_idx: 索引 [B] - 每个序列的级联ID
         # ans: 答案 [B, L] - 每个交互的正确性标签
         tgt, tgt_timestamp, tgt_idx, ans = batch
-        tgt = tgt.to(device)           # [B, L] - 目标序列，批量大小×序列长度
+        tgt = tgt.to(device)  # [B, L] - 目标序列，批量大小×序列长度
         tgt_timestamp = tgt_timestamp.to(device)  # [B, L] - 时间戳张量
-        tgt_idx = tgt_idx.to(device)   # [B] - 级联索引张量
-        ans = ans.to(device)           # [B, L] - 答案张量，标记每个交互的正确性
+        tgt_idx = tgt_idx.to(device)  # [B] - 级联索引张量
+        ans = ans.to(device)  # [B, L] - 答案张量，标记每个交互的正确性
 
         # 初始化策略一次
         if rl.policy is None:
@@ -162,7 +162,7 @@ def train_one_epoch(rl: RLPathOptimizer, train_loader, graph, hypergraph_list, d
         # - returns: 回报 [N*K] - 累积回报
         # - final_metrics: 最终指标字典，包含effectiveness, adaptivity, diversity等 [B]
         rollout = rl.collect_trajectory(tgt, tgt_timestamp, tgt_idx, ans, graph=graph, hypergraph_list=hypergraph_list)
-        
+
         # 更新策略，返回损失字典：
         # - policy_loss: 策略损失标量
         # - value_loss: 价值损失标量
@@ -172,9 +172,9 @@ def train_one_epoch(rl: RLPathOptimizer, train_loader, graph, hypergraph_list, d
 
         fm = rollout["final_metrics"]  # 最终评估指标字典
         stats["policy_loss"].append(losses["policy_loss"])  # 策略损失列表
-        stats["value_loss"].append(losses["value_loss"])    # 价值损失列表
-        stats["entropy"].append(losses["entropy"])          # 熵值列表
-        stats["total_loss"].append(losses["total_loss"])    # 总损失列表
+        stats["value_loss"].append(losses["value_loss"])  # 价值损失列表
+        stats["entropy"].append(losses["entropy"])  # 熵值列表
+        stats["total_loss"].append(losses["total_loss"])  # 总损失列表
         # 最终质量平均值 [scalar]
         stats["final_quality"].append(float(fm["final_quality"].mean().detach().cpu()))
         # 有效性平均值 [scalar]
@@ -212,7 +212,7 @@ def main():
     hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)  # 超图列表
 
     args.d_word_vec = args.d_model  # 词向量维度
-    args.user_size = user_size      # 用户/物品总数
+    args.user_size = user_size  # 用户/物品总数
     # 基础模型MSHGAT，接收参数并构建：
     # - 输入: [B, L] 序列，[B, L] 时间戳，[B] 级联ID，[B, L] 答案
     # - 输出: 预测概率分布和其他状态信息
@@ -230,14 +230,14 @@ def main():
     # - history_window_T: 历史窗口大小 [scalar] - 用于计算适应性指标
     rl = RLPathOptimizer(
         base_model=base_model,
-        num_items=user_size,          # 物品总数 N，影响概率分布维度 [N]
+        num_items=user_size,  # 物品总数 N，影响概率分布维度 [N]
         data_name=args.data_name,
         device=device,
-        pad_val=0,                    # 填充值
-        topk=args.topk,              # top-k推荐数 K，影响最终评估 [K]
-        cand_k=args.cand_k,          # 候选项目数 Kcand，每步决策空间 [Kcand]
+        pad_val=0,  # 填充值
+        topk=args.topk,  # top-k推荐数 K，影响最终评估 [K]
+        cand_k=args.cand_k,  # 候选项目数 Kcand，每步决策空间 [Kcand]
         history_window_T=args.history_T,  # 历史窗口长度 T，影响适应性计算
-        rl_lr=args.rl_lr,            # 强化学习学习率
+        rl_lr=args.rl_lr,  # 强化学习学习率
     )
 
     best_val = -1e18  # 最佳验证分数
@@ -250,7 +250,8 @@ def main():
         # - tgt_timestamp: [B, L] 时间戳
         # - tgt_idx: [B] 级联ID
         # - ans: [B, L] 答案标签
-        train_loader = DataLoader(train_shuffled, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"))
+        train_loader = DataLoader(train_shuffled, batch_size=args.batch_size, load_dict=True,
+                                  cuda=(device.type == "cuda"))
 
         t0 = time.time()
         # 训练一个epoch，返回平均指标
@@ -258,13 +259,15 @@ def main():
         print(f"  train: {tr}  (elapsed {(time.time() - t0) / 60:.2f} min)")
 
         # 验证集评估
-        valid_loader = DataLoader(valid, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"), test=True)
+        valid_loader = DataLoader(valid, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"),
+                                  test=True)
         # 评估策略性能，返回：
         # - final_quality: 最终质量 [scalar]
         # - effectiveness: 有效性 [scalar]
         # - adaptivity: 适应性 [scalar]
         # - diversity: 多样性 [scalar]
-        val = evaluate_policy(rl=rl, data_loader=valid_loader, graph=relation_graph, hypergraph_list=hypergraph_list, device=device, compute_all=True)
+        val = evaluate_policy(rl=rl, data_loader=valid_loader, graph=relation_graph, hypergraph_list=hypergraph_list,
+                              device=device, compute_all=True)
         print("  valid:", val)
 
         # 保存最佳模型
@@ -276,7 +279,8 @@ def main():
 
     # 测试集评估
     test_loader = DataLoader(test, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"), test=True)
-    te = evaluate_policy(rl=rl, data_loader=test_loader, graph=relation_graph, hypergraph_list=hypergraph_list, device=device)
+    te = evaluate_policy(rl=rl, data_loader=test_loader, graph=relation_graph, hypergraph_list=hypergraph_list,
+                         device=device)
     print("\\n[Test]", te)
 
 
@@ -357,6 +361,7 @@ def test_rl():
               res[f"base_acc@{m}"], res[f"policy_acc@{m}"],
               res[f"base_NDCG@{m}"], res[f"policy_NDCG@{m}"],
               "windows", res[f"policy_windows@{m}"])
+
 
 if __name__ == "__main__":
     main()

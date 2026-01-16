@@ -333,8 +333,18 @@ class OnlineLearningPathEnv:
         self.T = history_window_T
         self.eps = epsilon
 
+        # ===== Fixed-horizon path generation (H steps) =====
+        # We start from a seeded prefix (default seed_len=2) and let RL generate exactly H next items.
+        # Samples with insufficient valid length will terminate early and be masked out by PPO 'active' mask.
+        self.horizon_H = 5
+
+        # ===== Scheme A: terminal reward dominant, small step shaping =====
+        # Step reward is scaled down to provide dense guidance without overpowering terminal final_quality.
+        self.step_reward_scale = 0.1
+
         # weights for step reward
         self.w_step = w_step or {
+            # Small shaping weights (Scheme A)
             "preference": 1.0,
             "adaptivity": 1.0,
             "novelty": 0.2,
@@ -537,8 +547,12 @@ class OnlineLearningPathEnv:
 
         B, L = self.orig_seq.shape
         self.valid_lens = (self.orig_seq != self.pad_val).sum(dim=1).clamp_min(1)  # [B]
-        self.max_steps = int(self.valid_lens.max().item()) - 1  # predict next for each step
-        self.max_steps = max(0, self.max_steps)
+        # ---------------- Fixed horizon (H) ----------------
+        # OLD (variable-length, tied to each sample's valid_len):
+        # self.max_steps = int(self.valid_lens.max().item()) - 1
+        # self.max_steps = max(0, self.max_steps)
+        # NEW: rollout exactly H steps (Scheme: fixed-length recommended path)
+        self.max_steps = int(self.horizon_H)
 
         # seed prefix: first 2 valid items per sample (need len>=2 to get a next-step prediction from base_model)
         self.gen_seq = torch.full_like(self.orig_seq, self.pad_val)
@@ -709,6 +723,11 @@ class OnlineLearningPathEnv:
             self.w_step.get("novelty", 0.0) * novelty
         ).float()
 
+        # Scheme A: terminal reward dominant + small step shaping
+        # OLD (unscaled shaping):
+        # reward = reward
+        reward = self.step_reward_scale * reward
+
         # ------- transition: append chosen item & simulated answer -------
         next_pos = self.step + 1
         done = torch.zeros((B,), device=self.device, dtype=torch.float32)
@@ -728,8 +747,14 @@ class OnlineLearningPathEnv:
         # advance step
         self.step += 1
 
+        # ---------------- Fixed horizon termination ----------------
+        # We count RL actions from start_t (seed_len-1). After H actions, terminate all remaining samples.
+        # action_count = self.step - self.start_t
+        if (self.step - self.start_t) >= self.horizon_H:
+            done = torch.ones_like(done)
+
         # update next state's cache if not finished for all
-        if self.step < self.max_steps:
+        if self.step < self.max_steps and float(done.min().item()) < 1.0:
             self._update_pre_step_cache()
 
         next_state = {"candidate_ids": self._pre_cand_ids, "candidate_features": self._pre_cand_feat}
@@ -778,16 +803,18 @@ class OnlineLearningPathEnv:
         B, L = self.orig_seq.shape
 
         # ------------------ build RL-path tensor (actual actions) ------------------
-        # path_tensor[b, t] = item id chosen by RL at time step t (global item id), else PAD
-        path_tensor = torch.full((B, L - 1), self.pad_val, device=self.device, dtype=torch.long)
+        # We evaluate ONLY the *actual RL action sequence* of fixed length H.
+        # path_tensor[b, s] = item id chosen by RL at action-step s (s=0..H-1), else PAD.
+        H = int(self.horizon_H)
+        path_tensor = torch.full((B, H), self.pad_val, device=self.device, dtype=torch.long)
         for b in range(B):
-            steps = min(len(self.chosen_items[b]), L - 1)
-            start_t = int(getattr(self, "start_t", 0))
+            steps = min(len(self.chosen_items[b]), H)
             for s in range(steps):
-                t = start_t + s
-                if t >= (L - 1):
-                    break
-                path_tensor[b, t] = int(self.chosen_items[b][s])
+                path_tensor[b, s] = int(self.chosen_items[b][s])
+
+        # NOTE: For time-aligned metrics (Eq.20), we map action-step s to the corresponding
+        # original time index t_global = start_t + s.
+        start_t = int(getattr(self, "start_t", 0))
 
         # ------------------ (kept for reference) old topk-based evaluation ------------------
         # K = self.topk
@@ -810,46 +837,34 @@ class OnlineLearningPathEnv:
             adapt_scores[:] = 0.0
         else:
             for b in range(B):
+                # Need at least the seed prefix to define delta_t
                 valid_len = int(self.valid_lens[b].item())
                 if valid_len <= 1:
                     continue
 
-                # history diffs/results from generated sequence up to valid_len
-                hist_items = self.gen_seq[b, :valid_len].detach().cpu().numpy().tolist()
-                hist_ans = self.gen_ans[b, :valid_len].detach().cpu().numpy().tolist()
-
-                # pre-compute (filtered) history diffs/results in order
-                history_diffs = []
-                history_results = []
-                for t in range(valid_len - 1):
-                    it = hist_items[t]
-                    if it != self.pad_val and it > 1:
-                        history_diffs.append(self.diff_map.get_difficulty_norm(it, default=2))
-                        history_results.append(float(hist_ans[t]))
-
                 total = 0.0
                 cnt = 0
-                Tmax = min(valid_len - 1, path_tensor.size(1))
-                for t in range(Tmax):
-                    # delta_t uses recent window on prefix (same logic as previous implementation)
-                    if len(history_diffs[:t]) < self.T // 2:
+
+                # We compute delta_t on the *generated prefix* before each recommended item.
+                # This matches the idea of Eq.(19): delta_t reflects recent performance.
+                for s in range(int(self.horizon_H)):
+                    rec = int(path_tensor[b, s].item())
+                    if rec == self.pad_val or rec <= 1:
+                        continue
+
+                    prefix_len = min(valid_len, self.seed_len + s)  # prefix BEFORE choosing step s item
+                    if prefix_len <= 0:
                         delta = 1.0
                     else:
-                        start = max(0, t - self.T)
-                        recent_diffs = history_diffs[start:t]
-                        recent_res = history_results[start:t]
-                        if len(recent_diffs) > 0:
-                            num = sum(d * r for d, r in zip(recent_diffs, recent_res))
-                            den = sum(recent_res) + self.eps
-                            delta = num / den
-                        else:
-                            delta = 1.0
+                        # delta_t on [1, prefix_len]
+                        hist_items = self.gen_seq[b:b+1, :prefix_len]
+                        hist_ans = self.gen_ans[b:b+1, :prefix_len]
+                        delta = float(self._compute_delta_t(hist_items, hist_ans)[0].item())
 
-                    rec = int(path_tensor[b, t].item())
-                    if rec != self.pad_val and rec > 1:
-                        rec_diff = self.diff_map.get_difficulty_norm(rec, default=2)
-                        total += (1.0 - abs(delta - rec_diff))
-                        cnt += 1
+                    rec_diff = float(self.diff_map.get_difficulty_norm(rec, default=2))
+                    total += (1.0 - abs(delta - rec_diff))
+                    cnt += 1
+
                 adapt_scores[b] = total / max(1, cnt)
 
         # ------------------ effectiveness Eq.(20) over RL-path ------------------
@@ -884,11 +899,15 @@ class OnlineLearningPathEnv:
                     continue
                 total = 0.0
                 cnt = 0
-                Tmax = min(valid_len - 1, Tm)
-                for t in range(Tmax):
+
+                # Fixed-horizon evaluation on actual RL path.
+                for s in range(int(self.horizon_H)):
+                    t = start_t + s
+                    if t < 0 or t >= Tm:
+                        continue
                     if int(self.orig_seq[b, t].item()) == self.pad_val:
                         continue
-                    r = int(path_tensor[b, t].item())
+                    r = int(path_tensor[b, s].item())
                     if r == self.pad_val:
                         continue
                     if 0 <= r < S:
@@ -898,6 +917,7 @@ class OnlineLearningPathEnv:
                             gain = (pa - pb) / (1.0 - pb)
                             total += gain
                             cnt += 1
+
                 eff_scores[b] = total / max(1, cnt)
 
         # ------------------ diversity Eq.(21) over RL-path ------------------
@@ -911,9 +931,8 @@ class OnlineLearningPathEnv:
                 if valid_len <= 1:
                     continue
                 items: List[int] = []
-                Tmax = min(valid_len - 1, path_tensor.size(1))
-                for t in range(Tmax):
-                    r = int(path_tensor[b, t].item())
+                for s in range(int(self.horizon_H)):
+                    r = int(path_tensor[b, s].item())
                     if r != self.pad_val and r > 1:
                         items.append(r)
                 if len(items) < 2:
