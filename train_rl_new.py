@@ -267,7 +267,7 @@ def main():
         # - adaptivity: 适应性 [scalar]
         # - diversity: 多样性 [scalar]
         val = evaluate_policy(rl=rl, data_loader=valid_loader, graph=relation_graph, hypergraph_list=hypergraph_list,
-                              device=device, compute_all=True)
+                              device=device)
         print("  valid:", val)
 
         # 保存最佳模型
