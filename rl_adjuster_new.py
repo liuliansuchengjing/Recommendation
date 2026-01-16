@@ -817,15 +817,10 @@ class OnlineLearningPathEnv:
         else:
             novelty = torch.zeros((B,), device=self.device)
 
-        # reward = (
-        #     self.w_step["preference"] * pref +
-        #     self.w_step["adaptivity"] * adapt +
-        #     self.w_step.get("novelty", 0.0) * novelty
-        # ).float()
         reward = (
-                self.w_step["preference"] * pref +
-                self.w_step["adaptivity"] * adapt +  # 注释掉适应性奖励
-                self.w_step.get("novelty", 0.0) * novelty
+            self.w_step["preference"] * pref +
+            self.w_step["adaptivity"] * adapt +
+            self.w_step.get("novelty", 0.0) * novelty
         ).float()
 
         # ------- transition: append chosen item & simulated answer -------
