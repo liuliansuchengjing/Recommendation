@@ -83,10 +83,10 @@ def build_args():
     p.add_argument("-dropout", type=float, default=0.3)
     p.add_argument("-pos_emb", type=bool, default=True)
 
-    p.add_argument("--pretrained_path", type=str, default="./checkpoint/DiffusionPrediction_a150.pt")
+    p.add_argument("--pretrained_path", type=str, default="./checkpoint/DiffusionPrediction_a120.pt")
 
     # ===== RL/PPO =====
-    p.add_argument("--rl_epochs", type=int, default=5)
+    p.add_argument("--rl_epochs", type=int, default=3)
     p.add_argument("--cand_k", type=int, default=50)
     p.add_argument("--topk", type=int, default=5)
     p.add_argument("--history_T", type=int, default=10)
@@ -177,8 +177,8 @@ def main():
 
         if val.get("final_quality", -1e18) > best_val:
             best_val = val["final_quality"]
-            torch.save({"policy": rl.policy.state_dict()}, "./checkpoint/rl_policy_best.pt")
-            print("  [OK] saved best RL policy to ./checkpoint/rl_policy_best.pt")
+            torch.save({"policy": rl.policy.state_dict()}, "./checkpoint/a_rl_policy.pt")
+            print("  [OK] saved best RL policy to ./checkpoint/a_rl_policy.pt")
 
     test_loader = DataLoader(test, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"), test=True)
     te = evaluate_policy(rl=rl, data_loader=test_loader, graph=relation_graph, hypergraph_list=hypergraph_list, device=device)
@@ -264,4 +264,5 @@ def test_rl():
               "windows", res[f"policy_windows@{m}"])
 
 if __name__ == "__main__":
+    main()
     test_rl()
