@@ -232,7 +232,7 @@ def test_rl():
     rl.ensure_initialized(tgt, ts, idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
 
     # 加载 policy 权重
-    ckpt = torch.load("./checkpoint/rl_policy_best.pt", map_location=device)
+    ckpt = torch.load("./checkpoint/a_rl_policy.pt", map_location=device)
     rl.policy.load_state_dict(ckpt["policy"])
     rl.policy.eval()
 
