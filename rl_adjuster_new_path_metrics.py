@@ -748,7 +748,10 @@ class OnlineLearningPathEnv:
                     seq_before[b, cut:] = self.pad_val
                     ans_before[b, cut:] = 0
                     ts_before[b, cut:] = 0
-                    idx_before[b, cut:] = 0
+                    # NOTE: in this codebase, tgt_idx is a *cascade index* (shape [B]),
+                    # not a per-time-step tensor (shape [B,L]). Only mask if it's 2-D.
+                    if idx_before.dim() == 2:
+                        idx_before[b, cut:] = 0
 
             # ---- build AFTER inputs: use history+RL path, but zero ts/idx on PAD positions ----
             seq_after = self.gen_seq
@@ -757,7 +760,9 @@ class OnlineLearningPathEnv:
             idx_after = self.orig_idx.clone()
             pad_mask_after = (seq_after == self.pad_val)
             ts_after[pad_mask_after] = 0
-            idx_after[pad_mask_after] = 0
+            # Only apply PAD masking if idx is per-time-step.
+            if idx_after.dim() == 2:
+                idx_after[pad_mask_after] = 0
 
             yt_before = _run_kt_like(seq_before, ts_before, idx_before, ans_before)
             yt_after = _run_kt_like(seq_after, ts_after, idx_after, ans_after)
