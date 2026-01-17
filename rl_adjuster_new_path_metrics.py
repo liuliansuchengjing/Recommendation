@@ -649,7 +649,7 @@ class OnlineLearningPathEnv:
             self.gen_seq[b, p] = chosen[b]
             # simulate answer from pre-step mastery prob (item-level)
             p_correct = float(self._pre_yt[b, int(chosen[b].item())].item()) if int(chosen[b].item()) < self._pre_yt.size(1) else float(pref[b].item())
-            self.gen_ans[b, p] = 1 if p_correct >= 0.5 else 0
+            self.gen_ans[b, p] = 1 if p_correct >= 0 else 0
 
         # advance step counter
         self.s += 1

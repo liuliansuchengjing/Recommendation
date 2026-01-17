@@ -345,7 +345,7 @@ def test_rl():
         # 固定长度路径 + 方案1：每个时间步做规划，但限制次数
         horizon_H=10,
         min_start=5,
-        max_starts_per_seq=5,
+        max_starts_per_seq=1,
 
         # ===== 终止奖励消融开关（训练用）=====
         # 默认全开；要做 w/o 某项就把它设为 False
