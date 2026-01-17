@@ -211,17 +211,6 @@ class PPOTrainer:
         returns: torch.Tensor,       # [N]
     ) -> Dict[str, float]:
         cfg = self.cfg
-
-        # IMPORTANT: rollout buffers must be treated as constants.
-        # They may come from previous forward passes; detach to avoid
-        # "backward through the graph a second time" when running multiple PPO epochs.
-        cand_feat = cand_feat.detach()
-        actions = actions.detach()
-        old_logp = old_logp.detach()
-        old_values = old_values.detach()
-        advantages = advantages.detach()
-        returns = returns.detach()
-
         N = cand_feat.size(0)
         idx = torch.randperm(N, device=cand_feat.device)
 
@@ -292,6 +281,7 @@ class OnlineLearningPathEnv:
         cand_k: int = 50,
         history_window_T: int = 10,
         horizon_H: int = 5,
+        target_future_M: int = 1,
         step_reward_scale: float = 0.1,
         epsilon: float = 1e-5,
         w_step: Optional[Dict[str, float]] = None,
@@ -305,6 +295,7 @@ class OnlineLearningPathEnv:
         self.cand_k = int(cand_k)
         self.T = int(history_window_T)
         self.H = int(horizon_H)
+        self.future_M = int(target_future_M)
         self.step_reward_scale = float(step_reward_scale)
         self.eps = float(epsilon)
 
@@ -649,7 +640,7 @@ class OnlineLearningPathEnv:
             self.gen_seq[b, p] = chosen[b]
             # simulate answer from pre-step mastery prob (item-level)
             p_correct = float(self._pre_yt[b, int(chosen[b].item())].item()) if int(chosen[b].item()) < self._pre_yt.size(1) else float(pref[b].item())
-            self.gen_ans[b, p] = 1 if p_correct >= 0 else 0
+            self.gen_ans[b, p] = 1 if p_correct >= 0.5 else 0
 
         # advance step counter
         self.s += 1
@@ -720,6 +711,17 @@ class OnlineLearningPathEnv:
                 adapt_scores[b] = total / max(1, cnt)
 
         # ---- effectiveness Eq.(20) ----
+        # A-scheme target set (offline): use the *future ground-truth items* after start_t as targets.
+        #
+        # For each episode b:
+        #   - targets T_b = { orig_seq[b, start_t+1 ... start_t+M] } (filter PAD/EOS)
+        #   - pb: mastery on targets at the *pre-path* slice t0 = start_t
+        #   - pa: mastery on targets at the *post-path* slice t1 = start_t + H - 1
+        #   - effectiveness = mean_{q in T_b} (pa - pb) / (1 - pb)
+        #
+        # IMPORTANT: yt_before must be computed on *history prefix only* (mask out original future),
+        # otherwise it leaks future interactions.
+
         def _run_kt_like(seq, ts, idx, ans):
             out = self.base_model(seq, ts, idx, ans, self.graph, self.hypergraph_list)
             if isinstance(out, dict):
@@ -733,23 +735,32 @@ class OnlineLearningPathEnv:
             return None
 
         if need_eff:
-            # NOTE: Effectiveness is evaluated as a **whole-path intervention**:
-            #   - before state: knowledge after observing the full real history up to start_t
-            #   - after state : knowledge after appending the entire recommended path (H steps)
-            # This avoids the per-step time alignment and matches your definition:
-            #   pb_s = yt_before[t0, r_s], pa_s = yt_after[t1, r_s]
+            # ---- build BEFORE inputs: keep only prefix [0..start_t] ----
+            seq_before = self.orig_seq.clone()
+            ans_before = self.orig_ans.clone()
+            ts_before = self.orig_ts.clone()
+            idx_before = self.orig_idx.clone()
 
-            # Build history-only (no future leakage): keep [0..start_t] real interactions, PAD the rest.
-            hist_seq = torch.full_like(self.orig_seq, self.pad_val)
-            hist_ans = torch.zeros_like(self.orig_ans)
             for b in range(B):
-                t0b = int(self.start_t[b].item())
-                t0b = max(0, min(t0b, L - 1))
-                hist_seq[b, : t0b + 1] = self.orig_seq[b, : t0b + 1]
-                hist_ans[b, : t0b + 1] = self.orig_ans[b, : t0b + 1]
+                cut = int(self.start_t[b].item()) + 1  # keep inclusive prefix
+                cut = max(1, min(cut, L))
+                if cut < L:
+                    seq_before[b, cut:] = self.pad_val
+                    ans_before[b, cut:] = 0
+                    ts_before[b, cut:] = 0
+                    idx_before[b, cut:] = 0
 
-            yt_before = _run_kt_like(hist_seq, self.orig_ts, self.orig_idx, hist_ans)
-            yt_after = _run_kt_like(self.gen_seq, self.orig_ts, self.orig_idx, self.gen_ans)
+            # ---- build AFTER inputs: use history+RL path, but zero ts/idx on PAD positions ----
+            seq_after = self.gen_seq
+            ans_after = self.gen_ans
+            ts_after = self.orig_ts.clone()
+            idx_after = self.orig_idx.clone()
+            pad_mask_after = (seq_after == self.pad_val)
+            ts_after[pad_mask_after] = 0
+            idx_after[pad_mask_after] = 0
+
+            yt_before = _run_kt_like(seq_before, ts_before, idx_before, ans_before)
+            yt_after = _run_kt_like(seq_after, ts_after, idx_after, ans_after)
 
             if yt_before is not None and yt_after is not None:
                 Tm = min(yt_before.size(1), yt_after.size(1), L - 1)
@@ -757,26 +768,39 @@ class OnlineLearningPathEnv:
                 yt_after = yt_after[:, :Tm]
                 S = yt_before.size(-1)
 
+                M = int(getattr(self, "future_M", 1))
+
                 for b in range(B):
-                    total = 0.0
-                    cnt = 0
+                    # time slices
                     t0 = int(self.start_t[b].item())
                     t0 = max(0, min(t0, Tm - 1))
-                    t1 = int(t0 + H - 1)
+                    t1 = int(self.start_t[b].item()) + H - 1
                     t1 = max(0, min(t1, Tm - 1))
 
-                    for s in range(H):
-                        r = int(path_tensor[b, s].item())
-                        if r == self.pad_val:
+                    # collect future targets from ORIGINAL sequence
+                    targets = []
+                    for j in range(1, M + 1):
+                        pos = int(self.start_t[b].item()) + j
+                        if pos < 0 or pos >= L:
                             continue
+                        item = int(self.orig_seq[b, pos].item())
+                        if item in (self.pad_val, 1) or item <= 1:
+                            continue
+                        targets.append(item)
+
+                    if not targets:
+                        eff_scores[b] = 0.0
+                        continue
+
+                    total = 0.0
+                    cnt = 0
+                    for r in targets:
                         if 0 <= r < S:
                             pb = float(yt_before[b, t0, r].item())
                             pa = float(yt_after[b, t1, r].item())
-                            # Eq.(20): Gain = (pa - pb) / (1 - pb), optionally ignore near-mastery items
                             if pb < 0.9 and pa > 0:
                                 total += (pa - pb) / (1.0 - pb)
                                 cnt += 1
-
                     eff_scores[b] = total / max(1, cnt)
 
         # ---- diversity Eq.(21) ----
@@ -830,6 +854,7 @@ class RLPathOptimizer:
         cand_k: int = 50,
         history_window_T: int = 10,
         rl_lr: float = 3e-4,
+        target_future_M: int = 1,
         policy_hidden: int = 128,
         ppo_config: Optional[PPOConfig] = None,
         step_reward_weights: Optional[Dict[str, float]] = None,
@@ -854,6 +879,7 @@ class RLPathOptimizer:
             cand_k=cand_k,
             history_window_T=history_window_T,
             horizon_H=horizon_H,
+            target_future_M=target_future_M,
             step_reward_scale=0.1,
             w_step=step_reward_weights,
         )

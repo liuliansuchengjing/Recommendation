@@ -83,7 +83,7 @@ def build_args():
     p = argparse.ArgumentParser()
 
     # ===== same as run.py essentials =====
-    p.add_argument("-data_name", default="MOO")
+    p.add_argument("-data_name", default="Assist")
     p.add_argument("-batch_size", type=int, default=16)
     p.add_argument("-d_model", type=int, default=64)
     p.add_argument("-initialFeatureSize", type=int, default=64)
@@ -92,7 +92,7 @@ def build_args():
     p.add_argument("-dropout", type=float, default=0.3)
     p.add_argument("-pos_emb", type=bool, default=True)
 
-    p.add_argument("--pretrained_path", type=str, default="./checkpoint/DiffusionPrediction_MOO.pt")
+    p.add_argument("--pretrained_path", type=str, default="./checkpoint/DiffusionPrediction_a150.pt")
 
     # ===== RL/PPO =====
     p.add_argument("--rl_epochs", type=int, default=5)
@@ -230,14 +230,31 @@ def main():
     # - history_window_T: 历史窗口大小 [scalar] - 用于计算适应性指标
     rl = RLPathOptimizer(
         base_model=base_model,
-        num_items=user_size,  # 物品总数 N，影响概率分布维度 [N]
+        num_items=user_size,
         data_name=args.data_name,
         device=device,
-        pad_val=0,  # 填充值
-        topk=args.topk,  # top-k推荐数 K，影响最终评估 [K]
-        cand_k=args.cand_k,  # 候选项目数 Kcand，每步决策空间 [Kcand]
-        history_window_T=args.history_T,  # 历史窗口长度 T，影响适应性计算
-        rl_lr=args.rl_lr,  # 强化学习学习率
+        pad_val=0,
+        topk=args.topk,
+        cand_k=args.cand_k,
+        history_window_T=args.history_T,
+        rl_lr=args.rl_lr,
+        target_future_M=3,
+
+        # 固定长度路径 + 方案1：每个时间步做规划，但限制次数
+        horizon_H=5,
+        min_start=5,
+        max_starts_per_seq=5,
+
+        # ===== 终止奖励消融开关（训练用）=====
+        # 默认全开；要做 w/o 某项就把它设为 False
+        terminal_reward_components={
+            "effectiveness": True,
+            "adaptivity": False,
+            "diversity": False,
+        },
+
+        # 训练时：只计算“开着的”终止指标（关掉的就不算，省时间，也符合你的要求）
+        train_compute_all_terminal_metrics=False,
     )
 
     best_val = -1e18  # 最佳验证分数
@@ -274,8 +291,8 @@ def main():
         if val.get("final_quality", -1e18) > best_val:
             best_val = val["final_quality"]
             # 保存策略参数
-            torch.save({"policy": rl.policy.state_dict()}, "./checkpoint/M_rl_policy.pt")
-            print("  [OK] saved best RL policy to ./checkpoint/M_rl_policy.pt")
+            torch.save({"policy": rl.policy.state_dict()}, "./checkpoint/A_rl_policy.pt")
+            print("  [OK] saved best RL policy to ./checkpoint/A_rl_policy.pt")
 
     # 测试集评估
     test_loader = DataLoader(test, batch_size=args.batch_size, load_dict=True, cuda=(device.type == "cuda"), test=True)
@@ -323,6 +340,7 @@ def test_rl():
         cand_k=args.cand_k,
         history_window_T=args.history_T,
         rl_lr=args.rl_lr,
+        target_future_M=3,
 
         # 固定长度路径 + 方案1：每个时间步做规划，但限制次数
         horizon_H=5,
@@ -347,7 +365,7 @@ def test_rl():
     rl.ensure_initialized(tgt, ts, idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
 
     # 加载 policy 权重
-    ckpt = torch.load("./checkpoint/M_rl_policy.pt", map_location=device)
+    ckpt = torch.load("./checkpoint/A_rl_policy.pt", map_location=device)
     rl.policy.load_state_dict(ckpt["policy"])
     rl.policy.eval()
 
@@ -381,4 +399,4 @@ def test_rl():
 
 if __name__ == "__main__":
     main()
-    test_rl()
+    # test_rl()
