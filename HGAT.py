@@ -296,7 +296,7 @@ class MSHGAT(nn.Module):
         pred = self.pred(trm_output)
         mask = get_previous_user_mask(input.cpu(), self.n_node)
 
-        return (pred + mask).view(-1, pred.size(-1)).cuda(), pred_res, kt_mask, yt, hidden, status_emb
+        return (pred + mask).view(-1, pred.size(-1)), pred_res, kt_mask, yt, hidden, status_emb
 
 
 # 单独知识追踪模块用于有效性评价指标计算
