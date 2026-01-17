@@ -375,6 +375,87 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
 
     return scores, auc_test, acc_test
 
+# def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[5, 10, 20],
+#                show_examples=True):
+#     ''' Epoch operation in evaluation phase '''
+#     model.eval()
+#     auc_test = []
+#     acc_test = []
+#     scores = {}
+#     for k in k_list:
+#         scores['hits@' + str(k)] = 0
+#         scores['map@' + str(k)] = 0
+#
+#     n_total_words = 0
+#
+#     with torch.no_grad():
+#         for i, batch in enumerate(validation_data):
+#             # 准备数据
+#             tgt, tgt_timestamp, tgt_idx, ans = batch
+#             y_gold = tgt[:, 1:].contiguous().view(-1).detach().cpu().numpy()
+#
+#             # 前向传播
+#             pred, pred_res, kt_mask, _, _, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
+#
+#             # 显示每个样本每个时间步的历史和top5推荐（无限制）
+#             if show_examples:
+#                 batch_size, seq_len = tgt.size()
+#
+#                 for b in range(batch_size):  # 遍历所有样本，移除限制
+#                     # 获取完整的历史序列
+#                     full_history = [int(x) for x in tgt[b].cpu().numpy() if int(x) != Constants.PAD and int(x) != 1]
+#
+#                     # 遍历每个时间步
+#                     for t in range(1, min(seq_len, len(full_history) + 1)):  # 遍历所有时间步，移除限制
+#                         # 获取当前时间步之前的history
+#                         current_history = full_history[:t - 1] if t > 1 else []
+#
+#                         # 获取该时间步的预测结果
+#                         pred_idx = b * (seq_len - 1) + (t - 1)  # 计算预测tensor中的索引
+#
+#                         if pred_idx < len(pred):  # 确保索引有效
+#                             pred_logits = pred[pred_idx, :]  # 获取该时间步的预测logits
+#
+#                             # 获取top5推荐
+#                             top5_recommendations = torch.topk(pred_logits, k=5).indices.cpu().numpy().tolist()
+#                             top1_recommendation = top5_recommendations[0]
+#
+#                             # 获取真实的下一个项目
+#                             if t < seq_len:
+#                                 real_next = tgt[b, t].item()
+#                                 is_top1_correct = top1_recommendation == real_next
+#                                 is_in_top5 = real_next in top5_recommendations
+#
+#                                 print(f"Batch {i}, Sample {b + 1}, Time step {t}:")
+#                                 print(f"  Current history: {current_history}")
+#                                 print(f"  Top5 recommendations: {top5_recommendations}")
+#                                 print(f"  Top1 recommendation: {top1_recommendation}")
+#                                 print(f"  Real next item: {real_next}")
+#                                 print(f"  Top1 match: {'✓' if is_top1_correct else '✗'}")
+#                                 print(f"  In Top5: {'✓' if is_in_top5 else '✗'}")
+#                                 print()
+#
+#             y_pred = pred.detach().cpu().numpy()
+#             loss_kt, auc, acc = kt_loss(pred_res.cpu(), ans.cpu(), kt_mask.cpu())
+#
+#             if auc != -1 and acc != -1:
+#                 auc_test.append(auc)
+#                 acc_test.append(acc)
+#
+#             scores_batch, scores_len = metric.compute_metric(y_pred, y_gold, k_list)
+#             n_total_words += scores_len
+#
+#             for k in k_list:
+#                 scores['hits@' + str(k)] += scores_batch['hits@' + str(k)] * scores_len
+#                 scores['map@' + str(k)] += scores_batch['map@' + str(k)] * scores_len
+#
+#     for k in k_list:
+#         scores['hits@' + str(k)] = scores['hits@' + str(k)] / n_total_words
+#         scores['map@' + str(k)] = scores['map@' + str(k)] / n_total_words
+#
+#     return scores, auc_test, acc_test
+
+
 
 def test_model(MSHGAT, data_path):
     kt_loss = KTLoss()
@@ -394,6 +475,14 @@ def test_model(MSHGAT, data_path):
     kt_loss = kt_loss.cuda()
     scores, auc_test, acc_test = test_epoch(model, test_data, relation_graph, hypergraph_list, kt_loss,
                                             k_list=[5, 10, 20, 30, 40, 50])
+    # 在验证阶段调用
+    # 使用带有详细显示的版本
+    # scores, auc_test, acc_test = test_epoch(
+    #     model, test_data, relation_graph, hypergraph_list, kt_loss,
+    #     k_list=[5, 10, 20],
+    #     show_examples=True,  # 启用示例显示
+    # )
+
     print('  - (Test) ')
     for metric in scores.keys():
         print(metric + ' ' + str(scores[metric]))
