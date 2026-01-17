@@ -210,25 +210,18 @@ class PPOTrainer:
         advantages: torch.Tensor,    # [N]
         returns: torch.Tensor,       # [N]
     ) -> Dict[str, float]:
-        """PPO update.
+        cfg = self.cfg
 
-        NOTE: rollout tensors (cand_feat/old_logp/old_values/advantages/returns)
-        must be treated as *constants*. If they carry autograd history (e.g.,
-        collected without torch.no_grad()), PPO's multi-epoch optimization will
-        trigger "backward through the graph a second time".
-        We defensively detach them here to avoid backprop into the base model
-        and to keep the PPO graph local to the policy forward in this function.
-        """
-
-        # Detach rollout buffers to avoid reusing freed graphs across PPO epochs
-        # and to ensure we don't backprop into the base_model used to build features.
+        # IMPORTANT: rollout buffers must be treated as constants.
+        # They may come from previous forward passes; detach to avoid
+        # "backward through the graph a second time" when running multiple PPO epochs.
         cand_feat = cand_feat.detach()
+        actions = actions.detach()
         old_logp = old_logp.detach()
         old_values = old_values.detach()
         advantages = advantages.detach()
         returns = returns.detach()
 
-        cfg = self.cfg
         N = cand_feat.size(0)
         idx = torch.randperm(N, device=cand_feat.device)
 
@@ -656,7 +649,7 @@ class OnlineLearningPathEnv:
             self.gen_seq[b, p] = chosen[b]
             # simulate answer from pre-step mastery prob (item-level)
             p_correct = float(self._pre_yt[b, int(chosen[b].item())].item()) if int(chosen[b].item()) < self._pre_yt.size(1) else float(pref[b].item())
-            self.gen_ans[b, p] = 1 if p_correct >= 0.5 else 0
+            self.gen_ans[b, p] = 1 if p_correct >= 0 else 0
 
         # advance step counter
         self.s += 1
@@ -740,8 +733,24 @@ class OnlineLearningPathEnv:
             return None
 
         if need_eff:
-            yt_before = _run_kt_like(self.orig_seq, self.orig_ts, self.orig_idx, self.orig_ans)
+            # NOTE: Effectiveness is evaluated as a **whole-path intervention**:
+            #   - before state: knowledge after observing the full real history up to start_t
+            #   - after state : knowledge after appending the entire recommended path (H steps)
+            # This avoids the per-step time alignment and matches your definition:
+            #   pb_s = yt_before[t0, r_s], pa_s = yt_after[t1, r_s]
+
+            # Build history-only (no future leakage): keep [0..start_t] real interactions, PAD the rest.
+            hist_seq = torch.full_like(self.orig_seq, self.pad_val)
+            hist_ans = torch.zeros_like(self.orig_ans)
+            for b in range(B):
+                t0b = int(self.start_t[b].item())
+                t0b = max(0, min(t0b, L - 1))
+                hist_seq[b, : t0b + 1] = self.orig_seq[b, : t0b + 1]
+                hist_ans[b, : t0b + 1] = self.orig_ans[b, : t0b + 1]
+
+            yt_before = _run_kt_like(hist_seq, self.orig_ts, self.orig_idx, hist_ans)
             yt_after = _run_kt_like(self.gen_seq, self.orig_ts, self.orig_idx, self.gen_ans)
+
             if yt_before is not None and yt_after is not None:
                 Tm = min(yt_before.size(1), yt_after.size(1), L - 1)
                 yt_before = yt_before[:, :Tm]
@@ -752,19 +761,22 @@ class OnlineLearningPathEnv:
                     total = 0.0
                     cnt = 0
                     t0 = int(self.start_t[b].item())
+                    t0 = max(0, min(t0, Tm - 1))
+                    t1 = int(t0 + H - 1)
+                    t1 = max(0, min(t1, Tm - 1))
+
                     for s in range(H):
-                        t = t0 + s
-                        if t < 0 or t >= Tm:
-                            continue
                         r = int(path_tensor[b, s].item())
                         if r == self.pad_val:
                             continue
                         if 0 <= r < S:
-                            pb = float(yt_before[b, t, r].item())
-                            pa = float(yt_after[b, t, r].item())
+                            pb = float(yt_before[b, t0, r].item())
+                            pa = float(yt_after[b, t1, r].item())
+                            # Eq.(20): Gain = (pa - pb) / (1 - pb), optionally ignore near-mastery items
                             if pb < 0.9 and pa > 0:
                                 total += (pa - pb) / (1.0 - pb)
                                 cnt += 1
+
                     eff_scores[b] = total / max(1, cnt)
 
         # ---- diversity Eq.(21) ----
