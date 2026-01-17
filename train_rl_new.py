@@ -397,6 +397,138 @@ def test_rl():
               "windows", res[f"policy_windows@{m}"])
 
 
+def test_rl_policy_from_checkpoint(checkpoint_path="./checkpoint/A_rl_policy.pt", data_name="Assist", 
+                                  batch_size=16, horizon_H=5, max_starts_per_seq=10):
+    """
+    从指定检查点测试RL策略的函数
+    
+    Args:
+        checkpoint_path: 模型检查点路径
+        data_name: 数据集名称
+        batch_size: 批次大小
+        horizon_H: 规划视野长度
+        max_starts_per_seq: 每个序列的最大起始点数
+    """
+    # 设置参数
+    args = build_args()
+    args.data_name = data_name
+    args.batch_size = batch_size
+    
+    set_seed(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Device] {device}")
+    print(f"[Checkpoint] Loading from: {checkpoint_path}")
+
+    user_size, total_cascades, timestamps, train_data, valid_data, test_data = Split_data(
+        args.data_name, args.train_rate, args.valid_rate, load_dict=True
+    )
+
+    relation_graph = ConRelationGraph(args.data_name)
+    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)
+
+    # 创建测试数据加载器
+    test_loader = DataLoader(
+        test_data,
+        batch_size=args.batch_size,
+        load_dict=True,
+        cuda=(device.type == "cuda"),
+        test=True
+    )
+
+    args.d_word_vec = args.d_model
+    args.user_size = user_size
+    base_model = MSHGAT(args, dropout=args.dropout).to(device)
+    _load_pretrained(base_model, args.pretrained_path, device)
+    base_model.eval()
+
+    # 创建RL路径优化器，使用传入的参数
+    rl = RLPathOptimizer(
+        base_model=base_model,
+        num_items=user_size,
+        data_name=args.data_name,
+        device=device,
+        pad_val=0,
+        topk=args.topk,
+        cand_k=args.cand_k,
+        history_window_T=args.history_T,
+        rl_lr=args.rl_lr,
+
+        # 使用传入的参数
+        horizon_H=horizon_H,
+        min_start=5,
+        max_starts_per_seq=max_starts_per_seq,
+
+        # 终止奖励组件
+        terminal_reward_components={
+            "effectiveness": True,
+            "adaptivity": True,
+            "diversity": True,
+        },
+        train_compute_all_terminal_metrics=False,
+    )
+
+    # 用一个 batch 触发 lazy init
+    first_batch = next(iter(test_loader))
+    tgt, ts, idx, ans = (x.to(device) for x in first_batch)
+    rl.ensure_initialized(tgt, ts, idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
+
+    # 加载策略权重
+    if os.path.exists(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        rl.policy.load_state_dict(ckpt["policy"])
+        rl.policy.eval()
+        print(f"[OK] Loaded RL policy from: {checkpoint_path}")
+    else:
+        print(f"[ERROR] Checkpoint not found: {checkpoint_path}")
+        return
+
+    # 运行基本评估
+    print("\nRunning basic evaluation...")
+    basic_metrics = evaluate_policy(
+        rl=rl,
+        data_loader=test_loader,
+        graph=relation_graph,
+        hypergraph_list=hypergraph_list,
+        device=device,
+        max_batches=50  # 限制批次数量以加快测试
+    )
+    print("Basic Metrics:", basic_metrics)
+
+    # 运行详细评估
+    print("\nRunning detailed evaluation...")
+    detailed_res = evaluate_policy_with_ranking_metrics(
+        rl=rl,
+        data_loader=test_loader,
+        graph=relation_graph,
+        hypergraph_list=hypergraph_list,
+        device=device,
+        max_batches=999999,
+        k_list=[1, 3, 5, 10],
+        m_list=[3, 5, 7, 9],
+        schemeA_skip_short=True
+    )
+
+    # 打印详细结果
+    print("\n[Table 1] Next-item ranking metrics (Base vs Policy)")
+    for k in [1, 3, 5, 10]:
+        print("K=", k,
+              detailed_res[f"base_hits@{k}"], detailed_res[f"policy_hits@{k}"],
+              detailed_res[f"base_NDCG@{k}"], detailed_res[f"policy_NDCG@{k}"])
+
+    print("\n[Table 2] Open-loop path planning metrics (Base rollout vs Policy rollout)")
+    for m in [3, 5, 7, 9]:
+        print("m=", m,
+              detailed_res[f"base_acc@{m}"], detailed_res[f"policy_acc@{m}"],
+              detailed_res[f"base_NDCG@{m}"], detailed_res[f"policy_NDCG@{m}"],
+              "windows", detailed_res[f"policy_windows@{m}"])
+              
+    return basic_metrics, detailed_res
+
+
 if __name__ == "__main__":
-    main()
-    # test_rl()
+    # main()
+    test_rl_policy_from_checkpoint()
+    test_rl()
+    # 如果需要使用特定参数测试，可以取消下面的注释
+    # test_rl_policy_from_checkpoint(checkpoint_path="./checkpoint/A_rl_policy.pt", data_name="Assist")
