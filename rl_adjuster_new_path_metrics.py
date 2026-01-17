@@ -210,6 +210,24 @@ class PPOTrainer:
         advantages: torch.Tensor,    # [N]
         returns: torch.Tensor,       # [N]
     ) -> Dict[str, float]:
+        """PPO update.
+
+        NOTE: rollout tensors (cand_feat/old_logp/old_values/advantages/returns)
+        must be treated as *constants*. If they carry autograd history (e.g.,
+        collected without torch.no_grad()), PPO's multi-epoch optimization will
+        trigger "backward through the graph a second time".
+        We defensively detach them here to avoid backprop into the base model
+        and to keep the PPO graph local to the policy forward in this function.
+        """
+
+        # Detach rollout buffers to avoid reusing freed graphs across PPO epochs
+        # and to ensure we don't backprop into the base_model used to build features.
+        cand_feat = cand_feat.detach()
+        old_logp = old_logp.detach()
+        old_values = old_values.detach()
+        advantages = advantages.detach()
+        returns = returns.detach()
+
         cfg = self.cfg
         N = cand_feat.size(0)
         idx = torch.randperm(N, device=cand_feat.device)
@@ -638,7 +656,7 @@ class OnlineLearningPathEnv:
             self.gen_seq[b, p] = chosen[b]
             # simulate answer from pre-step mastery prob (item-level)
             p_correct = float(self._pre_yt[b, int(chosen[b].item())].item()) if int(chosen[b].item()) < self._pre_yt.size(1) else float(pref[b].item())
-            self.gen_ans[b, p] = 1 if p_correct >= 0 else 0
+            self.gen_ans[b, p] = 1 if p_correct >= 0.5 else 0
 
         # advance step counter
         self.s += 1
