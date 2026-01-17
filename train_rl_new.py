@@ -241,7 +241,7 @@ def main():
         target_future_M=3,
 
         # 固定长度路径 + 方案1：每个时间步做规划，但限制次数
-        horizon_H=5,
+        horizon_H=10,
         min_start=5,
         max_starts_per_seq=5,
 
@@ -343,7 +343,7 @@ def test_rl():
         target_future_M=3,
 
         # 固定长度路径 + 方案1：每个时间步做规划，但限制次数
-        horizon_H=5,
+        horizon_H=10,
         min_start=5,
         max_starts_per_seq=5,
 
