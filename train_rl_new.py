@@ -302,6 +302,115 @@ def main():
 
 
 def test_rl():
+    test_rl_from_checkpoint(
+        checkpoint_path="./checkpoint/A_rl_policy.pt",
+        eval_split="test",
+        max_batches=999999,
+        k_list=(1, 3, 5, 10),
+        m_list=(3, 5, 7, 9),
+    )
+    # args = build_args()
+    # set_seed(args.seed)
+    #
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # print("[Device]", device)
+    #
+    # user_size, total_cascades, timestamps, train_data, valid_data, test_data = Split_data(
+    #     args.data_name, args.train_rate, args.valid_rate, load_dict=True
+    # )  # 这里返回的 test_data 还是 list 结构，不是 loader :contentReference[oaicite:5]{index=5}
+    #
+    # relation_graph = ConRelationGraph(args.data_name)
+    # hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)
+    #
+    # #  关键：把 test_data 包装成 DataLoader（与你 RL 训练时一致）
+    # test_loader = DataLoader(
+    #     test_data,
+    #     batch_size=args.batch_size,
+    #     load_dict=True,
+    #     cuda=(device.type == "cuda"),
+    #     test=True
+    # )  # DataLoader 每个 batch 返回 (seq, ts, idx, ans) :contentReference[oaicite:6]{index=6}
+    #
+    # args.d_word_vec = args.d_model
+    # args.user_size = user_size
+    # base_model = MSHGAT(args, dropout=args.dropout).to(device)
+    # _load_pretrained(base_model, args.pretrained_path, device)
+    # base_model.eval()
+    #
+    # rl = RLPathOptimizer(
+    #     base_model=base_model,
+    #     num_items=user_size,
+    #     data_name=args.data_name,
+    #     device=device,
+    #     pad_val=0,
+    #     topk=args.topk,
+    #     cand_k=args.cand_k,
+    #     history_window_T=args.history_T,
+    #     rl_lr=args.rl_lr,
+    #     target_future_M=3,
+    #
+    #     # 固定长度路径 + 方案1：每个时间步做规划，但限制次数
+    #     horizon_H=10,
+    #     min_start=5,
+    #     max_starts_per_seq=1,
+    #
+    #     # ===== 终止奖励消融开关（训练用）=====
+    #     # 默认全开；要做 w/o 某项就把它设为 False
+    #     terminal_reward_components={
+    #         "effectiveness": True,
+    #         "adaptivity": True,
+    #         "diversity": True,
+    #     },
+    #
+    #     # 训练时：只计算“开着的”终止指标（关掉的就不算，省时间，也符合你的要求）
+    #     train_compute_all_terminal_metrics=False,
+    # )
+    #
+    # # 用一个 batch 触发 lazy init
+    # first_batch = next(iter(test_loader))
+    # tgt, ts, idx, ans = (x.to(device) for x in first_batch)  # 四元组 :contentReference[oaicite:7]{index=7}
+    # rl.ensure_initialized(tgt, ts, idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
+    #
+    # # 加载 policy 权重
+    # ckpt = torch.load("./checkpoint/A_rl_policy.pt", map_location=device)
+    # rl.policy.load_state_dict(ckpt["policy"])
+    # rl.policy.eval()
+    #
+    # # 评估（两张表）
+    # res = evaluate_policy_with_ranking_metrics(
+    #     rl=rl,
+    #     data_loader=test_loader,
+    #     graph=relation_graph,
+    #     hypergraph_list=hypergraph_list,
+    #     device=device,
+    #     max_batches=999999,
+    #     k_list=[1, 3, 5, 10],
+    #     m_list=[3, 5, 7, 9],
+    #     schemeA_skip_short=True
+    # )
+    #
+    # # 打印
+    # print("\n[Table 1] Next-item ranking metrics (Base vs Policy)")
+    # for k in [1, 3, 5, 10]:
+    #     print("K=", k,
+    #           res[f"base_hits@{k}"], res[f"policy_hits@{k}"],
+    #           res[f"base_NDCG@{k}"], res[f"policy_NDCG@{k}"])
+    #
+    # print("\n[Table 2] Open-loop path planning metrics (Base rollout vs Policy rollout)")
+    # for m in [3, 5, 7, 9]:
+    #     print("m=", m,
+    #           res[f"base_acc@{m}"], res[f"policy_acc@{m}"],
+    #           res[f"base_NDCG@{m}"], res[f"policy_NDCG@{m}"],
+    #           "windows", res[f"policy_windows@{m}"])
+
+
+def test_rl_from_checkpoint(
+    checkpoint_path: str = "./checkpoint/A_rl_policy.pt",
+    eval_split: str = "test",   # "valid" or "test"
+    max_batches: int = 999999,
+    k_list=(1, 3, 5, 10),
+    m_list=(3, 5, 7, 9),
+):
     args = build_args()
     set_seed(args.seed)
 
@@ -310,26 +419,33 @@ def test_rl():
 
     user_size, total_cascades, timestamps, train_data, valid_data, test_data = Split_data(
         args.data_name, args.train_rate, args.valid_rate, load_dict=True
-    )  # 这里返回的 test_data 还是 list 结构，不是 loader :contentReference[oaicite:5]{index=5}
+    )
 
     relation_graph = ConRelationGraph(args.data_name)
     hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)
 
-    #  关键：把 test_data 包装成 DataLoader（与你 RL 训练时一致）
-    test_loader = DataLoader(
-        test_data,
+    # 选择评估 split
+    if eval_split.lower() == "valid":
+        eval_data = valid_data
+    else:
+        eval_data = test_data
+
+    eval_loader = DataLoader(
+        eval_data,
         batch_size=args.batch_size,
         load_dict=True,
         cuda=(device.type == "cuda"),
         test=True
-    )  # DataLoader 每个 batch 返回 (seq, ts, idx, ans) :contentReference[oaicite:6]{index=6}
+    )
 
+    # base model
     args.d_word_vec = args.d_model
     args.user_size = user_size
     base_model = MSHGAT(args, dropout=args.dropout).to(device)
     _load_pretrained(base_model, args.pretrained_path, device)
     base_model.eval()
 
+    # RL optimizer
     rl = RLPathOptimizer(
         base_model=base_model,
         num_items=user_size,
@@ -342,193 +458,61 @@ def test_rl():
         rl_lr=args.rl_lr,
         target_future_M=3,
 
-        # 固定长度路径 + 方案1：每个时间步做规划，但限制次数
         horizon_H=10,
         min_start=5,
         max_starts_per_seq=1,
 
-        # ===== 终止奖励消融开关（训练用）=====
-        # 默认全开；要做 w/o 某项就把它设为 False
         terminal_reward_components={
             "effectiveness": True,
             "adaptivity": True,
             "diversity": True,
         },
-
-        # 训练时：只计算“开着的”终止指标（关掉的就不算，省时间，也符合你的要求）
         train_compute_all_terminal_metrics=False,
     )
 
-    # 用一个 batch 触发 lazy init
-    first_batch = next(iter(test_loader))
-    tgt, ts, idx, ans = (x.to(device) for x in first_batch)  # 四元组 :contentReference[oaicite:7]{index=7}
+    # 触发 lazy init（你现在就是这么做的）:contentReference[oaicite:2]{index=2}
+    first_batch = next(iter(eval_loader))
+    tgt, ts, idx, ans = (x.to(device) for x in first_batch)
     rl.ensure_initialized(tgt, ts, idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
 
-    # 加载 policy 权重
-    ckpt = torch.load("./checkpoint/A_rl_policy.pt", map_location=device)
+    # 加载 policy ckpt（你现在固定写死 A_rl_policy.pt）:contentReference[oaicite:3]{index=3}
+    ckpt = torch.load(checkpoint_path, map_location=device)
     rl.policy.load_state_dict(ckpt["policy"])
     rl.policy.eval()
 
-    # 评估（两张表）
+    # 评估（两张表）:contentReference[oaicite:4]{index=4}
     res = evaluate_policy_with_ranking_metrics(
         rl=rl,
-        data_loader=test_loader,
+        data_loader=eval_loader,
         graph=relation_graph,
         hypergraph_list=hypergraph_list,
         device=device,
-        max_batches=999999,
-        k_list=[1, 3, 5, 10],
-        m_list=[3, 5, 7, 9],
+        max_batches=max_batches,
+        k_list=list(k_list),
+        m_list=list(m_list),
         schemeA_skip_short=True
     )
 
-    # 打印
+    print(f"\n[Eval split: {eval_split}] checkpoint={checkpoint_path}")
+
     print("\n[Table 1] Next-item ranking metrics (Base vs Policy)")
-    for k in [1, 3, 5, 10]:
+    for k in k_list:
         print("K=", k,
               res[f"base_hits@{k}"], res[f"policy_hits@{k}"],
               res[f"base_NDCG@{k}"], res[f"policy_NDCG@{k}"])
 
     print("\n[Table 2] Open-loop path planning metrics (Base rollout vs Policy rollout)")
-    for m in [3, 5, 7, 9]:
+    for m in m_list:
         print("m=", m,
               res[f"base_acc@{m}"], res[f"policy_acc@{m}"],
               res[f"base_NDCG@{m}"], res[f"policy_NDCG@{m}"],
-              "windows", res[f"policy_windows@{m}"])
+              "windows", res.get(f"policy_windows@{m}", None))
 
-
-def test_rl_policy_from_checkpoint(checkpoint_path="./checkpoint/A_rl_policy.pt", data_name="Assist", 
-                                  batch_size=16, horizon_H=5, max_starts_per_seq=10):
-    """
-    从指定检查点测试RL策略的函数
-    
-    Args:
-        checkpoint_path: 模型检查点路径
-        data_name: 数据集名称
-        batch_size: 批次大小
-        horizon_H: 规划视野长度
-        max_starts_per_seq: 每个序列的最大起始点数
-    """
-    # 设置参数
-    args = build_args()
-    args.data_name = data_name
-    args.batch_size = batch_size
-    
-    set_seed(args.seed)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Device] {device}")
-    print(f"[Checkpoint] Loading from: {checkpoint_path}")
-
-    user_size, total_cascades, timestamps, train_data, valid_data, test_data = Split_data(
-        args.data_name, args.train_rate, args.valid_rate, load_dict=True
-    )
-
-    relation_graph = ConRelationGraph(args.data_name)
-    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)
-
-    # 创建测试数据加载器
-    test_loader = DataLoader(
-        test_data,
-        batch_size=args.batch_size,
-        load_dict=True,
-        cuda=(device.type == "cuda"),
-        test=True
-    )
-
-    args.d_word_vec = args.d_model
-    args.user_size = user_size
-    base_model = MSHGAT(args, dropout=args.dropout).to(device)
-    _load_pretrained(base_model, args.pretrained_path, device)
-    base_model.eval()
-
-    # 创建RL路径优化器，使用传入的参数
-    rl = RLPathOptimizer(
-        base_model=base_model,
-        num_items=user_size,
-        data_name=args.data_name,
-        device=device,
-        pad_val=0,
-        topk=args.topk,
-        cand_k=args.cand_k,
-        history_window_T=args.history_T,
-        rl_lr=args.rl_lr,
-
-        # 使用传入的参数
-        horizon_H=horizon_H,
-        min_start=5,
-        max_starts_per_seq=max_starts_per_seq,
-
-        # 终止奖励组件
-        terminal_reward_components={
-            "effectiveness": True,
-            "adaptivity": True,
-            "diversity": True,
-        },
-        train_compute_all_terminal_metrics=False,
-    )
-
-    # 用一个 batch 触发 lazy init
-    first_batch = next(iter(test_loader))
-    tgt, ts, idx, ans = (x.to(device) for x in first_batch)
-    rl.ensure_initialized(tgt, ts, idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
-
-    # 加载策略权重
-    if os.path.exists(checkpoint_path):
-        ckpt = torch.load(checkpoint_path, map_location=device)
-        rl.policy.load_state_dict(ckpt["policy"])
-        rl.policy.eval()
-        print(f"[OK] Loaded RL policy from: {checkpoint_path}")
-    else:
-        print(f"[ERROR] Checkpoint not found: {checkpoint_path}")
-        return
-
-    # 运行基本评估
-    print("\nRunning basic evaluation...")
-    basic_metrics = evaluate_policy(
-        rl=rl,
-        data_loader=test_loader,
-        graph=relation_graph,
-        hypergraph_list=hypergraph_list,
-        device=device,
-        max_batches=50  # 限制批次数量以加快测试
-    )
-    print("Basic Metrics:", basic_metrics)
-
-    # 运行详细评估
-    print("\nRunning detailed evaluation...")
-    detailed_res = evaluate_policy_with_ranking_metrics(
-        rl=rl,
-        data_loader=test_loader,
-        graph=relation_graph,
-        hypergraph_list=hypergraph_list,
-        device=device,
-        max_batches=999999,
-        k_list=[1, 3, 5, 10],
-        m_list=[3, 5, 7, 9],
-        schemeA_skip_short=True
-    )
-
-    # 打印详细结果
-    print("\n[Table 1] Next-item ranking metrics (Base vs Policy)")
-    for k in [1, 3, 5, 10]:
-        print("K=", k,
-              detailed_res[f"base_hits@{k}"], detailed_res[f"policy_hits@{k}"],
-              detailed_res[f"base_NDCG@{k}"], detailed_res[f"policy_NDCG@{k}"])
-
-    print("\n[Table 2] Open-loop path planning metrics (Base rollout vs Policy rollout)")
-    for m in [3, 5, 7, 9]:
-        print("m=", m,
-              detailed_res[f"base_acc@{m}"], detailed_res[f"policy_acc@{m}"],
-              detailed_res[f"base_NDCG@{m}"], detailed_res[f"policy_NDCG@{m}"],
-              "windows", detailed_res[f"policy_windows@{m}"])
-              
-    return basic_metrics, detailed_res
+    return res
 
 
 if __name__ == "__main__":
     # main()
-    test_rl_policy_from_checkpoint()
     test_rl()
     # 如果需要使用特定参数测试，可以取消下面的注释
     # test_rl_policy_from_checkpoint(checkpoint_path="./checkpoint/A_rl_policy.pt", data_name="Assist")
