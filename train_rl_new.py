@@ -95,10 +95,10 @@ def build_args():
     p.add_argument("--pretrained_path", type=str, default="./checkpoint/DiffusionPrediction_MOO.pt")
 
     # ===== RL/PPO =====
-    p.add_argument("--rl_epochs", type=int, default=20)
+    p.add_argument("--rl_epochs", type=int, default=5)
     p.add_argument("--cand_k", type=int, default=5)
     p.add_argument("--topk", type=int, default=5)
-    p.add_argument("--history_T", type=int, default=10)
+    p.add_argument("--history_T", type=int, default=5)
     p.add_argument("--rl_lr", type=float, default=3e-4)
     p.add_argument("--seed", type=int, default=0)
 
@@ -326,8 +326,8 @@ def test_rl():
 
         # 固定长度路径 + 方案1：每个时间步做规划，但限制次数
         horizon_H=5,
-        min_start=2,
-        max_starts_per_seq=10,
+        min_start=5,
+        max_starts_per_seq=5,
 
         # ===== 终止奖励消融开关（训练用）=====
         # 默认全开；要做 w/o 某项就把它设为 False
