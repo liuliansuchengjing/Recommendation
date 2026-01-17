@@ -211,6 +211,15 @@ class PPOTrainer:
         returns: torch.Tensor,       # [N]
     ) -> Dict[str, float]:
         cfg = self.cfg
+
+        # IMPORTANT: PPO performs multiple optimization epochs over the SAME rollout.
+        # Rollout tensors must be treated as constants; otherwise the 2nd backward
+        # will try to traverse a freed graph and crash.
+        cand_feat = cand_feat.detach()
+        old_logp = old_logp.detach()
+        old_values = old_values.detach()
+        advantages = advantages.detach()
+        returns = returns.detach()
         N = cand_feat.size(0)
         idx = torch.randperm(N, device=cand_feat.device)
 
