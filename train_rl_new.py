@@ -323,6 +323,22 @@ def test_rl():
         cand_k=args.cand_k,
         history_window_T=args.history_T,
         rl_lr=args.rl_lr,
+
+        # 固定长度路径 + 方案1：每个时间步做规划，但限制次数
+        horizon_H=5,
+        min_start=2,
+        max_starts_per_seq=10,
+
+        # ===== 终止奖励消融开关（训练用）=====
+        # 默认全开；要做 w/o 某项就把它设为 False
+        terminal_reward_components={
+            "effectiveness": True,
+            "adaptivity": True,
+            "diversity": True,
+        },
+
+        # 训练时：只计算“开着的”终止指标（关掉的就不算，省时间，也符合你的要求）
+        train_compute_all_terminal_metrics=False,
     )
 
     # 用一个 batch 触发 lazy init
