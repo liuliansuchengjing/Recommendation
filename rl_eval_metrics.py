@@ -160,7 +160,15 @@ def rollout_episode_greedy(
       per_step_policy_topk: List[Tensor[B,topk]] (length=max_steps; only if mode="rl", else None)
     """
     env = rl.env
-    state = env.reset(tgt, tgt_timestamp, tgt_idx, ans, graph=graph, hypergraph_list=hypergraph_list)
+    # state = env.reset(tgt, tgt_timestamp, tgt_idx, ans, graph=graph, hypergraph_list=hypergraph_list)
+    start_t = getattr(env, "min_start", 0)
+    state = env.reset(
+        tgt, tgt_timestamp, tgt_idx, ans,
+        start_t=start_t,
+        graph=graph,
+        hypergraph_list=hypergraph_list
+    )
+
     rl._lazy_init(int(state["candidate_features"].size(-1)))
     rl.policy.eval()
 
