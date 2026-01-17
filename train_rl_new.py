@@ -381,4 +381,4 @@ def test_rl():
 
 if __name__ == "__main__":
     main()
-    # test_rl()
+    test_rl()

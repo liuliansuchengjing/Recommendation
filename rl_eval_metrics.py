@@ -335,6 +335,7 @@ def evaluate_policy_with_ranking_metrics(
             valid_lens = out["valid_lens"]
             B, L = gen_seq.shape
 
+            seed_len = int(out.get("seed_len", torch.tensor(2, device=device)).item())
             for m in m_list:
                 acc_sum = exact_sum = overlap_sum = map_sum = ndcg_sum = 0.0
                 windows = 0.0
@@ -343,20 +344,54 @@ def evaluate_policy_with_ranking_metrics(
                     vlen = int(valid_lens[b].item())
                     # start positions t where we compare next m items: positions t+1..t+m
                     # ensure these predicted positions exist (>=2) and within vlen
-                    for tpos in range(1, vlen - m):
-                        start = tpos
+                                        # --- OLD (kept for reference): sliding windows over full valid length ---
+                    # for tpos in range(1, vlen - m):
+                    #                         start = tpos
+                    #                         s = start + 1
+                    #                         e = start + 1 + m
+                    #                         if e > vlen:
+                    #                             continue
+                    #                         gt_win = tgt[b, s:e]
+                    #                         pred_win = gen_seq[b, s:e]
+                    #                         # Scheme A: if GT has PAD (shouldn't within vlen) or pred has PAD, skip or keep.
+                    #                         if schemeA_skip_short:
+                    #                             if (gt_win == 0).any():
+                    #                                 continue
+                    #                         windows += 1.0
+                    #
+                    #                         # token accuracy
+                    #                         acc = (pred_win == gt_win).float().mean().item()
+                    #                         acc_sum += acc
+                    #                         # exact
+                    #                         exact_sum += 1.0 if (pred_win == gt_win).all().item() else 0.0
+                    #                         # overlap
+                    #                         overlap_sum += _window_overlap_stats(pred_win, gt_win)
+                    #                         # map/ndcg treating GT window as relevant set
+                    #                         gt_set = set(gt_win.tolist())
+                    #                         ap, nd = _window_map_ndcg(pred_win, gt_set)
+                    #                         map_sum += ap
+                    #                         ndcg_sum += nd
+                    # --- NEW: evaluate only within the generated open-loop segment (path itself) ---
+                    pred_len = int((gen_seq[b, seed_len:] != 0).sum().item())
+                    if pred_len < m:
+                        if schemeA_skip_short:
+                            continue
+                        continue
+                    start_min = seed_len - 1
+                    start_max_excl = seed_len + pred_len - m  # exclusive
+                    for start in range(start_min, start_max_excl):
                         s = start + 1
                         e = start + 1 + m
                         if e > vlen:
-                            continue
+                            if schemeA_skip_short:
+                                continue
+                            break
                         gt_win = tgt[b, s:e]
                         pred_win = gen_seq[b, s:e]
-                        # Scheme A: if GT has PAD (shouldn't within vlen) or pred has PAD, skip or keep.
                         if schemeA_skip_short:
-                            if (gt_win == 0).any():
+                            if (gt_win == 0).any() or (pred_win == 0).any():
                                 continue
                         windows += 1.0
-
                         # token accuracy
                         acc = (pred_win == gt_win).float().mean().item()
                         acc_sum += acc
@@ -369,6 +404,7 @@ def evaluate_policy_with_ranking_metrics(
                         ap, nd = _window_map_ndcg(pred_win, gt_set)
                         map_sum += ap
                         ndcg_sum += nd
+
 
                 if windows > 0:
                     path_aggs[(tag, m)]["acc_sum"] += acc_sum
