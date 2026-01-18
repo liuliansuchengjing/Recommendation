@@ -37,7 +37,7 @@ parser.add_argument('-valid_rate', type=float, default=0.1)
 parser.add_argument('-n_warmup_steps', type=int, default=1000)
 parser.add_argument('-dropout', type=float, default=0.3)
 parser.add_argument('-log', default=None)
-parser.add_argument('-save_path', default="./checkpoint/DiffusionPrediction_a150.pt")
+parser.add_argument('-save_path', default="./checkpoint/DiffusionPrediction_a125_u.pt")
 parser.add_argument('-save_mode', type=str, choices=['all', 'best'], default='best')
 parser.add_argument('-no_cuda', action='store_true')
 parser.add_argument('-pos_emb', type=bool, default=True)
@@ -365,7 +365,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
 
             y_pred = pred.detach().cpu().numpy()
             # ===== KT rerank (evaluation only) =====
-            USE_KT_RERANK = True  # 你也可以换成 argparse 参数
+            USE_KT_RERANK = False  # 你也可以换成 argparse 参数
             if USE_KT_RERANK:
                 y_pred = kt_rerank_logits_numpy(
                     logits_np=y_pred,
@@ -537,8 +537,8 @@ def test_model(MSHGAT, data_path):
 
 if __name__ == "__main__":
     model = MSHGAT
-    # train_model(model, opt.data_name)
-    test_model(model, opt.data_name)
-    # 多目标评价指标计算
-    gain_test_model(model, opt.data_name, opt)
+    train_model(model, opt.data_name)
+    # test_model(model, opt.data_name)
+    # # 多目标评价指标计算
+    # gain_test_model(model, opt.data_name, opt)
 
