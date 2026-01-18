@@ -301,155 +301,63 @@ def main():
     print("\\n[Test]", te)
 
 @torch.no_grad()
-def evaluate_greedy_top1_path_metrics(
+def evaluate_base_top1_terminal_metrics_like_rl(
     rl,
-    base_model,               # 直接传进来，别依赖 rl.base_model
     data_loader,
     graph,
     hypergraph_list,
     device,
-    horizon_H=None,
-    min_start=None,
-    max_starts_per_seq=None,
-    max_batches=10**9,
+    max_batches: int = 999999,
 ):
     """
-    逐步 Top1 rollout，路径长度与 RL 的 horizon_H 相同，
-    返回 RL 终止口径的 effectiveness/adaptivity/diversity（以及 final_quality 如果有）。
+    Baseline: 每一步都选 base 候选集中的 top1（action_idx=0），rollout H 步，
+    然后用 env.compute_final_quality(compute_all=True) 计算终止质量指标。
+    口径对齐 rl_adjuster_new_path_metrics.py 里的 evaluate_policy。
     """
     env = rl.env
-    base_model.eval()
 
-    # 跟 RL 配置对齐（你的 RLPathOptimizer 里就是这些） :contentReference[oaicite:3]{index=3}
-    if horizon_H is None:
-        horizon_H = getattr(rl, "horizon_H", 10)
-    if min_start is None:
-        min_start = getattr(rl, "min_start", 5)
-    if max_starts_per_seq is None:
-        max_starts_per_seq = getattr(rl, "max_starts_per_seq", 5)
+    agg = {"effectiveness": 0.0, "adaptivity": 0.0, "diversity": 0.0, "final_quality": 0.0}
+    n = 0
 
-    # 让环境在 compute_final_quality 时尽量把三项都算出来（若 env 支持）
-    # 不同版本 env 可能没有这些属性，有就设，没有就忽略
-    if hasattr(env, "terminal_reward_components"):
-        try:
-            env.terminal_reward_components["effectiveness"] = True
-            env.terminal_reward_components["adaptivity"] = True
-            env.terminal_reward_components["diversity"] = True
-        except Exception:
-            pass
-    if hasattr(env, "train_compute_all_terminal_metrics"):
-        try:
-            env.train_compute_all_terminal_metrics = True
-        except Exception:
-            pass
-
-    sums = {"final_quality": 0.0, "effectiveness": 0.0, "adaptivity": 0.0, "diversity": 0.0}
-    cnt = 0
-
-    def _get_candidates(state):
-        # 兼容：候选集可能在 state 里，也可能 env 里
-        if isinstance(state, dict):
-            for key in ["cand_items", "candidates", "cand_ids", "candidate_items", "cands"]:
-                if key in state and state[key] is not None:
-                    x = state[key]
-                    if not torch.is_tensor(x):
-                        x = torch.tensor(x, device=device)
-                    return x.long().to(device)
-        for attr in ["cand_items", "candidates", "candidate_items", "cands"]:
-            if hasattr(env, attr):
-                x = getattr(env, attr)
-                if x is None:
-                    continue
-                if not torch.is_tensor(x):
-                    x = torch.tensor(x, device=device)
-                return x.long().to(device)
-        return None
-
-    def _forward_last_step_logits():
-        """
-        用 env 当前缓存的 seq/ts/idx/ans 做一次 base_model forward，
-        取“当前步”的 logits（最后一步）。
-        """
-        seq = getattr(env, "seq", None)
-        ts  = getattr(env, "ts", None)
-        idx = getattr(env, "idx", None)
-        ans = getattr(env, "ans", None)
-        if seq is None or ts is None or idx is None or ans is None:
-            raise RuntimeError(
-                "env 没有缓存 seq/ts/idx/ans。你把 env.reset/step 里更新这些字段的代码贴我，我给你改成不依赖 env 缓存的版本。"
-            )
-
-        out = base_model(seq, ts, idx, ans, graph, hypergraph_list)
-        pred = out[0] if isinstance(out, (tuple, list)) else out  # [B*t_pred, V] or similar
-
-        B = seq.size(0)
-        V = pred.size(-1)
-        t_pred = pred.size(0) // B
-        pred = pred.view(B, t_pred, V)
-        return pred[:, -1, :]  # [B, V]
-
-    for b_i, batch in enumerate(data_loader):
-        if b_i >= max_batches:
+    for i, batch in enumerate(data_loader):
+        if i >= max_batches:
             break
 
-        tgt, ts, idx, ans = batch
-        tgt = tgt.to(device)
-        ts  = ts.to(device)
-        idx = idx.to(device)
-        ans = ans.to(device)
+        tgt, ts, idx, ans = batch[0].to(device), batch[1].to(device), batch[2].to(device), batch[3].to(device)
 
-        B = tgt.size(0)
+        # 对齐训练/论文：windows 抽样（扩展 batch）
+        src_idx, start_t = rl._sample_starts(tgt)
+        tgt_e = tgt.index_select(0, src_idx)
+        ts_e  = ts.index_select(0, src_idx)
+        ans_e = ans.index_select(0, src_idx)
+        idx_e = idx.index_select(0, src_idx) if idx.dim() == 1 else idx.index_select(0, src_idx)
 
-        # windows：对每条序列抽若干 start（与你训练评估一致） :contentReference[oaicite:4]{index=4}
-        for _ in range(int(max_starts_per_seq)):
-            start_t = torch.full((B,), int(min_start), device=device, dtype=torch.long)
+        state = env.reset(
+            tgt_e, ts_e, idx_e, ans_e,
+            start_t=start_t,
+            graph=graph,
+            hypergraph_list=hypergraph_list
+        )
 
-            state = env.reset(
-                tgt, ts, idx, ans,
-                start_t=start_t,
-                graph=graph,
-                hypergraph_list=hypergraph_list,
-            )
+        # rollout H 步：每一步 action_idx=0 => candidate_ids 的第一个（即 base top1）
+        for _ in range(rl.horizon_H):
+            Bexp = state["candidate_ids"].size(0)
+            action_idx = torch.zeros((Bexp,), device=device, dtype=torch.long)  # 永远选候选集第0个
+            state, _, _, _ = env.step_env(action_idx)
 
-            # rollout H 步：每一步 top1
-            for _step in range(int(horizon_H)):
-                cand = _get_candidates(state)
-                logits = _forward_last_step_logits()  # [B, V]
+        metrics = env.compute_final_quality(
+            reward_weights=rl.final_reward_weights,
+            reward_components=rl.terminal_reward_components,
+            compute_all=True,
+        )
 
-                if cand is None:
-                    action_item_id = logits.argmax(dim=1).long()
-                    state, reward, done, info = env.step(action_item_id)
-                else:
-                    cand_logits = logits.gather(1, cand)          # [B, K]
-                    best_pos = cand_logits.argmax(dim=1)          # [B]
-                    action_item_id = cand.gather(1, best_pos[:, None]).squeeze(1).long()
+        for k in agg:
+            agg[k] += float(metrics[k].mean().detach().cpu())
+        n += 1
 
-                    # 绝大多数实现 env.step 接收 item_id；如果你 env.step 接收的是“候选索引”，就改成 best_pos
-                    state, reward, done, info = env.step(action_item_id)
-
-                if torch.is_tensor(done):
-                    if done.all().item():
-                        break
-                else:
-                    if bool(done):
-                        break
-
-            # 终止指标：用 env 同口径 compute_final_quality（与你 RL evaluate_policy 一致） :contentReference[oaicite:5]{index=5}
-            seq_after = getattr(env, "seq_after", getattr(env, "seq", tgt))
-            ts_after  = getattr(env, "ts_after",  getattr(env, "ts", ts))
-            idx_after = getattr(env, "idx_after", getattr(env, "idx", idx))
-            ans_after = getattr(env, "ans_after", getattr(env, "ans", ans))
-
-            metrics = env.compute_final_quality(seq_after, ts_after, idx_after, ans_after)
-
-            for k in list(sums.keys()):
-                if k in metrics:
-                    sums[k] += float(metrics[k])
-            cnt += 1
-
-    if cnt == 0:
-        return {k: 0.0 for k in sums}
-    return {k: v / cnt for k, v in sums.items()}
+    if n == 0:
+        return {k: 0.0 for k in agg}
+    return {k: v / n for k, v in agg.items()}
 
 def test_rl_like_training(checkpoint_path: str = "./checkpoint/A_rl_policy.pt", eval_split: str = "test"):
     args = build_args()
