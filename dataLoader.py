@@ -15,7 +15,7 @@ import pickle
 class Options(object):
 
     def __init__(self, data_name='douban'):
-        self.data = 'data/' + data_name + '/cascades.txt'
+        self.data = 'data/' + data_name + '/cascades_Unrepeat.txt'
         self.u2idx_dict = 'data/' + data_name + '/u2idx.pickle'
         self.idx2u_dict = 'data/' + data_name + '/idx2u.pickle'
         self.save_path = ''

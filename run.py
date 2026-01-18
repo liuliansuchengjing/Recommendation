@@ -28,7 +28,7 @@ metric = Metrics()
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-data_name', default='Assist')
-parser.add_argument('-epoch', type=int, default=130)
+parser.add_argument('-epoch', type=int, default=125)
 parser.add_argument('-batch_size', type=int, default=64)
 parser.add_argument('-d_model', type=int, default=64)
 parser.add_argument('-initialFeatureSize', type=int, default=64)
@@ -37,7 +37,7 @@ parser.add_argument('-valid_rate', type=float, default=0.1)
 parser.add_argument('-n_warmup_steps', type=int, default=1000)
 parser.add_argument('-dropout', type=float, default=0.3)
 parser.add_argument('-log', default=None)
-parser.add_argument('-save_path', default="./checkpoint/DiffusionPrediction_a150.pt")
+parser.add_argument('-save_path', default="./checkpoint/DiffusionPrediction_a125_unrepeat.pt")
 parser.add_argument('-save_mode', type=str, choices=['all', 'best'], default='best')
 parser.add_argument('-no_cuda', action='store_true')
 parser.add_argument('-pos_emb', type=bool, default=True)
@@ -493,8 +493,8 @@ def test_model(MSHGAT, data_path):
 
 if __name__ == "__main__":
     model = MSHGAT
-    # train_model(model, opt.data_name)
-    test_model(model, opt.data_name)
+    train_model(model, opt.data_name)
+    # test_model(model, opt.data_name)
     # 多目标评价指标计算
     # gain_test_model(model, opt.data_name, opt)
 
