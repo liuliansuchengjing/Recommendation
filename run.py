@@ -540,5 +540,5 @@ if __name__ == "__main__":
     # train_model(model, opt.data_name)
     test_model(model, opt.data_name)
     # 多目标评价指标计算
-    # gain_test_model(model, opt.data_name, opt)
+    gain_test_model(model, opt.data_name, opt)
 
