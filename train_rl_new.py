@@ -359,7 +359,13 @@ def evaluate_base_top1_terminal_metrics_like_rl(
         return {k: 0.0 for k in agg}
     return {k: v / n for k, v in agg.items()}
 
-def test_rl_like_training(checkpoint_path: str = "./checkpoint/A_rl_policy.pt", eval_split: str = "test"):
+
+def test_rl_like_training(
+    checkpoint_path: str = "./checkpoint/A_rl_policy.pt",
+    eval_split: str = "test",
+    max_batches: int = 50,   # 新增：和 evaluate_policy 默认一致
+):
+
     args = build_args()
     set_seed(args.seed)
 
@@ -407,18 +413,15 @@ def test_rl_like_training(checkpoint_path: str = "./checkpoint/A_rl_policy.pt", 
     rl.ensure_initialized(tgt, ts, idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
 
     # ===== Base greedy-top1 rollout (same horizon_H as RL) =====
-    base_top1_metrics = evaluate_greedy_top1_path_metrics(
+    base_top1 = evaluate_base_top1_terminal_metrics_like_rl(
         rl=rl,
-        base_model=base_model,
         data_loader=eval_loader,
         graph=relation_graph,
         hypergraph_list=hypergraph_list,
         device=device,
-        horizon_H=10,  # 你 RLPathOptimizer 里就是 10 :contentReference[oaicite:6]{index=6}
-        min_start=5,
-        max_starts_per_seq=5,
+        max_batches=max_batches,
     )
-    print("[BASE greedy-top1 terminal]", base_top1_metrics)
+    print("[BASE top1 terminal metrics]", base_top1)
 
     # 2) load RL policy
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -427,14 +430,22 @@ def test_rl_like_training(checkpoint_path: str = "./checkpoint/A_rl_policy.pt", 
 
     # 3) policy terminal (训练同款)
     policy_metrics = evaluate_policy(
-        rl=rl, data_loader=eval_loader,
-        graph=relation_graph, hypergraph_list=hypergraph_list, device=device
+        rl=rl,
+        data_loader=eval_loader,
+        graph=relation_graph,
+        hypergraph_list=hypergraph_list,
+        device=device,
+        max_batches=max_batches,
     )
-    print("[POLICY terminal]", policy_metrics)
+    print("[POLICY terminal metrics]", policy_metrics)
 
 
 def test_rl():
-    test_rl_like_training("./checkpoint/A_rl_policy.pt", eval_split="test")
+    test_rl_like_training(
+        "./checkpoint/A_rl_policy.pt",
+        eval_split="test",
+        max_batches=999999,  # 你想全量就给大一点
+    )
 
 
 
