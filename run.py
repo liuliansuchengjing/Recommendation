@@ -45,7 +45,41 @@ parser.add_argument('-pos_emb', type=bool, default=True)
 opt = parser.parse_args()
 opt.d_word_vec = opt.d_model
 
+def kt_rerank_logits_numpy(logits_np, yt_tensor, base_k=100, beta=1.0, pad_id=0, skip_id=1, eps=1e-12):
+    """
+    logits_np: (N, V)  numpy, 来自 pred.detach().cpu().numpy()
+    yt_tensor: torch.Tensor, (B, T-1, V) 或 (N, V)  —— 你的 model forward 返回的 yt
+    base_k: 只在 base_k 个候选上做 KT 重排（推荐 50~200）
+    beta: KT 强度，score = logit + beta*log(yt)
+    返回: (N, V) numpy，重排后的“可用于 argsort/topk 的分数矩阵”
+    """
+    # ---- yt reshape -> (N, V) numpy ----
+    yt = yt_tensor.detach().cpu()
+    if yt.dim() == 3:
+        yt = yt.reshape(-1, yt.size(-1))
+    yt_np = yt.numpy()  # (N, V)
 
+    N, V = logits_np.shape
+    assert yt_np.shape == (N, V), f"yt shape {yt_np.shape} != logits shape {logits_np.shape}"
+
+    # 初始化为很小的分数，确保只在候选集内竞争
+    out = np.full_like(logits_np, fill_value=-1e9)
+
+    for n in range(N):
+        row = logits_np[n]
+
+        # 取推荐模型的 base_k 候选
+        cand = np.argpartition(row, -base_k)[-base_k:]
+        # 过滤 PAD / skip
+        cand = cand[(cand != pad_id) & (cand != skip_id)]
+
+        # 计算 KT 加权分数
+        kt_prob = yt_np[n, cand]
+        score = row[cand] + beta * np.log(kt_prob + eps)
+
+        out[n, cand] = score
+
+    return out
 # print(opt)
 
 def batch_path_counts_from_logits(pred_logits, tgt, m, pad_id=0, skip_id=1):
@@ -321,8 +355,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
 
             # forward
             # pred = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
-            pred, pred_res, kt_mask, _, _, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph,
-                                                     hypergraph_list)  # ==================================
+            pred, pred_res, kt_mask, yt, _, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)  # ==================================
 
             for m in paper_ms:
                 tp, fp, fn = batch_path_counts_from_logits(pred, tgt, m, pad_id=Constants.PAD, skip_id=1)
@@ -331,6 +364,17 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
                 paper_totals[m]["FN"] += fn
 
             y_pred = pred.detach().cpu().numpy()
+            # ===== KT rerank (evaluation only) =====
+            USE_KT_RERANK = True  # 你也可以换成 argparse 参数
+            if USE_KT_RERANK:
+                y_pred = kt_rerank_logits_numpy(
+                    logits_np=y_pred,
+                    yt_tensor=yt,
+                    base_k=100,  # 先用 100
+                    beta=1.0,  # 先用 1.0
+                    pad_id=Constants.PAD,
+                    skip_id=1
+                )
 
 
             loss_kt, auc, acc = kt_loss(pred_res.cpu(), ans.cpu(),
