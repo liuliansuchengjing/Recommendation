@@ -343,6 +343,13 @@ def test_rl_like_training(checkpoint_path: str = "./checkpoint/A_rl_policy.pt", 
         train_compute_all_terminal_metrics=False,
     )
 
+    # --- after rl = RLPathOptimizer(...) ---
+    if not hasattr(rl, "base_model"):
+        rl.base_model = base_model  # 补一个你评估函数需要的属性
+    # 也建议 env 也挂上，防止你后续从 env 里取
+    if hasattr(rl, "env") and not hasattr(rl.env, "base_model"):
+        rl.env.base_model = base_model
+
     # lazy init
     first_batch = next(iter(eval_loader))
     tgt, ts, idx, ans = (x.to(device) for x in first_batch)
