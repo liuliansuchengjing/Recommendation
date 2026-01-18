@@ -134,6 +134,42 @@ def simulate_learning(kt_model, original_seqs, original_ans, topk_sequence, grap
     return torch.stack(yt_after_list, dim=1)  # 维度: [batch_size, seq_len-1, num_skills]
 
 
+def kt_rerank_logits_numpy(logits_np, yt_tensor, base_k=100, beta=1.0, pad_id=0, skip_id=1, eps=1e-12):
+    """
+    logits_np: (N, V)  numpy, 来自 pred.detach().cpu().numpy()
+    yt_tensor: torch.Tensor, (B, T-1, V) 或 (N, V)  —— 你的 model forward 返回的 yt
+    base_k: 只在 base_k 个候选上做 KT 重排（推荐 50~200）
+    beta: KT 强度，score = logit + beta*log(yt)
+    返回: (N, V) numpy，重排后的“可用于 argsort/topk 的分数矩阵”
+    """
+    # ---- yt reshape -> (N, V) numpy ----
+    yt = yt_tensor.detach().cpu()
+    if yt.dim() == 3:
+        yt = yt.reshape(-1, yt.size(-1))
+    yt_np = yt.numpy()  # (N, V)
+
+    N, V = logits_np.shape
+    assert yt_np.shape == (N, V), f"yt shape {yt_np.shape} != logits shape {logits_np.shape}"
+
+    # 初始化为很小的分数，确保只在候选集内竞争
+    out = np.full_like(logits_np, fill_value=-1e9)
+
+    for n in range(N):
+        row = logits_np[n]
+
+        # 取推荐模型的 base_k 候选
+        cand = np.argpartition(row, -base_k)[-base_k:]
+        # 过滤 PAD / skip
+        cand = cand[(cand != pad_id) & (cand != skip_id)]
+
+        # 计算 KT 加权分数
+        kt_prob = yt_np[n, cand]
+        score = row[cand] + beta * np.log(kt_prob + eps)
+
+        out[n, cand] = score
+
+    return out
+
 def gain_test_epoch(model, kt_model, test_data, graph, hypergraph_list, kt_loss, data_path, k_list=[5, 10, 20], topnum=6, cannum = 14):
     model.eval()# 将模型设置为评估模式
     auc_test, acc_test = [], []
@@ -181,6 +217,17 @@ def gain_test_epoch(model, kt_model, test_data, graph, hypergraph_list, kt_loss,
             y_pred = pred.detach().cpu().numpy()  # 维度: [batch_size*seq_len-1, num_skills]
             # print("y_pred",y_pred.shape)# 维度: [batch_size, seq_len-1, num_skills]
             # print("y_gold",y_gold.shape) # 维度: [(batch_size * (seq_len - 1))]
+            # ===== KT rerank (evaluation only) =====
+            USE_KT_RERANK = True  # 你也可以换成 argparse 参数
+            if USE_KT_RERANK:
+                y_pred = kt_rerank_logits_numpy(
+                    logits_np=y_pred,
+                    yt_tensor=yt_before,
+                    base_k=100,  # 先用 100
+                    beta=1.0,  # 先用 1.0
+                    pad_id=Constants.PAD,
+                    skip_id=1
+                )
             scores_batch, topk_sequence, scores_len = metric.gaintest_compute_metric(
                 y_pred, y_gold, batch_size, seq_len, k_list, topnum
             )
