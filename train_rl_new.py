@@ -348,21 +348,24 @@ def test_rl_like_training(checkpoint_path: str = "./checkpoint/A_rl_policy.pt", 
     tgt, ts, idx, ans = (x.to(device) for x in first_batch)
     rl.ensure_initialized(tgt, ts, idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
 
-    # load policy
+    # 1) base top1 baseline
+    base_top1 = evaluate_base_top1_terminal_like_training(
+        rl, eval_loader, relation_graph, hypergraph_list, device,
+        horizon_H=10, min_start=5, max_starts_per_seq=1
+    )
+    print("[BASE top1 terminal]", base_top1)
+
+    # 2) load RL policy
     ckpt = torch.load(checkpoint_path, map_location=device)
     rl.policy.load_state_dict(ckpt["policy"])
     rl.policy.eval()
 
-    print("[Running evaluate_policy ...]")
-    metrics = evaluate_policy(
-        rl=rl,
-        data_loader=eval_loader,
-        graph=relation_graph,
-        hypergraph_list=hypergraph_list,
-        device=device
+    # 3) policy terminal (训练同款)
+    policy_metrics = evaluate_policy(
+        rl=rl, data_loader=eval_loader,
+        graph=relation_graph, hypergraph_list=hypergraph_list, device=device
     )
-    print(f"[Eval split: {eval_split}] {metrics}")
-    return metrics
+    print("[POLICY terminal]", policy_metrics)
 
 
 @torch.no_grad()
@@ -579,10 +582,134 @@ def test_base_top1(eval_split="test", scheme="windows"):
     for m in (3, 5, 7, 9):
         print(f"  m={m}  P={res[f'base_P@{m}']:.4f}  R={res[f'base_R@{m}']:.4f}  F1={res[f'base_F1@{m}']:.4f}  windows={res[f'base_windows@{m}']}")
 
+import torch
+
+@torch.no_grad()
+def evaluate_base_top1_terminal_like_training(
+    rl,
+    data_loader,
+    graph,
+    hypergraph_list,
+    device,
+    horizon_H=10,
+    min_start=5,
+    max_starts_per_seq=1,
+    max_batches=10**9,
+):
+    """
+    不用RL policy：每一步用 base_model 的 top1 作为动作，
+    输出与 evaluate_policy 同口径的终止指标（final_quality/effectiveness/adaptivity/diversity）
+    """
+
+    env = rl.env
+    base_model = rl.base_model
+    base_model.eval()
+
+    sums = {"final_quality": 0.0, "effectiveness": 0.0, "adaptivity": 0.0, "diversity": 0.0}
+    n = 0
+
+    def _get_candidates(state):
+        # 你按实际情况补字段名（常见几种我先列出来）
+        if isinstance(state, dict):
+            for key in ["cand_items", "candidates", "cand_ids", "candidate_items", "cands"]:
+                if key in state and state[key] is not None:
+                    x = state[key]
+                    if not torch.is_tensor(x):
+                        x = torch.tensor(x, device=device)
+                    return x.long().to(device)
+        # 也可能 env 上缓存了
+        for attr in ["cand_items", "candidates", "candidate_items", "cands"]:
+            if hasattr(env, attr):
+                x = getattr(env, attr)
+                if x is None:
+                    continue
+                if not torch.is_tensor(x):
+                    x = torch.tensor(x, device=device)
+                return x.long().to(device)
+        return None
+
+    def _current_logits():
+        """
+        从 env 里拿当前序列做一次 forward，得到当前步 logits。
+        这里依赖 env 里缓存了 seq/ts/idx/ans（多数实现都有）。
+        """
+        seq = getattr(env, "seq", None)
+        ts  = getattr(env, "ts", None)
+        idx = getattr(env, "idx", None)
+        ans = getattr(env, "ans", None)
+        out = base_model(seq, ts, idx, ans, graph, hypergraph_list)
+        pred = out[0] if isinstance(out, (tuple, list)) else out  # [B*(t_pred), V]
+        B = seq.size(0)
+        V = pred.size(-1)
+        t_pred = pred.size(0) // B
+        pred = pred.view(B, t_pred, V)
+        # 默认用最后一步作为“当前步”
+        return pred[:, -1, :]  # [B, V]
+
+    for b_i, batch in enumerate(data_loader):
+        if b_i >= max_batches:
+            break
+
+        tgt, ts, idx, ans = batch
+        tgt = tgt.to(device); ts = ts.to(device); idx = idx.to(device); ans = ans.to(device)
+
+        B = tgt.size(0)
+
+        # windows：对每条序列抽若干 start（先用固定 min_start，完全对齐你训练时的习惯）
+        for _ in range(max_starts_per_seq):
+            start_t = torch.full((B,), int(min_start), device=device, dtype=torch.long)
+
+            state = env.reset(
+                tgt, ts, idx, ans,
+                start_t=start_t,
+                graph=graph,
+                hypergraph_list=hypergraph_list
+            )
+
+            # rollout H 步：每一步动作=base top1
+            for _step in range(horizon_H):
+                cand = _get_candidates(state)
+                logits = _current_logits()  # [B,V]
+
+                if cand is None:
+                    action = logits.argmax(dim=1).long()  # 全局top1
+                else:
+                    cand_logits = logits.gather(1, cand)           # [B,K]
+                    best_pos = cand_logits.argmax(dim=1)          # [B]
+                    action = cand.gather(1, best_pos[:, None]).squeeze(1).long()
+
+                # 大多数 env.step(action_id) 这样就行；若你项目需要别的参数，
+                # 报错后把 step 的函数签名贴我，我帮你对齐
+                state, reward, done, info = env.step(action)
+
+                # done 可能是 bool，也可能是 (B,) tensor
+                if torch.is_tensor(done):
+                    if done.all().item():
+                        break
+                else:
+                    if bool(done):
+                        break
+
+            # 终止质量：用 env 自带口径算（与训练 evaluate_policy 一致）
+            seq_after = getattr(env, "seq_after", getattr(env, "seq", tgt))
+            ts_after  = getattr(env, "ts_after",  getattr(env, "ts", ts))
+            idx_after = getattr(env, "idx_after", getattr(env, "idx", idx))
+            ans_after = getattr(env, "ans_after", getattr(env, "ans", ans))
+
+            metrics = env.compute_final_quality(seq_after, ts_after, idx_after, ans_after)
+
+            for k in sums:
+                if k in metrics:
+                    sums[k] += float(metrics[k])
+            n += 1
+
+    if n == 0:
+        return {k: 0.0 for k in sums}
+    return {k: v / n for k, v in sums.items()}
+
 
 def test_rl():
-    # test_rl_like_training("./checkpoint/A_rl_policy.pt", eval_split="test")
-    test_base_top1(eval_split="test", scheme="windows")
+    test_rl_like_training("./checkpoint/A_rl_policy.pt", eval_split="test")
     # args = build_args()
     # set_seed(args.seed)
     #
