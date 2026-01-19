@@ -43,7 +43,7 @@ parser.add_argument('-no_cuda', action='store_true')
 parser.add_argument('-pos_emb', type=bool, default=True)
 # --- KT-guided distillation (train-time) ---
 parser.add_argument('--lambda_kt', type=float, default=5000.0)      # 保持你当前 5000 不变
-parser.add_argument('--lambda_distill', type=float, default=0.0)    # 默认关闭，不影响现有结果
+parser.add_argument('--lambda_distill', type=float, default=0.1)    # 默认关闭，不影响现有结果
 parser.add_argument('--distill_k', type=int, default=30)           # topK 候选大小
 parser.add_argument('--distill_tau', type=float, default=1.0)       # 温度
 parser.add_argument('--distill_eps', type=float, default=1e-12)     # log/softmax 稳定项
