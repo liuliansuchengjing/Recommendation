@@ -218,7 +218,7 @@ def gain_test_epoch(model, kt_model, test_data, graph, hypergraph_list, kt_loss,
             # print("y_pred",y_pred.shape)# 维度: [batch_size, seq_len-1, num_skills]
             # print("y_gold",y_gold.shape) # 维度: [(batch_size * (seq_len - 1))]
             # ===== KT rerank (evaluation only) =====
-            USE_KT_RERANK = True  # 你也可以换成 argparse 参数
+            USE_KT_RERANK = False  # 你也可以换成 argparse 参数
             if USE_KT_RERANK:
                 y_pred = kt_rerank_logits_numpy(
                     logits_np=y_pred,

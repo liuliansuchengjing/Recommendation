@@ -357,11 +357,11 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
             # pred = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
             pred, pred_res, kt_mask, yt, _, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)  # ==================================
 
-            for m in paper_ms:
-                tp, fp, fn = batch_path_counts_from_logits(pred, tgt, m, pad_id=Constants.PAD, skip_id=1)
-                paper_totals[m]["TP"] += tp
-                paper_totals[m]["FP"] += fp
-                paper_totals[m]["FN"] += fn
+            # for m in paper_ms:
+            #     tp, fp, fn = batch_path_counts_from_logits(pred, tgt, m, pad_id=Constants.PAD, skip_id=1)
+            #     paper_totals[m]["TP"] += tp
+            #     paper_totals[m]["FP"] += fp
+            #     paper_totals[m]["FN"] += fn
 
             y_pred = pred.detach().cpu().numpy()
             # ===== KT rerank (evaluation only) =====
@@ -402,20 +402,20 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
         scores['hits@' + str(k)] = scores['hits@' + str(k)] / n_total_words
         scores['map@' + str(k)] = scores['map@' + str(k)] / n_total_words
 
-    paper_scores = {}
-    for m in paper_ms:
-        TP = paper_totals[m]["TP"]
-        FP = paper_totals[m]["FP"]
-        FN = paper_totals[m]["FN"]
-        P = TP / (TP + FP + 1e-12)
-        R = TP / (TP + FN + 1e-12)
-        F1 = 0.0 if (P + R) == 0 else 2 * P * R / (P + R)
-        paper_scores[m] = (P, R, F1)
-
-    print("==== Paper-style Path-level PRF (FULL TESTSET) ====")
-    for m in paper_ms:
-        P, R, F1 = paper_scores[m]
-        print(f"[FINAL PRF] m={m}  P={P:.4f} R={R:.4f} F1={F1:.4f}")
+    # paper_scores = {}
+    # for m in paper_ms:
+    #     TP = paper_totals[m]["TP"]
+    #     FP = paper_totals[m]["FP"]
+    #     FN = paper_totals[m]["FN"]
+    #     P = TP / (TP + FP + 1e-12)
+    #     R = TP / (TP + FN + 1e-12)
+    #     F1 = 0.0 if (P + R) == 0 else 2 * P * R / (P + R)
+    #     paper_scores[m] = (P, R, F1)
+    #
+    # print("==== Paper-style Path-level PRF (FULL TESTSET) ====")
+    # for m in paper_ms:
+    #     P, R, F1 = paper_scores[m]
+    #     print(f"[FINAL PRF] m={m}  P={P:.4f} R={R:.4f} F1={F1:.4f}")
 
     return scores, auc_test, acc_test
 
@@ -537,8 +537,8 @@ def test_model(MSHGAT, data_path):
 
 if __name__ == "__main__":
     model = MSHGAT
-    train_model(model, opt.data_name)
-    # test_model(model, opt.data_name)
+    # train_model(model, opt.data_name)
+    test_model(model, opt.data_name)
     # # 多目标评价指标计算
-    # gain_test_model(model, opt.data_name, opt)
+    gain_test_model(model, opt.data_name, opt)
 
