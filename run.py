@@ -27,8 +27,8 @@ torch.cuda.manual_seed(0)
 metric = Metrics()
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-data_name', default='Assist')
-parser.add_argument('-epoch', type=int, default=125)
+parser.add_argument('-data_name', default='MOO')
+parser.add_argument('-epoch', type=int, default=100)
 parser.add_argument('-batch_size', type=int, default=64)
 parser.add_argument('-d_model', type=int, default=64)
 parser.add_argument('-initialFeatureSize', type=int, default=64)
@@ -37,10 +37,17 @@ parser.add_argument('-valid_rate', type=float, default=0.1)
 parser.add_argument('-n_warmup_steps', type=int, default=1000)
 parser.add_argument('-dropout', type=float, default=0.3)
 parser.add_argument('-log', default=None)
-parser.add_argument('-save_path', default="./checkpoint/DiffusionPrediction_a125_u.pt")
+parser.add_argument('-save_path', default="./checkpoint/DiffusionPrediction_M100.pt")
 parser.add_argument('-save_mode', type=str, choices=['all', 'best'], default='best')
 parser.add_argument('-no_cuda', action='store_true')
 parser.add_argument('-pos_emb', type=bool, default=True)
+# --- KT-guided distillation (train-time) ---
+parser.add_argument('--lambda_kt', type=float, default=5000.0)      # 保持你当前 5000 不变
+parser.add_argument('--lambda_distill', type=float, default=0.0)    # 默认关闭，不影响现有结果
+parser.add_argument('--distill_k', type=int, default=100)           # topK 候选大小
+parser.add_argument('--distill_tau', type=float, default=1.0)       # 温度
+parser.add_argument('--distill_eps', type=float, default=1e-12)     # log/softmax 稳定项
+
 
 opt = parser.parse_args()
 opt.d_word_vec = opt.d_model
@@ -188,6 +195,64 @@ def get_performance(crit, pred, gold):
     n_correct = n_correct.masked_select(gold.ne(Constants.PAD).data).sum().float()
     return loss, n_correct
 
+def kt_guided_distill_loss(
+    pred_logits,  # (B*(T-1), V) 或 (B, T-1, V)
+    yt,           # (B, T-1, V) 或 (B*(T-1), V)
+    gold,         # (B, T-1)  真实下一题 id
+    k=100,
+    tau=1.0,
+    pad_id=0,
+    eps=1e-12,
+):
+    """
+    只在 topK 候选集上做蒸馏：
+      teacher = softmax(log(yt_prob)/tau)
+      student = softmax(logits/tau)
+      L = KL(teacher || student)
+    """
+    # ---- reshape logits -> (N, V) ----
+    if pred_logits.dim() == 3:
+        B, Tm1, V = pred_logits.size()
+        pred_logits = pred_logits.reshape(-1, V)
+    else:
+        V = pred_logits.size(-1)
+
+    # ---- reshape yt -> (N, V) ----
+    if yt.dim() == 3:
+        yt = yt.reshape(-1, yt.size(-1))
+    assert yt.size(-1) == V, f"yt V={yt.size(-1)} != logits V={V}"
+
+    # ---- valid positions (exclude PAD targets) ----
+    valid = gold.ne(pad_id).reshape(-1)  # (N,)
+    if valid.sum().item() == 0:
+        return pred_logits.new_tensor(0.0)
+
+    logits_v = pred_logits[valid]  # (Nvalid, V)
+    yt_v = yt[valid]               # (Nvalid, V)
+
+    # ---- topK candidate indices from student logits ----
+    kk = min(k, V)
+    cand_idx = torch.topk(logits_v, k=kk, dim=-1).indices  # (Nvalid, K)
+
+    # ---- gather candidate scores ----
+    stu_cand = torch.gather(logits_v, dim=1, index=cand_idx)  # (Nvalid, K)
+    tea_prob = torch.gather(yt_v, dim=1, index=cand_idx)      # (Nvalid, K)
+
+    # ---- teacher distribution from KT prob ----
+    # 用 log(yt) 再 softmax，更“像分布”，且数值稳定
+    tea_logits = torch.log(tea_prob + eps) / tau
+    tea_dist = torch.softmax(tea_logits, dim=-1).detach()  # teacher 不回传梯度
+
+    # ---- student log-prob ----
+    log_stu = torch.log_softmax(stu_cand / tau, dim=-1)
+
+    # ---- KL(teacher || student) ----
+    # kl_div expects input=log-prob, target=prob
+    loss = F.kl_div(log_stu, tea_dist, reduction="batchmean")
+
+    # 常见做法：乘 tau^2 保持梯度尺度（可选，建议保留）
+    loss = loss * (tau * tau)
+    return loss
 
 def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss, optimizer):
     # train
@@ -221,21 +286,33 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
                                                   hypergraph_list)  # ==================================
 
         # loss
-        loss, n_correct = get_performance(loss_func, pred, gold)
+        # loss, n_correct = get_performance(loss_func, pred, gold)
+        loss_rec, n_correct = get_performance(loss_func, pred, gold)
 
-        loss_kt, auc, acc = kt_loss(pred_res, ans,
-                                    kt_mask)  # ============================================================================
+        loss_kt, auc, acc = kt_loss(pred_res, ans, kt_mask)
 
-        y_gold = tgt[:, 1:].contiguous().view(-1).cpu().numpy()  # 维度: [(batch_size * (seq_len - 1))]
-        y_pred = pred.detach().cpu().numpy()  # 维度: [batch_size*seq_len-1, num_skills]
-        scores_batch, topk_sequence, scores_len = metric.gaintest_compute_metric(
-            y_pred, y_gold, batch_size, seq_len, k_list=[5, 15, 20], topnum=5
-        )
+        # y_gold = tgt[:, 1:].contiguous().view(-1).cpu().numpy()  # 维度: [(batch_size * (seq_len - 1))]
+        # y_pred = pred.detach().cpu().numpy()  # 维度: [batch_size*seq_len-1, num_skills]
+        # scores_batch, topk_sequence, scores_len = metric.gaintest_compute_metric(
+        #     y_pred, y_gold, batch_size, seq_len, k_list=[5, 15, 20], topnum=5
+        # )
         # loss_eff = learning_effect_loss(model, yt, tgt.tolist(), ans.tolist(), topk_sequence, graph, batch_size, topnum = 1)
         # loss_eff = learning_effect_loss(yt)
-        adaptivity_loss = learning_adaptive_loss(tgt.tolist(), ans.tolist(), topk_sequence, opt.data_name)
+        # adaptivity_loss = learning_adaptive_loss(tgt.tolist(), ans.tolist(), topk_sequence, opt.data_name)
 
-        loss = loss + 5000 * loss_kt
+        # distill loss (only train-time)
+        loss_distill = kt_guided_distill_loss(
+            pred_logits=pred,  # (B*(T-1), V)
+            yt=yt,  # (B, T-1, V)
+            gold=gold,  # (B, T-1)
+            k=opt.distill_k,
+            tau=opt.distill_tau,
+            pad_id=Constants.PAD,
+            eps=opt.distill_eps,
+        )
+
+        # loss = loss + 5000 * loss_kt
+        loss = loss_rec + opt.lambda_kt * loss_kt + opt.lambda_distill * loss_distill
         # print("loss:", loss)
 
         # print("loss_kt:", loss_kt)
@@ -537,8 +614,8 @@ def test_model(MSHGAT, data_path):
 
 if __name__ == "__main__":
     model = MSHGAT
-    # train_model(model, opt.data_name)
-    test_model(model, opt.data_name)
+    train_model(model, opt.data_name)
+    # test_model(model, opt.data_name)
     # # 多目标评价指标计算
-    gain_test_model(model, opt.data_name, opt)
+    # gain_test_model(model, opt.data_name, opt)
 
