@@ -201,6 +201,7 @@ class MSHGAT(nn.Module):
 
         self.hgnn = HGNN_ATT(self.initial_feature, self.hidden_size * 2, self.hidden_size, dropout=dropout)
         self.gnn = GraphNN(self.n_node, self.initial_feature, dropout=dropout)
+        self.gnn2 = GraphNN(self.n_node, self.initial_feature, dropout=dropout)
         self.fus = Fusion(self.hidden_size)
         self.fus1 = Fusion(self.hidden_size)
         self.fus2 = Fusion(self.hidden_size)
@@ -236,6 +237,11 @@ class MSHGAT(nn.Module):
         self.num_skills = opt.user_size
         self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
 
+        # 定义三个可学习的对数方差参数（初始化为0）
+        self.log_var_rec = nn.Parameter(torch.zeros(1))
+        self.log_var_kt = nn.Parameter(torch.zeros(1))
+        self.log_var_distill = nn.Parameter(torch.zeros(1))  # 新增第三个任务的自适应参数
+
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.hidden_size)
         for weight in self.parameters():
@@ -266,9 +272,10 @@ class MSHGAT(nn.Module):
 
         # 仅使用图神经网络获取节点嵌入
         hidden = self.dropout(self.gnn(graph))
+        hidden_kt = self.dropout(self.gnn2(graph))
 
         # 使用DKT模型获取知识追踪结果
-        pred_res, kt_mask, yt, _ = self.ktmodel(hidden, original_input, ans)
+        pred_res, kt_mask, yt, _ = self.ktmodel(hidden_kt, original_input, ans)
 
         # 直接使用图神经网络的输出作为序列嵌入
         batch_size, max_len = input.size()

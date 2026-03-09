@@ -37,13 +37,14 @@ parser.add_argument('-valid_rate', type=float, default=0.1)
 parser.add_argument('-n_warmup_steps', type=int, default=1000)
 parser.add_argument('-dropout', type=float, default=0.3)
 parser.add_argument('-log', default=None)
-parser.add_argument('-save_path', default="./checkpoint/DiffusionPrediction_M100.pt")
+parser.add_argument('-save_rec_path', default="./checkpoint/REC_Prediction_M100.pt")
+parser.add_argument('-save_kt_path', default="./checkpoint/KT_Prediction_M100.pt")
 parser.add_argument('-save_mode', type=str, choices=['all', 'best'], default='best')
 parser.add_argument('-no_cuda', action='store_true')
 parser.add_argument('-pos_emb', type=bool, default=True)
 # --- KT-guided distillation (train-time) ---
-parser.add_argument('--lambda_kt', type=float, default=5000.0)      # 保持你当前 5000 不变
-parser.add_argument('--lambda_distill', type=float, default=0.1)    # 默认关闭，不影响现有结果
+# parser.add_argument('--lambda_kt', type=float, default=5000.0)      # 保持你当前 5000 不变
+# parser.add_argument('--lambda_distill', type=float, default=0.1)    # 默认关闭，不影响现有结果
 parser.add_argument('--distill_k', type=int, default=30)           # topK 候选大小
 parser.add_argument('--distill_tau', type=float, default=1.0)       # 温度
 parser.add_argument('--distill_eps', type=float, default=1e-12)     # log/softmax 稳定项
@@ -300,8 +301,17 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         # loss_eff = learning_effect_loss(yt)
         # adaptivity_loss = learning_adaptive_loss(tgt.tolist(), ans.tolist(), topk_sequence, opt.data_name)
 
-        # distill loss (only train-time)
-        loss_distill = kt_guided_distill_loss(
+
+        # loss = loss + 5000 * loss_kt
+        # loss = loss_rec + opt.lambda_kt * loss_kt + opt.lambda_distill * loss_distill
+        # print("loss:", loss)
+        # print("loss_kt:", loss_kt)
+        # 修改 run.py 中的 train_epoch 函数内部逻辑
+
+        # 1. 拿到三个原始损失 (Raw Loss)
+        loss_rec_raw, n_correct = get_performance(loss_func, pred, gold)
+        loss_kt_raw, auc, acc = kt_loss(pred_res, ans, kt_mask)
+        loss_distill_raw = kt_guided_distill_loss(
             pred_logits=pred,  # (B*(T-1), V)
             yt=yt,  # (B, T-1, V)
             gold=gold,  # (B, T-1)
@@ -311,12 +321,25 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
             eps=opt.distill_eps,
         )
 
-        # loss = loss + 5000 * loss_kt
-        loss = loss_rec + opt.lambda_kt * loss_kt + opt.lambda_distill * loss_distill
-        # print("loss:", loss)
+        # 2. 分别计算三个任务的自适应权重，并加权
+        # 公式：(1 / e^log_var) * Raw_Loss + log_var
 
-        # print("loss_kt:", loss_kt)
+        # 推荐系统损失
+        weight_rec = torch.exp(-model.log_var_rec)
+        loss_rec_adaptive = weight_rec * loss_rec_raw + model.log_var_rec
 
+        # 知识追踪损失
+        weight_kt = torch.exp(-model.log_var_kt)
+        loss_kt_adaptive = weight_kt * loss_kt_raw + model.log_var_kt
+
+        # 蒸馏损失 (或者是你提到的第三个其他损失)
+        weight_distill = torch.exp(-model.log_var_distill)
+        loss_distill_adaptive = weight_distill * loss_distill_raw + model.log_var_distill
+
+        # 3. 最终的总 Loss
+        loss = loss_rec_adaptive + loss_kt_adaptive + loss_distill_adaptive
+
+        # 反向传播，这一步会让模型自动去更新那三个 log_var_xxx 参数
         loss.backward()
 
         # parameter update
@@ -348,6 +371,14 @@ def train_model(MSHGAT, data_path):
 
     opt.user_size = user_size
 
+    # 1. 定义两个不同的最高分记录
+    best_rec_hit = 0.0
+    best_kt_auc = 0.0
+
+    # 2. 初始化早停机制参数 (新增)
+    patience = 5  # 容忍多少个 epoch 没有提升
+    patience_counter = 0  # 当前连续没有提升的 epoch 数
+
     # ========= Preparing Model =========#
     model = MSHGAT(opt, dropout=opt.dropout)
     loss_func = nn.CrossEntropyLoss(size_average=False, ignore_index=Constants.PAD)
@@ -364,6 +395,7 @@ def train_model(MSHGAT, data_path):
 
     validation_history = 0.0
     best_scores = {}
+    best_kt_metrics = {'auc': 0.0, 'acc': 0.0}  # 新增逻辑：专门记录 KT 的最佳指标
     for epoch_i in range(opt.epoch):
         print('\n[ Epoch', epoch_i, ']')
 
@@ -371,12 +403,24 @@ def train_model(MSHGAT, data_path):
         train_loss, train_accu, train_auc, train_acc = train_epoch(model, train_data, relation_graph, hypergraph_list,
                                                                    loss_func, kt_loss, optimizer)
 
+        # ==================== 新增：获取并计算当前的自适应权重 ====================
+        # 因为定义的参数是对数方差 (log_var)，实际的权重是 exp(-log_var)
+        # 使用 .item() 将单个元素的 Tensor 转换为普通的 Python 浮点数
+        w_rec = torch.exp(-model.log_var_rec).item()
+        w_kt = torch.exp(-model.log_var_kt).item()
+        w_distill = torch.exp(-model.log_var_distill).item()
+        # =========================================================================
+
         print('  - (Training)   loss: {loss: 8.5f}, accuracy: {accu:3.3f} %, ' \
               'elapse: {elapse:3.3f} min'.format(
             loss=train_loss, accu=100 * train_accu,
             elapse=(time.time() - start) / 60))
         print('auc_test: {:.10f}'.format(np.mean(train_auc)),
               'acc_test: {:.10f}'.format(np.mean(train_acc)))
+
+        # ==================== 新增：打印权重信息 ====================
+        print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} | Distill: {w_distill:.4f}')
+        # ==========================================================
 
         if epoch_i >= 0:
             start = time.time()
@@ -394,16 +438,52 @@ def train_model(MSHGAT, data_path):
                 print(metric + ' ' + str(scores[metric]))
             print('auc_test: {:.10f}'.format(np.mean(auc_test)),
                   'acc_test: {:.10f}'.format(np.mean(acc_test)))
-            if validation_history <= sum(scores.values()):
-                print("Best Validation hit@100:{} at Epoch:{}".format(scores["hits@20"], epoch_i))
-                validation_history = sum(scores.values())
+            # if validation_history <= sum(scores.values()):
+            #     print("Best Validation hit@20:{} at Epoch:{}".format(scores["hits@20"], epoch_i))
+            #     validation_history = sum(scores.values())
+            #     best_scores = scores
+            #     print("Save best model!!!")
+            #     torch.save(model.state_dict(), opt.save_path)
+            # 逻辑 1：保存推荐系统最好的模型
+            # 3. 早停逻辑核心判断
+            is_improved = False  # 设立一个标志位，记录这一轮是否有任何一个指标变好
+
+            if scores["hits@20"] > best_rec_hit:
+                best_rec_hit = scores["hits@20"]
+                torch.save(model.state_dict(), opt.save_rec_path)
+                print("Save Best Recommendation Model!")
                 best_scores = scores
-                print("Save best model!!!")
-                torch.save(model.state_dict(), opt.save_path)
+                is_improved = True  # 只要推荐变好了，就标记为 True
+
+            # 逻辑 2：保存知识追踪最好的模型（独立保存！）
+            current_kt_auc = np.mean(auc_test)
+            if current_kt_auc > best_kt_auc:
+                best_kt_auc = current_kt_auc
+                torch.save(model.state_dict(), opt.save_kt_path)
+                best_kt_metrics['auc'] = current_kt_auc
+                best_kt_metrics['acc'] = np.mean(acc_test)
+                print("Save Best KT Model!")
+                is_improved = True  # 只要 KT 变好了，也标记为 True
+
+            # 4. 更新耐心计时器
+            if is_improved:
+                patience_counter = 0  # 只要有任何一个指标提升，清零重新计数
+            else:
+                patience_counter += 1  # 两个都没提升，计数器 +1
+                print(f"⚠️ Early stopping counter: {patience_counter} out of {patience}")
+
+            # 5. 触发早停
+            if patience_counter >= patience:
+                print(f"\n Early stopping triggered at epoch {epoch_i}!")
+                break  # 直接跳出 for 循环，结束训练
 
     print(" -(Finished!!) \n Best scores: ")
     for metric in best_scores.keys():
         print(metric + ' ' + str(best_scores[metric]))
+
+    print("\n 🏆 Best Knowledge Tracing scores: ")
+    for metric in best_kt_metrics.keys():
+        print(f"    {metric}: {best_kt_metrics[metric]:.4f}")
 
 
 def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[5, 10, 20]):
