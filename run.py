@@ -677,22 +677,41 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
 
 def test_model(MSHGAT, data_path):
     kt_loss = KTLoss()
+    # 1. 获取数据，务必接收 train_history_cas 和 train_history_t 用于纯净建图
     user_size, total_cascades, timestamps, train, valid, test = Split_data(data_path, opt.train_rate, opt.valid_rate,
                                                                            load_dict=True)
 
     test_data = DataLoader(test, batch_size=opt.batch_size, load_dict=True, cuda=False)
 
+    # 2. 永远只用训练集历史来建图！(防止任何测试集泄露)
     relation_graph = ConRelationGraph(data_path)
     hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)
 
     opt.user_size = user_size
 
-    model = MSHGAT(opt, dropout=opt.dropout)
-    model.load_state_dict(torch.load(opt.save_path))
+    # model = MSHGAT(opt, dropout=opt.dropout)
+    # model.load_state_dict(torch.load(opt.save_path))
+    # 3. 实例化两个模型：一个用于推荐，一个用于知识追踪
+    model_rec = MSHGAT(opt, dropout=opt.dropout).cuda()
+    model_kt = MSHGAT(opt, dropout=opt.dropout).cuda()
     model.cuda()
     kt_loss = kt_loss.cuda()
-    scores, auc_test, acc_test = test_epoch(model, test_data, relation_graph, hypergraph_list, kt_loss,
+    # 4. 分别加载它们的最优权重
+    model_rec.load_state_dict(torch.load(opt.save_rec_path))
+    model_kt.load_state_dict(torch.load(opt.save_kt_path))
+
+    # 使用 model_rec 跑测试
+    scores, _, _ = test_epoch(model_rec, test_data, relation_graph, hypergraph_list, kt_loss,
                                             k_list=[5, 10, 20, 30, 40, 50])
+    # =========================================================
+    # 6. 测试知识追踪模型 (KT Model) - 只看 KT 指标
+    # =========================================================
+    print('\n=======================================')
+    print('  🧠 Testing Knowledge Tracing Model...')
+    print('=======================================')
+    # 使用 model_kt 跑测试
+    _, auc_test, acc_test = test_epoch(model_kt, test_data, relation_graph, hypergraph_list, kt_loss,
+                                       k_list=[5])  # k_list 随便传个小的省时间，因为我们只取 AUC/ACC
     # 在验证阶段调用
     # 使用带有详细显示的版本
     # scores, auc_test, acc_test = test_epoch(
@@ -714,5 +733,5 @@ if __name__ == "__main__":
     train_model(model, opt.data_name)
     # test_model(model, opt.data_name)
     # # 多目标评价指标计算
-    gain_test_model(model, opt.data_name, opt)
+    # gain_test_model(model, opt.data_name, opt)
 

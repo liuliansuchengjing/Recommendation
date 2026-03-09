@@ -83,6 +83,10 @@ def Split_data(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_
 
     '''data split'''
     train_idx_ = int(train_rate * len(t_cascades))
+    # ======== 【新增：保留打乱前的纯历史序列，专门用于建图】 ========
+    train_history_cas = t_cascades[0:train_idx_]
+    train_history_t = timestamps[0:train_idx_]
+    # ==========================================================
     train = t_cascades[0:train_idx_]
     train_t = timestamps[0:train_idx_]
     train_idx = cas_idx[0:train_idx_]
@@ -121,7 +125,7 @@ def Split_data(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_
     print('minimum length:%f' % (min(len(cas) for cas in t_cascades)))
     print("user size:%d" % (user_size - 2))
 
-    return user_size, t_cascades, timestamps, train, valid, test
+    return user_size, train_history_cas, train_history_t, train, valid, test
 
 
 def buildIndex(data):
