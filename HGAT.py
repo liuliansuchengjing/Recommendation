@@ -247,13 +247,35 @@ class MSHGAT(nn.Module):
         for weight in self.parameters():
             weight.data.uniform_(-stdv, stdv)
 
+    # def get_attention_mask(self, item_seq):
+    #     """Generate bidirectional attention mask for multi-scale attention."""
+    #     attention_mask = (item_seq > 0).long()
+    #     extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # torch.int64
+    #     # bidirectional mask
+    #     extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
+    #     extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+    #     return extended_attention_mask
     def get_attention_mask(self, item_seq):
-        """Generate bidirectional attention mask for multi-scale attention."""
-        attention_mask = (item_seq > 0).long()
-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # torch.int64
-        # bidirectional mask
-        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
+        """Generate CAUSAL (unidirectional) attention mask for next-item prediction."""
+        batch_size, seq_len = item_seq.size()
+
+        # 1. 屏蔽掉补零(PAD)的位置
+        padding_mask = (item_seq > 0).long()
+        extended_padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)  # [batch_size, 1, 1, seq_len]
+
+        # 2. 核心修复：生成下三角因果掩码 (防止看到未来的题目)
+        # torch.tril 生成下三角矩阵：当前时间步只能看到自己及之前的，右上方全为 0
+        causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=item_seq.device))
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+
+        # 3. 将 Padding Mask 和 Causal Mask 结合
+        # 只有在两个 mask 中都是 1 的位置，才是模型被允许看到的
+        extended_attention_mask = extended_padding_mask * causal_mask
+
+        # 4. 转换为 Transformer 兼容的负无穷格式
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
         return extended_attention_mask
 
     def pred(self, pred_logits):
@@ -328,7 +350,6 @@ class KTOnlyModel(nn.Module):
         # 仅运行 KT 模块
         _, _, yt, yt_all = self.ktmodel(hidden, input_seq, answers)
         return yt_all
-
 
 # import math
 # import numpy as np

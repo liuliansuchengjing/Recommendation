@@ -39,7 +39,7 @@ class Metrics(object):
         scores = {'hits@' + str(k): [] for k in k_list}
         scores.update({'map@' + str(k): [] for k in k_list})
         for p_, y_ in zip(y_prob, y_true):
-            if y_ != self.PAD:
+            if y_ != self.PAD and y_ != 1:
                 scores_len += 1.0
                 p_sort = p_.argsort()
                 for k in k_list:
@@ -70,7 +70,7 @@ class Metrics(object):
             # 获取当前样本的真实标签
             y_ = y_true[i]
             # 如果真实标签为PAD，则跳过当前样本
-            if y_ == self.PAD:
+            if y_ == self.PAD or y_ == 1:
                 continue  # 保持预初始化的空列表
 
             # 增加有效的样本数
@@ -133,7 +133,7 @@ class Metrics(object):
         for i in range(total_samples):
             y_ = y_true[i]
             # 跳过PAD标签的样本（保持空列表）
-            if y_ == self.PAD:
+            if y_ == self.PAD or y_ == 1:
                 continue
 
             # 对预测概率排序，取TopK资源

@@ -189,11 +189,25 @@ def prf_path_level_from_logits(pred_logits, tgt, m, pad_id=0, skip_id=1, average
 
 
 def get_performance(crit, pred, gold):
-    loss = crit(pred, gold.contiguous().view(-1))
-    pred = pred.max(1)[1]
-    gold = gold.contiguous().view(-1)
-    n_correct = pred.data.eq(gold.data)
-    n_correct = n_correct.masked_select(gold.ne(Constants.PAD).data).sum().float()
+    # loss = crit(pred, gold.contiguous().view(-1))
+    # pred = pred.max(1)[1]
+    # gold = gold.contiguous().view(-1)
+    # n_correct = pred.data.eq(gold.data)
+    # n_correct = n_correct.masked_select(gold.ne(Constants.PAD).data).sum().float()
+    gold_flat = gold.contiguous().view(-1)
+
+    # 【改动1】：为了让交叉熵损失同时忽略 1，我们临时将 1 替换为 PAD (0)
+    # 因为你的 crit(CrossEntropyLoss) 已经设置了 ignore_index=0
+    gold_for_loss = gold_flat.clone()
+    gold_for_loss[gold_for_loss == 1] = Constants.PAD
+
+    # 这样 loss 就不会去拟合 1 了
+    loss = crit(pred, gold_for_loss)
+
+    # 【改动2】：计算准确个数时，掩码不仅过滤 0，还要过滤 1
+    pred_id = pred.max(1)[1]
+    valid_mask = (gold_flat != Constants.PAD) & (gold_flat != 1)
+    n_correct = pred_id.eq(gold_flat).masked_select(valid_mask).sum().float()
     return loss, n_correct
 
 def kt_guided_distill_loss(
@@ -224,7 +238,8 @@ def kt_guided_distill_loss(
     assert yt.size(-1) == V, f"yt V={yt.size(-1)} != logits V={V}"
 
     # ---- valid positions (exclude PAD targets) ----
-    valid = gold.ne(pad_id).reshape(-1)  # (N,)
+    # valid = gold.ne(pad_id).reshape(-1)  # (N,)
+    valid = ((gold != pad_id) & (gold != 1)).reshape(-1)
     if valid.sum().item() == 0:
         return pred_logits.new_tensor(0.0)
 
@@ -276,7 +291,9 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         np.set_printoptions(threshold=np.inf)
         gold = tgt[:, 1:]
 
-        n_words = gold.data.ne(Constants.PAD).sum().float()
+        # n_words = gold.data.ne(Constants.PAD).sum().float()
+        valid_mask = (gold != Constants.PAD) & (gold != 1)
+        n_words = valid_mask.sum().float()
         n_total_words += n_words
         batch_num += tgt.size(0)
 
@@ -415,8 +432,8 @@ def train_model(MSHGAT, data_path):
               'elapse: {elapse:3.3f} min'.format(
             loss=train_loss, accu=100 * train_accu,
             elapse=(time.time() - start) / 60))
-        print('auc_test: {:.10f}'.format(np.mean(train_auc)),
-              'acc_test: {:.10f}'.format(np.mean(train_acc)))
+        print('auc_train: {:.10f}'.format(np.mean(train_auc)),
+              'acc_train: {:.10f}'.format(np.mean(train_acc)))
 
         # ==================== 新增：打印权重信息 ====================
         print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} | Distill: {w_distill:.4f}')
@@ -424,12 +441,12 @@ def train_model(MSHGAT, data_path):
 
         if epoch_i >= 0:
             start = time.time()
-            scores, auc_test, acc_test = test_epoch(model, valid_data, relation_graph, hypergraph_list, kt_loss)
+            scores, auc_valid, acc_valid = test_epoch(model, valid_data, relation_graph, hypergraph_list, kt_loss)
             print('  - ( Validation )) ')
             for metric in scores.keys():
                 print(metric + ' ' + str(scores[metric]))
-            print('auc_test: {:.10f}'.format(np.mean(auc_test)),
-                  'acc_test: {:.10f}'.format(np.mean(acc_test)))
+            print('auc_valid: {:.10f}'.format(np.mean(auc_valid)),
+                  'acc_valid: {:.10f}'.format(np.mean(acc_valid)))
             print("Validation use time: ", (time.time() - start) / 60, "min")
 
             print('  - (Test) ')
@@ -448,8 +465,8 @@ def train_model(MSHGAT, data_path):
             # 3. 早停逻辑核心判断
             is_improved = False  # 设立一个标志位，记录这一轮是否有任何一个指标变好
 
-            if scores["hits@20"] > best_rec_hit:
-                best_rec_hit = scores["hits@20"]
+            if validation_history <= sum(scores.values()):
+                validation_history = sum(scores.values())
                 torch.save(model.state_dict(), opt.save_rec_path)
                 print("Save Best Recommendation Model!")
                 best_scores = scores
