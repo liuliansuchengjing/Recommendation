@@ -487,7 +487,7 @@ def train_model(MSHGAT, data_path):
                 patience_counter = 0  # 只要有任何一个指标提升，清零重新计数
             else:
                 patience_counter += 1  # 两个都没提升，计数器 +1
-                print(f"⚠️ Early stopping counter: {patience_counter} out of {patience}")
+                print(f" Early stopping counter: {patience_counter} out of {patience}")
 
             # 5. 触发早停
             if patience_counter >= patience:
@@ -498,7 +498,7 @@ def train_model(MSHGAT, data_path):
     for metric in best_scores.keys():
         print(metric + ' ' + str(best_scores[metric]))
 
-    print("\n 🏆 Best Knowledge Tracing scores: ")
+    print("\n Best Knowledge Tracing scores: ")
     for metric in best_kt_metrics.keys():
         print(f"    {metric}: {best_kt_metrics[metric]:.4f}")
 
@@ -707,7 +707,7 @@ def test_model(MSHGAT, data_path):
     # 6. 测试知识追踪模型 (KT Model) - 只看 KT 指标
     # =========================================================
     print('\n=======================================')
-    print('  🧠 Testing Knowledge Tracing Model...')
+    print('  Testing Knowledge Tracing Model...')
     print('=======================================')
     # 使用 model_kt 跑测试
     _, auc_test, acc_test = test_epoch(model_kt, test_data, relation_graph, hypergraph_list, kt_loss,
