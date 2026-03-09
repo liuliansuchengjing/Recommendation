@@ -17,7 +17,7 @@ from Metrics import Metrics, KTLoss
 from HGAT import MSHGAT
 from Optim import ScheduledOptim
 from calculate_muti_obj import gain_test_model, learning_effect_loss, learning_adaptive_loss
-
+import torch.nn.functional as F
 torch.backends.cudnn.deterministic = True
 torch.manual_seed(0)
 torch.cuda.manual_seed_all(0)
@@ -617,5 +617,5 @@ if __name__ == "__main__":
     train_model(model, opt.data_name)
     # test_model(model, opt.data_name)
     # # 多目标评价指标计算
-    # gain_test_model(model, opt.data_name, opt)
+    gain_test_model(model, opt.data_name, opt)
 
