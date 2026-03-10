@@ -376,7 +376,7 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
 
 def train_model(MSHGAT, data_path):
     # ========= Preparing DataLoader =========#
-    user_size, total_cascades, timestamps, train, valid, test = Split_data(data_path, opt.train_rate, opt.valid_rate,
+    resource_size, total_cascades, timestamps, train, valid, test = Split_data(data_path, opt.train_rate, opt.valid_rate,
                                                                            load_dict=True)
 
     train_data = DataLoader(train, batch_size=opt.batch_size, load_dict=True, cuda=False)
@@ -384,9 +384,9 @@ def train_model(MSHGAT, data_path):
     test_data = DataLoader(test, batch_size=opt.batch_size, load_dict=True, cuda=False)
 
     relation_graph = ConRelationGraph(data_path)
-    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)
+    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, resource_size)
 
-    opt.user_size = user_size
+    opt.resource_size = resource_size
 
     # 1. 定义两个不同的最高分记录
     best_rec_hit = 0.0
@@ -678,16 +678,16 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
 def test_model(MSHGAT, data_path):
     kt_loss = KTLoss()
     # 1. 获取数据，务必接收 train_history_cas 和 train_history_t 用于纯净建图
-    user_size, total_cascades, timestamps, train, valid, test = Split_data(data_path, opt.train_rate, opt.valid_rate,
+    resource_size, total_cascades, timestamps, train, valid, test = Split_data(data_path, opt.train_rate, opt.valid_rate,
                                                                            load_dict=True)
 
     test_data = DataLoader(test, batch_size=opt.batch_size, load_dict=True, cuda=False)
 
     # 2. 永远只用训练集历史来建图！(防止任何测试集泄露)
     relation_graph = ConRelationGraph(data_path)
-    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)
+    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, resource_size)
 
-    opt.user_size = user_size
+    opt.resource_size = resource_size
 
     # model = MSHGAT(opt, dropout=opt.dropout)
     # model.load_state_dict(torch.load(opt.save_path))

@@ -61,7 +61,7 @@ class HGNNLayer(nn.Module):
         return x, edge
 
 
-def get_previous_user_mask(seq, user_size):
+def get_previous_user_mask(seq, resource_size):
     ''' Mask previous activated users.'''
     assert seq.dim() == 2
     prev_shape = (seq.size(0), seq.size(1), seq.size(1))
@@ -77,7 +77,7 @@ def get_previous_user_mask(seq, user_size):
     if seq.is_cuda:
         PAD_tmp = PAD_tmp.cuda()
     masked_seq = torch.cat([masked_seq, PAD_tmp], dim=2)
-    ans_tmp = torch.zeros(seq.size(0), seq.size(1), user_size)
+    ans_tmp = torch.zeros(seq.size(0), seq.size(1), resource_size)
     if seq.is_cuda:
         ans_tmp = ans_tmp.cuda()
     masked_seq = ans_tmp.scatter_(2, masked_seq.long(), float(-1000))
@@ -195,7 +195,7 @@ class MSHGAT(nn.Module):
     def __init__(self, opt, dropout=0.3):
         super(MSHGAT, self).__init__()
         self.hidden_size = opt.d_word_vec
-        self.n_node = opt.user_size
+        self.n_node = opt.resource_size
         self.dropout = nn.Dropout(dropout)
         self.initial_feature = opt.initialFeatureSize
 
@@ -234,8 +234,8 @@ class MSHGAT(nn.Module):
             multiscale=False
         )
 
-        self.num_skills = opt.user_size
-        self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
+        self.num_skills = opt.resource_size
+        self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills, opt.data_name)
 
         # 定义三个可学习的对数方差参数（初始化为0）
         self.log_var_rec = nn.Parameter(torch.zeros(1))
@@ -414,7 +414,7 @@ class KTOnlyModel(nn.Module):
 #         return x, edge
 #
 #
-# def get_previous_user_mask(seq, user_size):
+# def get_previous_user_mask(seq, resource_size):
 #     ''' Mask previous activated users.'''
 #     assert seq.dim() == 2
 #     prev_shape = (seq.size(0), seq.size(1), seq.size(1))
@@ -430,7 +430,7 @@ class KTOnlyModel(nn.Module):
 #     if seq.is_cuda:
 #         PAD_tmp = PAD_tmp.cuda()
 #     masked_seq = torch.cat([masked_seq, PAD_tmp], dim=2)
-#     ans_tmp = torch.zeros(seq.size(0), seq.size(1), user_size)
+#     ans_tmp = torch.zeros(seq.size(0), seq.size(1), resource_size)
 #     if seq.is_cuda:
 #         ans_tmp = ans_tmp.cuda()
 #     masked_seq = ans_tmp.scatter_(2, masked_seq.long(), float(-1000))
@@ -548,7 +548,7 @@ class KTOnlyModel(nn.Module):
 #     def __init__(self, opt, dropout=0.3):
 #         super(MSHGAT, self).__init__()
 #         self.hidden_size = opt.d_word_vec
-#         self.n_node = opt.user_size
+#         self.n_node = opt.resource_size
 #         self.dropout = nn.Dropout(dropout)
 #         self.initial_feature = opt.initialFeatureSize
 #
@@ -586,7 +586,7 @@ class KTOnlyModel(nn.Module):
 #             multiscale=False
 #         )
 #
-#         self.num_skills = opt.user_size
+#         self.num_skills = opt.resource_size
 #         self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
 #
 #         # 知识感知自注意力

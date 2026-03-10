@@ -31,7 +31,7 @@ def Split_data(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_
     u2idx = {}
     idx2u = []
     if not load_dict:
-        user_size, u2idx, idx2u = buildIndex(options.data)
+        resource_size, u2idx, idx2u = buildIndex(options.data)
         with open(options.u2idx_dict, 'wb') as handle:
             pickle.dump(u2idx, handle, protocol=pickle.HIGHEST_PROTOCOL)
         with open(options.idx2u_dict, 'wb') as handle:
@@ -41,7 +41,7 @@ def Split_data(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_
             u2idx = pickle.load(handle)
         with open(options.idx2u_dict, 'rb') as handle:
             idx2u = pickle.load(handle)
-        user_size = len(u2idx)
+        resource_size = len(u2idx)
 
     t_cascades = []
     timestamps = []
@@ -123,9 +123,9 @@ def Split_data(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_
     print("average length:%f" % (total_len / len(t_cascades)))
     print('maximum length:%f' % (max(len(cas) for cas in t_cascades)))
     print('minimum length:%f' % (min(len(cas) for cas in t_cascades)))
-    print("user size:%d" % (user_size - 2))
+    print("resource size:%d" % (resource_size - 2))
 
-    return user_size, train_history_cas, train_history_t, train, valid, test
+    return resource_size, train_history_cas, train_history_t, train, valid, test
 
 
 def buildIndex(data):
@@ -162,9 +162,9 @@ def buildIndex(data):
         u2idx[user] = pos
         idx2u.append(user)
         pos += 1
-    user_size = len(user_set) + 2
-    print("user_size : %d" % (user_size))
-    return user_size, u2idx, idx2u
+    resource_size = len(user_set) + 2
+    print("resource_size : %d" % (resource_size))
+    return resource_size, u2idx, idx2u
 
 
 class DataLoader(object):
