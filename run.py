@@ -677,7 +677,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
                 if len(target_set) > 0:
                     # 提前算一下学生还没做这5道题之前的初始掌握度
                     hidden_kt_eval = model.gnn(graph)
-                    _, _, yt_init_eval, _ = kt_loss.ktmodel(hidden_kt_eval, hist_seq, hist_ans) if hasattr(kt_loss,
+                    _, _, yt_init_eval, _, _ = kt_loss.ktmodel(hidden_kt_eval, hist_seq, hist_ans) if hasattr(kt_loss,
                                                                                                            'ktmodel') else model.ktmodel(
                         hidden_kt_eval, hist_seq, hist_ans)
                     p_init = yt_init_eval[0, -1, :]
