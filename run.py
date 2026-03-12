@@ -675,6 +675,13 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
                 target_set = [int(x) for x in target_seq[0].cpu().numpy() if x > 1]
 
                 if len(target_set) > 0:
+                    # 提前算一下学生还没做这5道题之前的初始掌握度
+                    hidden_kt_eval = model.gnn(graph)
+                    _, _, yt_init_eval, _ = kt_loss.ktmodel(hidden_kt_eval, hist_seq, hist_ans) if hasattr(kt_loss,
+                                                                                                           'ktmodel') else model.ktmodel(
+                        hidden_kt_eval, hist_seq, hist_ans)
+                    p_init = yt_init_eval[0, -1, :]
+                    ep_init = sum([p_init[t_id].item() for t_id in target_set])
                     # 2. 计算真实轨迹的收益 (Real EP)
                     real_seq = tgt[0:1, :20]
                     real_ans = ans[0:1, :20]
