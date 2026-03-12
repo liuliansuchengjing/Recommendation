@@ -305,9 +305,6 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
 
         # loss
         # loss, n_correct = get_performance(loss_func, pred, gold)
-        loss_rec, n_correct = get_performance(loss_func, pred, gold)
-
-        loss_kt, auc, acc = kt_loss(pred_res, ans, kt_mask)
 
         # y_gold = tgt[:, 1:].contiguous().view(-1).cpu().numpy()  # 维度: [(batch_size * (seq_len - 1))]
         # y_pred = pred.detach().cpu().numpy()  # 维度: [batch_size*seq_len-1, num_skills]
@@ -504,7 +501,7 @@ def train_model(MSHGAT, data_path):
         print(f"    {metric}: {best_kt_metrics[metric]:.4f}")
 
 
-def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[5, 10, 20]):
+def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[1, 5, 10, 20]):
     ''' Epoch operation in evaluation phase '''
     model.eval()
     auc_test = []
@@ -703,7 +700,7 @@ def test_model(MSHGAT, data_path):
 
     # 使用 model_rec 跑测试
     scores, _, _ = test_epoch(model_rec, test_data, relation_graph, hypergraph_list, kt_loss,
-                                            k_list=[5, 10, 20, 30, 40, 50])
+                                            k_list=[1, 5, 10, 20])
     # =========================================================
     # 6. 测试知识追踪模型 (KT Model) - 只看 KT 指标
     # =========================================================
