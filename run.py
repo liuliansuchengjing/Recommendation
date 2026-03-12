@@ -18,6 +18,7 @@ from HGAT import MSHGAT
 from Optim import ScheduledOptim
 from calculate_muti_obj import gain_test_model, learning_effect_loss, learning_adaptive_loss
 import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 torch.backends.cudnn.deterministic = True
 torch.manual_seed(0)
 torch.cuda.manual_seed_all(0)
@@ -52,6 +53,63 @@ parser.add_argument('--distill_eps', type=float, default=1e-12)     # log/softma
 
 opt = parser.parse_args()
 opt.d_word_vec = opt.d_model
+
+def compute_kt_clf_metrics(y_prob, y_true, mask):
+    """
+    计算二分类任务的 Acc, Precision, Recall, F1
+    y_prob: 模型的预测概率 (Tensor)
+    y_true: 真实的标签 (Tensor)
+    mask: 有效位掩码 (Tensor)
+    """
+    # 1. 展平并转为 numpy
+    y_prob_flat = y_prob.view(-1).detach().cpu().numpy()
+    y_true_flat = y_true.view(-1).detach().cpu().numpy()
+    mask_flat = mask.view(-1).detach().cpu().bool().numpy()
+
+    # 2. 用 mask 过滤掉 PAD 和 无效部分
+    valid_prob = y_prob_flat[mask_flat]
+    valid_true = y_true_flat[mask_flat]
+
+    if len(valid_true) == 0:
+        return -1, -1, -1, -1
+
+    # 3. 将概率转换为 0 或 1 的硬标签 (阈值 0.5)
+    valid_pred = (valid_prob >= 0.5).astype(int)
+
+    # 4. 调用 sklearn 计算指标 (zero_division=0 防止分母为0时报错)
+    acc = accuracy_score(valid_true, valid_pred)
+    p = precision_score(valid_true, valid_pred, zero_division=0)
+    r = recall_score(valid_true, valid_pred, zero_division=0)
+    f1 = f1_score(valid_true, valid_pred, zero_division=0)
+
+    return acc, p, r, f1
+
+
+def compute_rec_clf_metrics(y_pred_logits, y_true, pad_id=0, skip_id=1):
+    """
+    计算推荐任务 (多分类 Top-1) 的 Acc, Precision, Recall, F1
+    y_pred_logits: 推荐模型的预测输出 (N, num_items) numpy array
+    y_true: 真实的下一题 ID (N,) numpy array
+    """
+    # 1. 过滤掉无效的 PAD 和 Skip 标记
+    valid_mask = (y_true != pad_id) & (y_true != skip_id)
+    valid_true = y_true[valid_mask]
+
+    if len(valid_true) == 0:
+        return -1, -1, -1, -1
+
+    # 2. 获取模型预测概率最高的那道题 (Top-1)
+    valid_logits = y_pred_logits[valid_mask]
+    valid_pred = np.argmax(valid_logits, axis=1)
+
+    # 3. 计算多分类指标 (必须指定 average='weighted' 应对极度不平衡的题库)
+    acc = accuracy_score(valid_true, valid_pred)
+    p = precision_score(valid_true, valid_pred, average='weighted', zero_division=0)
+    r = recall_score(valid_true, valid_pred, average='weighted', zero_division=0)
+    f1 = f1_score(valid_true, valid_pred, average='weighted', zero_division=0)
+
+    return acc, p, r, f1
+
 
 def kt_rerank_logits_numpy(logits_np, yt_tensor, base_k=100, beta=1.0, pad_id=0, skip_id=1, eps=1e-12):
     """
@@ -325,15 +383,15 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         # 1. 拿到三个原始损失 (Raw Loss)
         loss_rec_raw, n_correct = get_performance(loss_func, pred, gold)
         loss_kt_raw, auc, acc = kt_loss(pred_res, ans, kt_mask)
-        loss_distill_raw = kt_guided_distill_loss(
-            pred_logits=pred,  # (B*(T-1), V)
-            yt=yt,  # (B, T-1, V)
-            gold=gold,  # (B, T-1)
-            k=opt.distill_k,
-            tau=opt.distill_tau,
-            pad_id=Constants.PAD,
-            eps=opt.distill_eps,
-        )
+        # loss_distill_raw = kt_guided_distill_loss(
+        #     pred_logits=pred,  # (B*(T-1), V)
+        #     yt=yt,  # (B, T-1, V)
+        #     gold=gold,  # (B, T-1)
+        #     k=opt.distill_k,
+        #     tau=opt.distill_tau,
+        #     pad_id=Constants.PAD,
+        #     eps=opt.distill_eps,
+        # )
 
         # 2. 分别计算三个任务的自适应权重，并加权
         # 公式：(1 / e^log_var) * Raw_Loss + log_var
@@ -504,8 +562,11 @@ def train_model(MSHGAT, data_path):
 def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[1, 5, 10, 20]):
     ''' Epoch operation in evaluation phase '''
     model.eval()
-    auc_test = []
-    acc_test = []
+    # KT 的指标列表
+    auc_test, acc_test = [], []
+    p_test_kt, r_test_kt, f1_test_kt = [], [], []
+    # ✅ 新增：推荐任务 (Rec) 的 Top-1 指标列表
+    acc_test_rec, p_test_rec, r_test_rec, f1_test_rec = [], [], [], []
     scores = {}
     for k in k_list:
         scores['hits@' + str(k)] = 0
@@ -536,6 +597,15 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
             #     paper_totals[m]["FN"] += fn
 
             y_pred = pred.detach().cpu().numpy()
+            # =========================================================
+            # ✅ 新增：计算推荐任务 (Rec) 的 Top-1 分类指标
+            # =========================================================
+            rec_acc, rec_p, rec_r, rec_f1 = compute_rec_clf_metrics(y_pred, y_gold)
+            if rec_acc != -1:
+                acc_test_rec.append(rec_acc)
+                p_test_rec.append(rec_p)
+                r_test_rec.append(rec_r)
+                f1_test_rec.append(rec_f1)
             # ===== KT rerank (evaluation only) =====
             USE_KT_RERANK = False  # 你也可以换成 argparse 参数
             if USE_KT_RERANK:
@@ -552,11 +622,18 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
             loss_kt, auc, acc = kt_loss(pred_res.cpu(), ans.cpu(),
                                         kt_mask.cpu())  # ====================================================================
             if auc != -1 and acc != -1:  # ========================================================================================
-                auc_test.append(
-                    auc)  # ====================================================================================
-                acc_test.append(
-                    acc)  # ==========================================================================================
+                auc_test.append(auc)  # ====================================================================================
+                acc_test.append(acc)  # ==========================================================================================
 
+            # =========================================================
+            # ✅ 新增：计算 Precision, Recall, F1
+            # 这里的 pred_res 是知识追踪预测的概率，ans 是真实答案，kt_mask 是掩码
+            batch_acc, batch_p, batch_r, batch_f1 = compute_kt_clf_metrics(pred_res, ans, kt_mask)
+            if batch_acc != -1:
+                p_test_kt.append(batch_p)
+                r_test_kt.append(batch_r)
+                f1_test_kt.append(batch_f1)
+            # =========================================================
             scores_batch, scores_len = metric.compute_metric(y_pred, y_gold, k_list)
 
             # # 论文同款：path-level P/R/F1（按不同 m 分别算）
@@ -589,7 +666,15 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
     #     P, R, F1 = paper_scores[m]
     #     print(f"[FINAL PRF] m={m}  P={P:.4f} R={R:.4f} F1={F1:.4f}")
 
+    # ✅ 新增：在终端直接打印出这三个指标的平均值
+    print('  [KT Metrics] Precision: {:.4f} | Recall: {:.4f} | F1: {:.4f}'.format(
+        np.mean(p_test_kt), np.mean(r_test_kt), np.mean(f1_test_kt)
+    ))
+    print('  [Rec Top-1]   Accuracy: {:.4f} | Precision: {:.4f} | Recall: {:.4f} | F1: {:.4f}'.format(
+        np.mean(acc_test_rec), np.mean(p_test_rec), np.mean(r_test_rec), np.mean(f1_test_rec)
+    ))
     return scores, auc_test, acc_test
+
 
 # def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[5, 10, 20],
 #                show_examples=True):
