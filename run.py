@@ -629,7 +629,77 @@ def generate_ep_greedy_path(model_rec, model_kt, hist_seq, hist_ans, target_set,
 
     return generated_path
 
-def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[1, 5, 10, 20]):
+
+def generate_dynamic_ep_path(model_rec, model_kt, hist_seq, hist_ans, target_pred, graph, max_length=10,
+                             candidate_size=150):
+    """
+    动态变长路径生成器：针对预测目标 (target_pred) 寻找最短且 EP 收益最高的路径
+    """
+    generated_path = []
+    current_seq = hist_seq.clone()
+    current_ans = hist_ans.clone()
+
+    with torch.no_grad():
+        hidden_kt = model_kt.gnn(graph)
+        _, _, yt_init, _,_ = model_kt.ktmodel(hidden_kt, current_seq, current_ans)
+        p_current = yt_init[0, -1, :]
+
+        for step in range(max_length):  # 最多允许生成 max_length 道题
+            # 1. 动态更新推荐候选池 (随着序列变长，推荐也会变)
+            pred_logits, _, _, _, _, _ = model_rec(current_seq, current_seq, current_seq, current_ans, graph, None)
+            last_step_logits = pred_logits[-1, :]
+            topk_candidates = torch.topk(last_step_logits, candidate_size).indices.cpu().numpy()
+
+            best_candidate = -1
+            max_ep_gain = -999.0
+            best_p_next = None
+
+            # 2. 遍历候选池，计算对预测目标的归一化 EP 收益
+            for cand_id in topk_candidates:
+                cand_id = int(cand_id)
+                # 过滤无效题目和已做题目（注意：这里不禁止推荐 target_pred 里的题了！因为如果是必须做的题，可以直接推）
+                if cand_id <= 1 or cand_id in generated_path or cand_id in current_seq[0].cpu().numpy():
+                    continue
+
+                sim_seq = torch.cat([current_seq, torch.tensor([[cand_id]], device=current_seq.device)], dim=1)
+                sim_ans = torch.cat([current_ans, torch.tensor([[1]], device=current_ans.device)], dim=1)
+
+                _, _, yt_sim, _,_ = model_kt.ktmodel(hidden_kt, sim_seq, sim_ans)
+                p_sim = yt_sim[0, -1, :]
+
+                # 计算针对 【预测目标 target_pred】 的边际归一化增益
+                ep_gain = 0.0
+                for t_id in target_pred:
+                    gain = p_sim[t_id].item() - p_current[t_id].item()
+                    room = 1.0 - p_current[t_id].item()
+                    ep_gain += gain / (room + 1e-9)
+
+                if ep_gain > max_ep_gain:
+                    max_ep_gain = ep_gain
+                    best_candidate = cand_id
+                    best_p_next = p_sim
+
+            # 3. 核心机制：边际收益早停 (Early Stopping) 保证路径最短
+            # 如果加上这道题，对所有预测目标的总归一化收益提升不到 0.01，说明已经“学透了”，立刻停止生成
+            if max_ep_gain < 0.01:
+                break
+
+                # 4. 否则，将该题加入路径，推进状态
+            if best_candidate != -1:
+                generated_path.append(best_candidate)
+                current_seq = torch.cat([current_seq, torch.tensor([[best_candidate]], device=current_seq.device)],
+                                        dim=1)
+                current_ans = torch.cat([current_ans, torch.tensor([[1]], device=current_ans.device)], dim=1)
+                p_current = best_p_next
+            else:
+                break
+
+    return generated_path
+
+
+def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evaluator=None, k_list=[1, 5, 10, 20]):
+    # 如果没有传，就用自己；传了，就用最优的 kt 模型当裁判
+    kt_referee = kt_evaluator if kt_evaluator is not None else model
     ''' Epoch operation in evaluation phase '''
     model.eval()
     # KT 的指标列表
@@ -661,81 +731,164 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
             y_gold = tgt[:, 1:].contiguous().view(-1).detach().cpu().numpy()
 
             # =========================================================
-            # ✅ 新增：动态前瞻路径生成与 EP 收益对比验证 (仅在第一维度的 Batch 上采样验证)
-            # 为了节约测试时间，我们只取 Batch 里的第一个学生 (b=0) 并且序列长度足够长的来验证
+            # ✅ 新增：严谨的离线评估 (预测目标生成 vs 真实目标评估)
             # =========================================================
             valid_len = (tgt[0] > 1).sum().item()
-            if valid_len > 20:  # 只评估做了 20 题以上的学生
-                # 1. 拆分历史序列(前15题) 和 隐式目标(第16-20题)
-                hist_seq = tgt[0:1, :15].cuda()  # [1, 15] 确保在GPU上
+            if valid_len > 20:
+                # 1. 切分历史序列
+                hist_seq = tgt[0:1, :15].cuda()
                 hist_ans = ans[0:1, :15].cuda()
 
-                target_seq = tgt[0:1, 15:20]
-                # 提取目标的 ID 列表 (过滤 0 和 1)
-                target_set = [int(x) for x in target_seq[0].cpu().numpy() if x > 1]
+                # 2. 提取【真实学习目标 target_actual】 (也就是未来真实的 5 道题)
+                target_actual_seq = tgt[0:1, 15:20]
+                target_actual = [int(x) for x in target_actual_seq[0].cpu().numpy() if x > 1]
 
-                if len(target_set) > 0:
-                    # 提前算一下学生还没做这5道题之前的初始掌握度
+                if len(target_actual) > 0:
+                    # 3. 让推荐模型推测【预测学习目标 target_pred】
+                    hist_pred, _, _, _, _, _ = model(hist_seq, tgt_timestamp[0:1, :15], tgt_idx[0:1, :15], hist_ans,
+                                                     graph, hypergraph_list)
+                    last_logits = hist_pred[-1, :]
+                    top5_preds = torch.topk(last_logits, 5).indices.cpu().numpy()
+                    target_pred = [int(x) for x in top5_preds if x > 1]
+
+                    # 4. 计算初始掌握度 (针对真实目标 target_actual 算基准)
                     hidden_kt_eval = model.gnn(graph)
-                    _, _, yt_init_eval, _, _ = kt_loss.ktmodel(hidden_kt_eval, hist_seq, hist_ans) if hasattr(kt_loss,
+                    _, _, yt_init_eval, _,_ = kt_loss.ktmodel(hidden_kt_eval, hist_seq, hist_ans) if hasattr(kt_loss,
                                                                                                            'ktmodel') else model.ktmodel(
                         hidden_kt_eval, hist_seq, hist_ans)
                     p_init = yt_init_eval[0, -1, :]
-                    ep_init = sum([p_init[t_id].item() for t_id in target_set])
-                    # 2. 计算真实轨迹的收益 (Real EP)
-                    real_seq = tgt[0:1, :20]
-                    real_ans = ans[0:1, :20]
 
-                    hidden_kt_eval = model.gnn(graph)
-                    _, _, yt_real, _, _ = kt_loss.ktmodel(hidden_kt_eval, real_seq, real_ans) if hasattr(kt_loss,
-                                                                                                      'ktmodel') else model.ktmodel(
-                        hidden_kt_eval, real_seq, real_ans)
-                    p_real = yt_real[0, -1, :]  # 真实轨迹做完 20 题后的掌握度
-                    ep_real = 0.0
-                    for t_id in target_set:
-                        gain_real = p_real[t_id].item() - p_init[t_id].item()
-                        room = 1.0 - p_init[t_id].item()
-                        ep_real += gain_real / (room + 1e-9)
+                    # 过滤学霸：只看对真实目标提升空间足够大的样本
+                    ep_init_abs = sum([p_init[t_id].item() for t_id in target_actual])
+                    if ep_init_abs < len(target_actual) * 0.8:
 
-                    # 3. 算法生成：基于前 15 题，生成 5 题的贪心推荐路径
-                    gen_path = generate_ep_greedy_path(
-                        model_rec=model,
-                        model_kt=model,
-                        hist_seq=hist_seq,
-                        hist_ans=hist_ans,
-                        target_set=target_set,
-                        graph=graph,
-                        path_length=len(target_set),
-                        candidate_size=50
-                    )
+                        # --- 5. 评估学生真实的瞎做路径 (Base EP) ---
+                        # 注意：评估的标准始终是 target_actual
+                        real_seq = tgt[0:1, :20].cuda()
+                        real_ans = ans[0:1, :20].cuda()
+                        _, _, yt_base, _,_ = kt_referee.ktmodel(hidden_kt_eval, real_seq, real_ans)
+                        p_base = yt_base[0, -1, :]
 
-                    # 4. 计算生成轨迹的收益 (Generated EP)
-                    if len(gen_path) == len(target_set):
-                        gen_seq = torch.cat([hist_seq, torch.tensor([gen_path], device='cuda')], dim=1)
-                        gen_ans = torch.cat([hist_ans, torch.ones((1, len(gen_path)), device='cuda')], dim=1)
+                        ep_base = 0.0
+                        for t_id in target_actual:
+                            gain = p_base[t_id].item() - p_init[t_id].item()
+                            ep_base += gain / (1.0 - p_init[t_id].item() + 1e-9)
 
-                        _, _, yt_gen, _, _ = model.ktmodel(hidden_kt_eval, gen_seq, gen_ans)
-                        p_gen = yt_gen[0, -1, :]
-                        ep_gen = 0.0
-                        for t_id in target_set:
-                            gain_gen = p_gen[t_id].item() - p_init[t_id].item()
-                            room = 1.0 - p_init[t_id].item()
-                            ep_gen += gain_gen / (room + 1e-9)
+                        # --- 6. 算法登场：为了 target_pred 生成变长优化路径 ---
+                        gen_path = generate_dynamic_ep_path(
+                            model_rec=model,
+                            model_kt=model,
+                            hist_seq=hist_seq,
+                            hist_ans=hist_ans,
+                            target_pred=target_pred,  # 🎯 算法只知道预测目标！
+                            graph=graph,
+                            max_length=10,  # 允许最多生成10道题
+                            candidate_size=150
+                        )
 
-                        # 5. 打印震撼对比结果！
-                        delta_ep = ep_gen - ep_real
-                        print(f"\n[路径生成对决] Target Set (目标题): {target_set}")
-                        print(
-                            f"   => 真实路径: {[int(x) for x in real_seq[0, 15:20].cpu().numpy()]} | 真实 EP 得分: {ep_real:.4f}")
-                        print(f"   => 算法路径: {gen_path} | 算法 EP 得分: {ep_gen:.4f}")
-                        print(
-                            f"   => 净收益 (Delta EP): {delta_ep:+.4f}  <-- {'🚀 算法完胜！' if delta_ep > 0 else '📉 算法落败'}")
-                        # ✅ 新增：将当前样本的得分累加到全局池子里
-                        total_ep_real += ep_real
-                        total_ep_gen += ep_gen
-                        total_delta_ep += delta_ep
-                        valid_ep_samples += 1
+                        # --- 7. 终极审判：评估生成路径在 target_actual 上的收益 (Opt EP) ---
+                        if len(gen_path) > 0:
+                            opt_seq = torch.cat([hist_seq, torch.tensor([gen_path]).cuda()], dim=1)
+                            opt_ans = torch.cat([hist_ans, torch.ones((1, len(gen_path))).cuda()], dim=1)
+                            _, _, yt_opt, _,_ = kt_referee.ktmodel(hidden_kt_eval, opt_seq, opt_ans)
+                            p_opt = yt_opt[0, -1, :]
+
+                            ep_opt = 0.0
+                            for t_id in target_actual:  # 🎯 打分始终看真实目标！
+                                gain = p_opt[t_id].item() - p_init[t_id].item()
+                                ep_opt += gain / (1.0 - p_init[t_id].item() + 1e-9)
+
+                            delta_ep = ep_opt - ep_base
+
+                            # 全局累加
+                            total_ep_real += ep_base
+                            total_ep_gen += ep_opt
+                            total_delta_ep += delta_ep
+                            valid_ep_samples += 1
+
+                            print(f"\n[终极盲测对决] 算法预测目标: {target_pred} | 真实隐式目标: {target_actual}")
+                            print(
+                                f"   => 真实路径 (长度 {len(target_actual)}): {target_actual} | 归一化 EP: {ep_base:.4f}")
+                            print(f"   => 算法路径 (长度 {len(gen_path)}): {gen_path} | 归一化 EP: {ep_opt:.4f}")
+                            print(
+                                f"   => 净收益 (Delta): {delta_ep:+.4f}  <-- {'🚀 盲测有效！' if delta_ep > 0 else '📉 盲测落败'}")
             # =========================================================
+            # # =========================================================
+            # # ✅ 新增：动态前瞻路径生成与 EP 收益对比验证 (仅在第一维度的 Batch 上采样验证)
+            # # 为了节约测试时间，我们只取 Batch 里的第一个学生 (b=0) 并且序列长度足够长的来验证
+            # # =========================================================
+            # valid_len = (tgt[0] > 1).sum().item()
+            # if valid_len > 20:  # 只评估做了 20 题以上的学生
+            #     # 1. 拆分历史序列(前15题) 和 隐式目标(第16-20题)
+            #     hist_seq = tgt[0:1, :15].cuda()  # [1, 15] 确保在GPU上
+            #     hist_ans = ans[0:1, :15].cuda()
+            #
+            #     target_seq = tgt[0:1, 15:20]
+            #     # 提取目标的 ID 列表 (过滤 0 和 1)
+            #     target_set = [int(x) for x in target_seq[0].cpu().numpy() if x > 1]
+            #
+            #     if len(target_set) > 0:
+            #         # 提前算一下学生还没做这5道题之前的初始掌握度
+            #         hidden_kt_eval = model.gnn(graph)
+            #         _, _, yt_init_eval, _, _ = kt_loss.ktmodel(hidden_kt_eval, hist_seq, hist_ans) if hasattr(kt_loss,
+            #                                                                                                'ktmodel') else model.ktmodel(
+            #             hidden_kt_eval, hist_seq, hist_ans)
+            #         p_init = yt_init_eval[0, -1, :]
+            #         ep_init = sum([p_init[t_id].item() for t_id in target_set])
+            #         # 2. 计算真实轨迹的收益 (Real EP)
+            #         real_seq = tgt[0:1, :20]
+            #         real_ans = ans[0:1, :20]
+            #
+            #         hidden_kt_eval = model.gnn(graph)
+            #         _, _, yt_real, _, _ = kt_loss.ktmodel(hidden_kt_eval, real_seq, real_ans) if hasattr(kt_loss,
+            #                                                                                           'ktmodel') else model.ktmodel(
+            #             hidden_kt_eval, real_seq, real_ans)
+            #         p_real = yt_real[0, -1, :]  # 真实轨迹做完 20 题后的掌握度
+            #         ep_real = 0.0
+            #         for t_id in target_set:
+            #             gain_real = p_real[t_id].item() - p_init[t_id].item()
+            #             room = 1.0 - p_init[t_id].item()
+            #             ep_real += gain_real / (room + 1e-9)
+            #
+            #         # 3. 算法生成：基于前 15 题，生成 5 题的贪心推荐路径
+            #         gen_path = generate_ep_greedy_path(
+            #             model_rec=model,
+            #             model_kt=model,
+            #             hist_seq=hist_seq,
+            #             hist_ans=hist_ans,
+            #             target_set=target_set,
+            #             graph=graph,
+            #             path_length=len(target_set),
+            #             candidate_size=50
+            #         )
+            #
+            #         # 4. 计算生成轨迹的收益 (Generated EP)
+            #         if len(gen_path) == len(target_set):
+            #             gen_seq = torch.cat([hist_seq, torch.tensor([gen_path], device='cuda')], dim=1)
+            #             gen_ans = torch.cat([hist_ans, torch.ones((1, len(gen_path)), device='cuda')], dim=1)
+            #
+            #             _, _, yt_gen, _, _ = model.ktmodel(hidden_kt_eval, gen_seq, gen_ans)
+            #             p_gen = yt_gen[0, -1, :]
+            #             ep_gen = 0.0
+            #             for t_id in target_set:
+            #                 gain_gen = p_gen[t_id].item() - p_init[t_id].item()
+            #                 room = 1.0 - p_init[t_id].item()
+            #                 ep_gen += gain_gen / (room + 1e-9)
+            #
+            #             # 5. 打印震撼对比结果！
+            #             delta_ep = ep_gen - ep_real
+            #             print(f"\n[路径生成对决] Target Set (目标题): {target_set}")
+            #             print(
+            #                 f"   => 真实路径: {[int(x) for x in real_seq[0, 15:20].cpu().numpy()]} | 真实 EP 得分: {ep_real:.4f}")
+            #             print(f"   => 算法路径: {gen_path} | 算法 EP 得分: {ep_gen:.4f}")
+            #             print(
+            #                 f"   => 净收益 (Delta EP): {delta_ep:+.4f}  <-- {'🚀 算法完胜！' if delta_ep > 0 else '📉 算法落败'}")
+            #             # ✅ 新增：将当前样本的得分累加到全局池子里
+            #             total_ep_real += ep_real
+            #             total_ep_gen += ep_gen
+            #             total_delta_ep += delta_ep
+            #             valid_ep_samples += 1
+            # # =========================================================
             # forward
             # pred = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
             pred, pred_res, kt_mask, yt, _, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)  # ==================================
@@ -852,7 +1005,7 @@ def test_model(MSHGAT, data_path):
     model_kt.load_state_dict(torch.load(opt.save_kt_path))
 
     # 使用 model_rec 跑测试
-    scores, _, _ = test_epoch(model_rec, test_data, relation_graph, hypergraph_list, kt_loss,
+    scores, _, _ = test_epoch(model_rec, test_data, relation_graph, hypergraph_list, kt_loss,kt_evaluator=model_kt,
                                             k_list=[1, 5, 10, 20])
     # =========================================================
     # 6. 测试知识追踪模型 (KT Model) - 只看 KT 指标
