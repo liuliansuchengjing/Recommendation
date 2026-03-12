@@ -607,7 +607,10 @@ def generate_ep_greedy_path(model_rec, model_kt, hist_seq, hist_ans, target_set,
                 # 3. 计算对 Target Set 的 EP 收益
                 ep_gain = 0.0
                 for target_id in target_set:
-                    ep_gain += (p_sim[target_id].item() - p_current[target_id].item())
+                    gain = p_sim[target_id].item() - p_current[target_id].item()
+                    room_for_improvement = 1.0 - p_current[target_id].item()
+                    # 加上 1e-9 防止除以 0 的极小概率事件
+                    ep_gain += gain / (room_for_improvement + 1e-9)
 
                 if ep_gain > max_ep_gain:
                     max_ep_gain = ep_gain
@@ -681,7 +684,11 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
                                                                                                       'ktmodel') else model.ktmodel(
                         hidden_kt_eval, real_seq, real_ans)
                     p_real = yt_real[0, -1, :]  # 真实轨迹做完 20 题后的掌握度
-                    ep_real = sum([p_real[t_id].item() for t_id in target_set])
+                    ep_real = 0.0
+                    for t_id in target_set:
+                        gain_real = p_real[t_id].item() - p_init[t_id].item()
+                        room = 1.0 - p_init[t_id].item()
+                        ep_real += gain_real / (room + 1e-9)
 
                     # 3. 算法生成：基于前 15 题，生成 5 题的贪心推荐路径
                     gen_path = generate_ep_greedy_path(
@@ -702,7 +709,11 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
 
                         _, _, yt_gen, _, _ = model.ktmodel(hidden_kt_eval, gen_seq, gen_ans)
                         p_gen = yt_gen[0, -1, :]
-                        ep_gen = sum([p_gen[t_id].item() for t_id in target_set])
+                        ep_gen = 0.0
+                        for t_id in target_set:
+                            gain_gen = p_gen[t_id].item() - p_init[t_id].item()
+                            room = 1.0 - p_init[t_id].item()
+                            ep_gen += gain_gen / (room + 1e-9)
 
                         # 5. 打印震撼对比结果！
                         delta_ep = ep_gen - ep_real
