@@ -745,8 +745,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
 
                 if len(target_actual) > 0:
                     # 3. 让推荐模型推测【预测学习目标 target_pred】
-                    hist_pred, _, _, _, _, _ = model(hist_seq, tgt_timestamp[0:1, :15], tgt_idx[0:1, :15], hist_ans,
-                                                     graph, hypergraph_list)
+                    hist_pred, _, _, _, _, _ = model(hist_seq, tgt_timestamp[0:1, :15], tgt_idx[0:1], hist_ans, graph, hypergraph_list)
                     last_logits = hist_pred[-1, :]
                     top5_preds = torch.topk(last_logits, 5).indices.cpu().numpy()
                     target_pred = [int(x) for x in top5_preds if x > 1]
