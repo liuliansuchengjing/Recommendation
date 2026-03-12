@@ -759,7 +759,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
 
                     # 过滤学霸：只看对真实目标提升空间足够大的样本
                     ep_init_abs = sum([p_init[t_id].item() for t_id in target_actual])
-                    if ep_init_abs < len(target_actual) * 0.8:
+                    if ep_init_abs < len(target_actual) * 1.0:
 
                         # --- 5. 评估学生真实的瞎做路径 (Base EP) ---
                         # 注意：评估的标准始终是 target_actual
