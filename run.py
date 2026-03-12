@@ -559,6 +559,73 @@ def train_model(MSHGAT, data_path):
         print(f"    {metric}: {best_kt_metrics[metric]:.4f}")
 
 
+def generate_ep_greedy_path(model_rec, model_kt, hist_seq, hist_ans, target_set, graph, path_length=5,
+                            candidate_size=50):
+    """
+    单目标 (EP) 贪心路径生成器
+    hist_seq: [1, seq_len] 历史序列
+    hist_ans: [1, seq_len] 历史作答记录
+    target_set: list 隐式目标题目的 ID
+    """
+    generated_path = []
+    current_seq = hist_seq.clone()
+    current_ans = hist_ans.clone()
+
+    with torch.no_grad():
+        # 获取 GNN 的图特征
+        hidden_kt = model_kt.gnn(graph)
+
+        # 跑一次 KT 获取初始对所有题目的掌握度
+        _, _, yt_init, _ = model_kt.ktmodel(hidden_kt, current_seq, current_ans)
+        p_current = yt_init[0, -1, :]
+
+        for step in range(path_length):
+            # 1. 用推荐模型获取 Top-K 候选池
+            pred_logits, _, _, _, _, _ = model_rec(current_seq, current_seq, current_seq, current_ans, graph, None)
+            last_step_logits = pred_logits[-1, :]
+            topk_candidates = torch.topk(last_step_logits, candidate_size).indices.cpu().numpy()
+
+            best_candidate = -1
+            max_ep_gain = -999.0
+            best_p_next = None
+
+            # 2. 遍历候选池，进行前瞻模拟
+            for cand_id in topk_candidates:
+                cand_id = int(cand_id)
+                # 过滤掉 PAD(0)、Skip(1) 以及已经做过的题
+                if cand_id <= 1 or cand_id in generated_path or cand_id in current_seq[0].cpu().numpy():
+                    continue
+
+                # 构造模拟序列: [当前序列, 候选题目]
+                sim_seq = torch.cat([current_seq, torch.tensor([[cand_id]], device=current_seq.device)], dim=1)
+                sim_ans = torch.cat([current_ans, torch.tensor([[1]], device=current_ans.device)], dim=1)  # 假设作对
+
+                # 送入 KT 模型模拟学习后的状态
+                _, _, yt_sim, _ = model_kt.ktmodel(hidden_kt, sim_seq, sim_ans)
+                p_sim = yt_sim[0, -1, :]  # 模拟学习后的掌握度
+
+                # 3. 计算对 Target Set 的 EP 收益
+                ep_gain = 0.0
+                for target_id in target_set:
+                    ep_gain += (p_sim[target_id].item() - p_current[target_id].item())
+
+                if ep_gain > max_ep_gain:
+                    max_ep_gain = ep_gain
+                    best_candidate = cand_id
+                    best_p_next = p_sim
+
+            # 4. 确定当前步的选择，更新状态
+            if best_candidate != -1:
+                generated_path.append(best_candidate)
+                current_seq = torch.cat([current_seq, torch.tensor([[best_candidate]], device=current_seq.device)],
+                                        dim=1)
+                current_ans = torch.cat([current_ans, torch.tensor([[1]], device=current_ans.device)], dim=1)
+                p_current = best_p_next
+            else:
+                break
+
+    return generated_path
+
 def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[1, 5, 10, 20]):
     ''' Epoch operation in evaluation phase '''
     model.eval()
@@ -578,14 +645,69 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
     paper_totals = {m: {"TP": 0, "FP": 0, "FN": 0} for m in paper_ms}
 
     with torch.no_grad():
-        for i, batch in enumerate(
-                validation_data):  # tqdm(validation_data, mininterval=2, desc='  - (Validation) ', leave=False):
+        for i, batch in enumerate(validation_data):  # tqdm(validation_data, mininterval=2, desc='  - (Validation) ', leave=False):
             # print("Validation batch ", i)
             # prepare data
             # tgt, tgt_timestamp, tgt_idx = batch
             tgt, tgt_timestamp, tgt_idx, ans = batch
             y_gold = tgt[:, 1:].contiguous().view(-1).detach().cpu().numpy()
 
+            # =========================================================
+            # ✅ 新增：动态前瞻路径生成与 EP 收益对比验证 (仅在第一维度的 Batch 上采样验证)
+            # 为了节约测试时间，我们只取 Batch 里的第一个学生 (b=0) 并且序列长度足够长的来验证
+            # =========================================================
+            valid_len = (tgt[0] > 1).sum().item()
+            if valid_len > 20:  # 只评估做了 20 题以上的学生
+                # 1. 拆分历史序列(前15题) 和 隐式目标(第16-20题)
+                hist_seq = tgt[0:1, :15]  # [1, 15]
+                hist_ans = ans[0:1, :15]
+
+                target_seq = tgt[0:1, 15:20]
+                # 提取目标的 ID 列表 (过滤 0 和 1)
+                target_set = [int(x) for x in target_seq[0].cpu().numpy() if x > 1]
+
+                if len(target_set) > 0:
+                    # 2. 计算真实轨迹的收益 (Real EP)
+                    real_seq = tgt[0:1, :20]
+                    real_ans = ans[0:1, :20]
+
+                    hidden_kt_eval = model.gnn(graph)
+                    _, _, yt_real, _ = kt_loss.ktmodel(hidden_kt_eval, real_seq, real_ans) if hasattr(kt_loss,
+                                                                                                      'ktmodel') else model.ktmodel(
+                        hidden_kt_eval, real_seq, real_ans)
+                    p_real = yt_real[0, -1, :]  # 真实轨迹做完 20 题后的掌握度
+                    ep_real = sum([p_real[t_id].item() for t_id in target_set])
+
+                    # 3. 算法生成：基于前 15 题，生成 5 题的贪心推荐路径
+                    gen_path = generate_ep_greedy_path(
+                        model_rec=model,
+                        model_kt=model,
+                        hist_seq=hist_seq,
+                        hist_ans=hist_ans,
+                        target_set=target_set,
+                        graph=graph,
+                        path_length=len(target_set),
+                        candidate_size=50
+                    )
+
+                    # 4. 计算生成轨迹的收益 (Generated EP)
+                    if len(gen_path) == len(target_set):
+                        gen_seq = torch.cat([hist_seq, torch.tensor([gen_path]).cuda()], dim=1)
+                        gen_ans = torch.cat([hist_ans, torch.ones((1, len(gen_path))).cuda()], dim=1)
+
+                        _, _, yt_gen, _ = model.ktmodel(hidden_kt_eval, gen_seq, gen_ans)
+                        p_gen = yt_gen[0, -1, :]
+                        ep_gen = sum([p_gen[t_id].item() for t_id in target_set])
+
+                        # 5. 打印震撼对比结果！
+                        delta_ep = ep_gen - ep_real
+                        print(f"\n[路径生成对决] Target Set (目标题): {target_set}")
+                        print(
+                            f"   => 真实路径: {[int(x) for x in real_seq[0, 15:20].cpu().numpy()]} | 真实 EP 得分: {ep_real:.4f}")
+                        print(f"   => 算法路径: {gen_path} | 算法 EP 得分: {ep_gen:.4f}")
+                        print(
+                            f"   => 净收益 (Delta EP): {delta_ep:+.4f}  <-- {'🚀 算法完胜！' if delta_ep > 0 else '📉 算法落败'}")
+            # =========================================================
             # forward
             # pred = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
             pred, pred_res, kt_mask, yt, _, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)  # ==================================
@@ -651,21 +773,6 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
         scores['hits@' + str(k)] = scores['hits@' + str(k)] / n_total_words
         scores['map@' + str(k)] = scores['map@' + str(k)] / n_total_words
 
-    # paper_scores = {}
-    # for m in paper_ms:
-    #     TP = paper_totals[m]["TP"]
-    #     FP = paper_totals[m]["FP"]
-    #     FN = paper_totals[m]["FN"]
-    #     P = TP / (TP + FP + 1e-12)
-    #     R = TP / (TP + FN + 1e-12)
-    #     F1 = 0.0 if (P + R) == 0 else 2 * P * R / (P + R)
-    #     paper_scores[m] = (P, R, F1)
-    #
-    # print("==== Paper-style Path-level PRF (FULL TESTSET) ====")
-    # for m in paper_ms:
-    #     P, R, F1 = paper_scores[m]
-    #     print(f"[FINAL PRF] m={m}  P={P:.4f} R={R:.4f} F1={F1:.4f}")
-
     # ✅ 新增：在终端直接打印出这三个指标的平均值
     print('  [KT Metrics] Precision: {:.4f} | Recall: {:.4f} | F1: {:.4f}'.format(
         np.mean(p_test_kt), np.mean(r_test_kt), np.mean(f1_test_kt)
@@ -674,89 +781,6 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
         np.mean(acc_test_rec), np.mean(p_test_rec), np.mean(r_test_rec), np.mean(f1_test_rec)
     ))
     return scores, auc_test, acc_test
-
-
-# def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[5, 10, 20],
-#                show_examples=True):
-#     ''' Epoch operation in evaluation phase '''
-#     model.eval()
-#     auc_test = []
-#     acc_test = []
-#     scores = {}
-#     for k in k_list:
-#         scores['hits@' + str(k)] = 0
-#         scores['map@' + str(k)] = 0
-#
-#     n_total_words = 0
-#
-#     with torch.no_grad():
-#         for i, batch in enumerate(validation_data):
-#             # 准备数据
-#             tgt, tgt_timestamp, tgt_idx, ans = batch
-#             y_gold = tgt[:, 1:].contiguous().view(-1).detach().cpu().numpy()
-#
-#             # 前向传播
-#             pred, pred_res, kt_mask, _, _, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
-#
-#             # 显示每个样本每个时间步的历史和top5推荐（无限制）
-#             if show_examples:
-#                 batch_size, seq_len = tgt.size()
-#
-#                 for b in range(batch_size):  # 遍历所有样本，移除限制
-#                     # 获取完整的历史序列
-#                     full_history = [int(x) for x in tgt[b].cpu().numpy() if int(x) != Constants.PAD and int(x) != 1]
-#
-#                     # 遍历每个时间步
-#                     for t in range(1, min(seq_len, len(full_history) + 1)):  # 遍历所有时间步，移除限制
-#                         # 获取当前时间步之前的history
-#                         current_history = full_history[:t - 1] if t > 1 else []
-#
-#                         # 获取该时间步的预测结果
-#                         pred_idx = b * (seq_len - 1) + (t - 1)  # 计算预测tensor中的索引
-#
-#                         if pred_idx < len(pred):  # 确保索引有效
-#                             pred_logits = pred[pred_idx, :]  # 获取该时间步的预测logits
-#
-#                             # 获取top5推荐
-#                             top5_recommendations = torch.topk(pred_logits, k=5).indices.cpu().numpy().tolist()
-#                             top1_recommendation = top5_recommendations[0]
-#
-#                             # 获取真实的下一个项目
-#                             if t < seq_len:
-#                                 real_next = tgt[b, t].item()
-#                                 is_top1_correct = top1_recommendation == real_next
-#                                 is_in_top5 = real_next in top5_recommendations
-#
-#                                 print(f"Batch {i}, Sample {b + 1}, Time step {t}:")
-#                                 print(f"  Current history: {current_history}")
-#                                 print(f"  Top5 recommendations: {top5_recommendations}")
-#                                 print(f"  Top1 recommendation: {top1_recommendation}")
-#                                 print(f"  Real next item: {real_next}")
-#                                 print(f"  Top1 match: {'✓' if is_top1_correct else '✗'}")
-#                                 print(f"  In Top5: {'✓' if is_in_top5 else '✗'}")
-#                                 print()
-#
-#             y_pred = pred.detach().cpu().numpy()
-#             loss_kt, auc, acc = kt_loss(pred_res.cpu(), ans.cpu(), kt_mask.cpu())
-#
-#             if auc != -1 and acc != -1:
-#                 auc_test.append(auc)
-#                 acc_test.append(acc)
-#
-#             scores_batch, scores_len = metric.compute_metric(y_pred, y_gold, k_list)
-#             n_total_words += scores_len
-#
-#             for k in k_list:
-#                 scores['hits@' + str(k)] += scores_batch['hits@' + str(k)] * scores_len
-#                 scores['map@' + str(k)] += scores_batch['map@' + str(k)] * scores_len
-#
-#     for k in k_list:
-#         scores['hits@' + str(k)] = scores['hits@' + str(k)] / n_total_words
-#         scores['map@' + str(k)] = scores['map@' + str(k)] / n_total_words
-#
-#     return scores, auc_test, acc_test
-
-
 
 def test_model(MSHGAT, data_path):
     kt_loss = KTLoss()
