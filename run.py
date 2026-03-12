@@ -601,7 +601,7 @@ def generate_ep_greedy_path(model_rec, model_kt, hist_seq, hist_ans, target_set,
                 sim_ans = torch.cat([current_ans, torch.tensor([[1]], device=current_ans.device)], dim=1)  # 假设作对
 
                 # 送入 KT 模型模拟学习后的状态
-                _, _, yt_sim, _ = model_kt.ktmodel(hidden_kt, sim_seq, sim_ans)
+                _, _, yt_sim, _, _ = model_kt.ktmodel(hidden_kt, sim_seq, sim_ans)
                 p_sim = yt_sim[0, -1, :]  # 模拟学习后的掌握度
 
                 # 3. 计算对 Target Set 的 EP 收益
