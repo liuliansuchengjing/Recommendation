@@ -576,7 +576,7 @@ def generate_ep_greedy_path(model_rec, model_kt, hist_seq, hist_ans, target_set,
         hidden_kt = model_kt.gnn(graph)
 
         # 跑一次 KT 获取初始对所有题目的掌握度
-        _, _, yt_init, _ = model_kt.ktmodel(hidden_kt, current_seq, current_ans)
+        _, _, yt_init, _, _ = model_kt.ktmodel(hidden_kt, current_seq, current_ans)
         p_current = yt_init[0, -1, :]
 
         for step in range(path_length):
