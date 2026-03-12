@@ -697,8 +697,8 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
 
                     # 4. 计算生成轨迹的收益 (Generated EP)
                     if len(gen_path) == len(target_set):
-                        gen_seq = torch.cat([hist_seq, torch.tensor([gen_path]).cuda()], dim=1)
-                        gen_ans = torch.cat([hist_ans, torch.ones((1, len(gen_path))).cuda()], dim=1)
+                        gen_seq = torch.cat([hist_seq, torch.tensor([gen_path], device='cuda')], dim=1)
+                        gen_ans = torch.cat([hist_ans, torch.ones((1, len(gen_path)), device='cuda')], dim=1)
 
                         _, _, yt_gen, _, _ = model.ktmodel(hidden_kt_eval, gen_seq, gen_ans)
                         p_gen = yt_gen[0, -1, :]
