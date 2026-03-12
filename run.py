@@ -677,7 +677,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
                     real_ans = ans[0:1, :20]
 
                     hidden_kt_eval = model.gnn(graph)
-                    _, _, yt_real, _ = kt_loss.ktmodel(hidden_kt_eval, real_seq, real_ans) if hasattr(kt_loss,
+                    _, _, yt_real, _, _ = kt_loss.ktmodel(hidden_kt_eval, real_seq, real_ans) if hasattr(kt_loss,
                                                                                                       'ktmodel') else model.ktmodel(
                         hidden_kt_eval, real_seq, real_ans)
                     p_real = yt_real[0, -1, :]  # 真实轨迹做完 20 题后的掌握度
@@ -700,7 +700,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
                         gen_seq = torch.cat([hist_seq, torch.tensor([gen_path]).cuda()], dim=1)
                         gen_ans = torch.cat([hist_ans, torch.ones((1, len(gen_path))).cuda()], dim=1)
 
-                        _, _, yt_gen, _ = model.ktmodel(hidden_kt_eval, gen_seq, gen_ans)
+                        _, _, yt_gen, _, _ = model.ktmodel(hidden_kt_eval, gen_seq, gen_ans)
                         p_gen = yt_gen[0, -1, :]
                         ep_gen = sum([p_gen[t_id].item() for t_id in target_set])
 
