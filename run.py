@@ -777,7 +777,7 @@ def test_model(MSHGAT, data_path):
     # 3. 实例化两个模型：一个用于推荐，一个用于知识追踪
     model_rec = MSHGAT(opt, dropout=opt.dropout).cuda()
     model_kt = MSHGAT(opt, dropout=opt.dropout).cuda()
-    model.cuda()
+    # model.cuda()
     kt_loss = kt_loss.cuda()
     # 4. 分别加载它们的最优权重
     model_rec.load_state_dict(torch.load(opt.save_rec_path))
