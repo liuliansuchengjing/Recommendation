@@ -664,8 +664,8 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
             valid_len = (tgt[0] > 1).sum().item()
             if valid_len > 20:  # 只评估做了 20 题以上的学生
                 # 1. 拆分历史序列(前15题) 和 隐式目标(第16-20题)
-                hist_seq = tgt[0:1, :15]  # [1, 15]
-                hist_ans = ans[0:1, :15]
+                hist_seq = tgt[0:1, :15].cuda()  # [1, 15] 确保在GPU上
+                hist_ans = ans[0:1, :15].cuda()
 
                 target_seq = tgt[0:1, 15:20]
                 # 提取目标的 ID 列表 (过滤 0 和 1)
