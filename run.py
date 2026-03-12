@@ -805,12 +805,12 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
                             total_delta_ep += delta_ep
                             valid_ep_samples += 1
 
-                            print(f"\n[终极盲测对决] 算法预测目标: {target_pred} | 真实隐式目标: {target_actual}")
-                            print(
-                                f"   => 真实路径 (长度 {len(target_actual)}): {target_actual} | 归一化 EP: {ep_base:.4f}")
-                            print(f"   => 算法路径 (长度 {len(gen_path)}): {gen_path} | 归一化 EP: {ep_opt:.4f}")
-                            print(
-                                f"   => 净收益 (Delta): {delta_ep:+.4f}  <-- {'🚀 盲测有效！' if delta_ep > 0 else '📉 盲测落败'}")
+                            # print(f"\n[终极盲测对决] 算法预测目标: {target_pred} | 真实隐式目标: {target_actual}")
+                            # print(
+                            #     f"   => 真实路径 (长度 {len(target_actual)}): {target_actual} | 归一化 EP: {ep_base:.4f}")
+                            # print(f"   => 算法路径 (长度 {len(gen_path)}): {gen_path} | 归一化 EP: {ep_opt:.4f}")
+                            # print(
+                            #     f"   => 净收益 (Delta): {delta_ep:+.4f}  <-- {'🚀 盲测有效！' if delta_ep > 0 else '📉 盲测落败'}")
             # =========================================================
             # # =========================================================
             # # ✅ 新增：动态前瞻路径生成与 EP 收益对比验证 (仅在第一维度的 Batch 上采样验证)
