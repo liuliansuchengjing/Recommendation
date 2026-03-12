@@ -634,6 +634,11 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
     p_test_kt, r_test_kt, f1_test_kt = [], [], []
     # ✅ 新增：推荐任务 (Rec) 的 Top-1 指标列表
     acc_test_rec, p_test_rec, r_test_rec, f1_test_rec = [], [], [], []
+    # ✅ 新增：用于统计全局 EP 收益的累加器
+    total_ep_real = 0.0
+    total_ep_gen = 0.0
+    total_delta_ep = 0.0
+    valid_ep_samples = 0
     scores = {}
     for k in k_list:
         scores['hits@' + str(k)] = 0
@@ -707,6 +712,11 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
                         print(f"   => 算法路径: {gen_path} | 算法 EP 得分: {ep_gen:.4f}")
                         print(
                             f"   => 净收益 (Delta EP): {delta_ep:+.4f}  <-- {'🚀 算法完胜！' if delta_ep > 0 else '📉 算法落败'}")
+                        # ✅ 新增：将当前样本的得分累加到全局池子里
+                        total_ep_real += ep_real
+                        total_ep_gen += ep_gen
+                        total_delta_ep += delta_ep
+                        valid_ep_samples += 1
             # =========================================================
             # forward
             # pred = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
@@ -780,6 +790,22 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
     print('  [Rec Top-1]   Accuracy: {:.4f} | Precision: {:.4f} | Recall: {:.4f} | F1: {:.4f}'.format(
         np.mean(acc_test_rec), np.mean(p_test_rec), np.mean(r_test_rec), np.mean(f1_test_rec)
     ))
+    # ✅ 新增：计算并打印整个测试集上的最终平均 EP 收益
+    if valid_ep_samples > 0:
+        avg_ep_real = total_ep_real / valid_ep_samples
+        avg_ep_gen = total_ep_gen / valid_ep_samples
+        avg_delta_ep = total_delta_ep / valid_ep_samples
+
+        print(f"\n========== 🏆 全局 EP 收益最终评估 ({valid_ep_samples} 个有效测试样本) ==========")
+        print(f"  => 平均真实 EP (学生自我摸索): {avg_ep_real:.4f}")
+        print(f"  => 平均生成 EP (算法智能推荐): {avg_ep_gen:.4f}")
+        print(f"  => 绝对平均净收益 (Average Delta EP): {avg_delta_ep:+.4f}")
+
+        # 计算相对提升百分比
+        if avg_ep_real > 0:
+            improvement_ratio = (avg_delta_ep / avg_ep_real) * 100
+            print(f"  => 相对学习效率提升: +{improvement_ratio:.2f}%")
+        print("=========================================================================\n")
     return scores, auc_test, acc_test
 
 def test_model(MSHGAT, data_path):
