@@ -62,9 +62,9 @@ def compute_kt_clf_metrics(y_prob, y_true, mask):
     mask: 有效位掩码 (Tensor)
     """
     # 1. 展平并转为 numpy
-    y_prob_flat = y_prob.view(-1).detach().cpu().numpy()
-    y_true_flat = y_true.view(-1).detach().cpu().numpy()
-    mask_flat = mask.view(-1).detach().cpu().bool().numpy()
+    y_prob_flat = y_prob.reshape(-1).detach().cpu().numpy()
+    y_true_flat = y_true.reshape(-1).detach().cpu().numpy()
+    mask_flat = mask.reshape(-1).detach().cpu().bool().numpy()
 
     # 2. 用 mask 过滤掉 PAD 和 无效部分
     valid_prob = y_prob_flat[mask_flat]
