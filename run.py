@@ -349,12 +349,12 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         weight_kt = torch.exp(-model.log_var_kt)
         loss_kt_adaptive = weight_kt * loss_kt_raw + model.log_var_kt
 
-        # 蒸馏损失 (或者是你提到的第三个其他损失)
-        weight_distill = torch.exp(-model.log_var_distill)
-        loss_distill_adaptive = weight_distill * loss_distill_raw + model.log_var_distill
+        # # 蒸馏损失 (或者是你提到的第三个其他损失)
+        # weight_distill = torch.exp(-model.log_var_distill)
+        # loss_distill_adaptive = weight_distill * loss_distill_raw + model.log_var_distill
 
         # 3. 最终的总 Loss
-        loss = loss_rec_adaptive + loss_kt_adaptive + loss_distill_adaptive
+        loss = loss_rec_adaptive + loss_kt_adaptive
 
         # 反向传播，这一步会让模型自动去更新那三个 log_var_xxx 参数
         loss.backward()
@@ -425,7 +425,7 @@ def train_model(MSHGAT, data_path):
         # 使用 .item() 将单个元素的 Tensor 转换为普通的 Python 浮点数
         w_rec = torch.exp(-model.log_var_rec).item()
         w_kt = torch.exp(-model.log_var_kt).item()
-        w_distill = torch.exp(-model.log_var_distill).item()
+        # w_distill = torch.exp(-model.log_var_distill).item()
         # =========================================================================
 
         print('  - (Training)   loss: {loss: 8.5f}, accuracy: {accu:3.3f} %, ' \
@@ -436,7 +436,8 @@ def train_model(MSHGAT, data_path):
               'acc_train: {:.10f}'.format(np.mean(train_acc)))
 
         # ==================== 新增：打印权重信息 ====================
-        print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} | Distill: {w_distill:.4f}')
+        # print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} | Distill: {w_distill:.4f}')
+        print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} ')
         # ==========================================================
 
         if epoch_i >= 0:
@@ -734,4 +735,3 @@ if __name__ == "__main__":
     # test_model(model, opt.data_name)
     # # 多目标评价指标计算
     # gain_test_model(model, opt.data_name, opt)
-

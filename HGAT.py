@@ -235,12 +235,12 @@ class MSHGAT(nn.Module):
         )
 
         self.num_skills = opt.resource_size
-        self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills, opt.data_name)
+        self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
 
         # 定义三个可学习的对数方差参数（初始化为0）
         self.log_var_rec = nn.Parameter(torch.zeros(1))
         self.log_var_kt = nn.Parameter(torch.zeros(1))
-        self.log_var_distill = nn.Parameter(torch.zeros(1))  # 新增第三个任务的自适应参数
+        # self.log_var_distill = nn.Parameter(torch.zeros(1))  # 新增第三个任务的自适应参数
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.hidden_size)
@@ -297,7 +297,8 @@ class MSHGAT(nn.Module):
         hidden_kt = self.dropout(self.gnn2(graph))
 
         # 使用DKT模型获取知识追踪结果
-        pred_res, kt_mask, yt, _ = self.ktmodel(hidden_kt, original_input, ans)
+        # pred_res, kt_mask, yt, _ = self.ktmodel(hidden_kt, original_input, ans)
+        pred_res, kt_mask, yt, _, kt_hidden = self.ktmodel(hidden_kt, original_input, ans)
 
         # 直接使用图神经网络的输出作为序列嵌入
         batch_size, max_len = input.size()
@@ -305,6 +306,11 @@ class MSHGAT(nn.Module):
         # 使用图嵌入作为序列处理的输入
         sequence_embeddings = F.embedding(input.cuda(), hidden.cuda())
 
+        # 【核心魔法：残差相加融合】
+        # sequence_embeddings 是题目的客观属性
+        # kt_hidden 是学生的主观掌握状态
+        # 两者相加，Transformer 就能同时看到“题目是什么”和“学生会不会”！
+        # sequence_embeddings = sequence_embeddings + kt_hidden
         # 添加位置编码
         input_embeddings = sequence_embeddings
         position_ids = torch.arange(input.size(1), dtype=torch.long, device=input.device)
