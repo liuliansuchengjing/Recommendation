@@ -628,7 +628,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, k_list=[
             # =========================================================
             # ✅ 新增：计算 Precision, Recall, F1
             # 这里的 pred_res 是知识追踪预测的概率，ans 是真实答案，kt_mask 是掩码
-            batch_acc, batch_p, batch_r, batch_f1 = compute_kt_clf_metrics(pred_res, ans, kt_mask)
+            batch_acc, batch_p, batch_r, batch_f1 = compute_kt_clf_metrics(pred_res, ans[:, 1:], kt_mask)
             if batch_acc != -1:
                 p_test_kt.append(batch_p)
                 r_test_kt.append(batch_r)
