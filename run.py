@@ -636,6 +636,7 @@ def generate_dynamic_ep_path(model_rec, model_kt, hist_seq, hist_ans, target_pre
     动态变长路径生成器：针对预测目标 (target_pred) 寻找最短且 EP 收益最高的路径
     """
     generated_path = []
+    generated_ans = []  # <--- ✅ 新增：记录模拟的对错
     current_seq = hist_seq.clone()
     current_ans = hist_ans.clone()
 
@@ -653,6 +654,7 @@ def generate_dynamic_ep_path(model_rec, model_kt, hist_seq, hist_ans, target_pre
             best_candidate = -1
             max_ep_gain = -999.0
             best_p_next = None
+            best_ans_val = 1
 
             # 2. 遍历候选池，计算对预测目标的归一化 EP 收益
             for cand_id in topk_candidates:
@@ -660,6 +662,9 @@ def generate_dynamic_ep_path(model_rec, model_kt, hist_seq, hist_ans, target_pre
                 # 过滤无效题目和已做题目（注意：这里不禁止推荐 target_pred 里的题了！因为如果是必须做的题，可以直接推）
                 if cand_id <= 1 or cand_id in generated_path or cand_id in current_seq[0].cpu().numpy():
                     continue
+
+                #  核心学术逻辑：预测他到底能不能做对这道题！
+                sim_ans_val = 1 if p_current[cand_id].item() >= 0.5 else 0
 
                 sim_seq = torch.cat([current_seq, torch.tensor([[cand_id]], device=current_seq.device)], dim=1)
                 sim_ans = torch.cat([current_ans, torch.tensor([[1]], device=current_ans.device)], dim=1)
@@ -678,6 +683,7 @@ def generate_dynamic_ep_path(model_rec, model_kt, hist_seq, hist_ans, target_pre
                     max_ep_gain = ep_gain
                     best_candidate = cand_id
                     best_p_next = p_sim
+                    best_ans_val = sim_ans_val  # <--- ✅ 保存这道题的作答结果
 
             # 3. 核心机制：边际收益早停 (Early Stopping) 保证路径最短
             # 如果加上这道题，对所有预测目标的总归一化收益提升不到 0.01，说明已经“学透了”，立刻停止生成
@@ -687,14 +693,14 @@ def generate_dynamic_ep_path(model_rec, model_kt, hist_seq, hist_ans, target_pre
                 # 4. 否则，将该题加入路径，推进状态
             if best_candidate != -1:
                 generated_path.append(best_candidate)
-                current_seq = torch.cat([current_seq, torch.tensor([[best_candidate]], device=current_seq.device)],
-                                        dim=1)
+                generated_ans.append(best_ans_val)  # <--- ✅ 把模拟对错加入记录
+                current_seq = torch.cat([current_seq, torch.tensor([[best_candidate]], device=current_seq.device)],dim=1)
                 current_ans = torch.cat([current_ans, torch.tensor([[1]], device=current_ans.device)], dim=1)
                 p_current = best_p_next
             else:
                 break
 
-    return generated_path
+    return generated_path, generated_ans
 
 
 def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evaluator=None, k_list=[1, 5, 10, 20]):
@@ -785,7 +791,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
                                     ep_base += gain / (1.0 - p_init[t_id].item() + 1e-9)
 
                                 # --- 6. 算法登场：为了 target_pred 生成变长优化路径 ---
-                                gen_path = generate_dynamic_ep_path(
+                                gen_path, gen_ans = generate_dynamic_ep_path(
                                     model_rec=model,
                                     model_kt=kt_referee,
                                     hist_seq=hist_seq,
