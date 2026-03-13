@@ -797,6 +797,29 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
                                 )
 
                                 # --- 7. 终极审判：评估生成路径在 target_actual 上的收益 (Opt EP) ---
+                                # if len(gen_path) > 0:
+                                #     opt_seq = torch.cat([hist_seq, torch.tensor([gen_path]).cuda()], dim=1)
+                                #     opt_ans = torch.cat([hist_ans, torch.ones((1, len(gen_path))).cuda()], dim=1)
+                                #     _, _, yt_opt, _, _ = kt_referee.ktmodel(hidden_kt_eval, opt_seq, opt_ans)
+                                #     p_opt = yt_opt[0, -1, :]
+                                #
+                                #     ep_opt = 0.0
+                                #     for t_id in target_actual:
+                                #         gain = p_opt[t_id].item() - p_init[t_id].item()
+                                #         ep_opt += gain / (1.0 - p_init[t_id].item() + 1e-9)
+                                #
+                                #     delta_ep = ep_opt - ep_base
+                                #
+                                #     # 全局累加
+                                #     total_ep_real += ep_base
+                                #     total_ep_gen += ep_opt
+                                #     total_delta_ep += delta_ep
+                                #     valid_ep_samples += 1
+                                #
+                                #     # ⚠️ 为了防止终端被疯狂刷屏，我们把它改成一行极其精简的输出
+                                #     print(
+                                #         f"  [对决] 样本 {valid_ep_samples:04d} | 学生 {b:02d} | 步 {t:03d} | Base: {ep_base:+.4f} | Opt: {ep_opt:+.4f} | Delta: {delta_ep:+.4f}")
+                                # --- 7. 终极审判：评估生成路径在 target_actual 上的收益 (Opt EP) ---
                                 if len(gen_path) > 0:
                                     opt_seq = torch.cat([hist_seq, torch.tensor([gen_path]).cuda()], dim=1)
                                     opt_ans = torch.cat([hist_ans, torch.ones((1, len(gen_path))).cuda()], dim=1)
@@ -807,18 +830,21 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
                                     for t_id in target_actual:
                                         gain = p_opt[t_id].item() - p_init[t_id].item()
                                         ep_opt += gain / (1.0 - p_init[t_id].item() + 1e-9)
+                                else:
+                                    # 🚨 算法选择放弃推荐（早停），不造成破坏，但也没有收益
+                                    ep_opt = 0.0
 
-                                    delta_ep = ep_opt - ep_base
+                                # 🚨 无论算法是否推荐，都必须参与评测！保证不同模型的评价分母绝对一致！
+                                delta_ep = ep_opt - ep_base
 
-                                    # 全局累加
-                                    total_ep_real += ep_base
-                                    total_ep_gen += ep_opt
-                                    total_delta_ep += delta_ep
-                                    valid_ep_samples += 1
+                                # 全局累加
+                                total_ep_real += ep_base
+                                total_ep_gen += ep_opt
+                                total_delta_ep += delta_ep
+                                valid_ep_samples += 1
 
-                                    # ⚠️ 为了防止终端被疯狂刷屏，我们把它改成一行极其精简的输出
-                                    print(
-                                        f"  [对决] 样本 {valid_ep_samples:04d} | 学生 {b:02d} | 步 {t:03d} | Base: {ep_base:+.4f} | Opt: {ep_opt:+.4f} | Delta: {delta_ep:+.4f}")
+                                print(
+                                    f"  [对决] 样本 {valid_ep_samples:04d} | 学生 {b:02d} | 步 {t:03d} | Base: {ep_base:+.4f} | Opt: {ep_opt:+.4f} | Delta: {delta_ep:+.4f}")
             # =========================================================
             # # =========================================================
             # # ✅ 新增：严谨的离线评估 (预测目标生成 vs 真实目标评估)
