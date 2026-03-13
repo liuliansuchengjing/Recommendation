@@ -1021,8 +1021,13 @@ def test_model(MSHGAT, data_path):
     # model.cuda()
     kt_loss = kt_loss.cuda()
     # 4. 分别加载它们的最优权重
-    model_rec.load_state_dict(torch.load(opt.save_rec_path))
-    model_kt.load_state_dict(torch.load(opt.save_kt_path))
+    # model_rec.load_state_dict(torch.load(opt.save_rec_path))
+    # model_kt.load_state_dict(torch.load(opt.save_kt_path))
+    # 推荐模型是你刚刚新训练的，大概率不需要加，但加上也无妨
+    model_rec.load_state_dict(torch.load(opt.save_rec_path), strict=False)
+
+    # 🚨 裁判是老版本模型，必须加上 strict=False 允许缺失新参数！
+    model_kt.load_state_dict(torch.load(opt.save_kt_path), strict=False)
 
     # 使用 model_rec 跑测试
     scores, _, _ = test_epoch(model_rec, test_data, relation_graph, hypergraph_list, kt_loss,kt_evaluator=model_kt,
