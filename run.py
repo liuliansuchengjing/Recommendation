@@ -828,7 +828,8 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
                                 # --- 7. 终极审判：评估生成路径在 target_actual 上的收益 (Opt EP) ---
                                 if len(gen_path) > 0:
                                     opt_seq = torch.cat([hist_seq, torch.tensor([gen_path]).cuda()], dim=1)
-                                    opt_ans = torch.cat([hist_ans, torch.ones((1, len(gen_path))).cuda()], dim=1)
+                                    # opt_ans = torch.cat([hist_ans, torch.ones((1, len(gen_path))).cuda()], dim=1)
+                                    opt_ans = torch.cat([hist_ans, torch.tensor([gen_ans]).cuda()], dim=1)
                                     _, _, yt_opt, _, _ = kt_referee.ktmodel(hidden_kt_eval, opt_seq, opt_ans)
                                     p_opt = yt_opt[0, -1, :]
 
