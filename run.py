@@ -548,7 +548,7 @@ def train_model(MSHGAT, data_path):
 
         # ==================== 新增：打印权重信息 ====================
         print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} | Distill: {w_distill:.4f}')
-        print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} ')
+        # print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} ')
         # ==========================================================
 
         if epoch_i >= 0:
