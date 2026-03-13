@@ -310,7 +310,8 @@ class MSHGAT(nn.Module):
         # sequence_embeddings 是题目的客观属性
         # kt_hidden 是学生的主观掌握状态
         # 两者相加，Transformer 就能同时看到“题目是什么”和“学生会不会”！
-        sequence_embeddings = sequence_embeddings + kt_hidden
+        # sequence_embeddings = sequence_embeddings + kt_hidden
+        sequence_embeddings = sequence_embeddings + kt_hidden.detach()
         # 添加位置编码
         input_embeddings = sequence_embeddings
         position_ids = torch.arange(input.size(1), dtype=torch.long, device=input.device)
