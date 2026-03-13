@@ -268,65 +268,121 @@ def get_performance(crit, pred, gold):
     n_correct = pred_id.eq(gold_flat).masked_select(valid_mask).sum().float()
     return loss, n_correct
 
+
 def kt_guided_distill_loss(
-    pred_logits,  # (B*(T-1), V) 或 (B, T-1, V)
-    yt,           # (B, T-1, V) 或 (B*(T-1), V)
-    gold,         # (B, T-1)  真实下一题 id
-    k=100,
-    tau=1.0,
-    pad_id=0,
-    eps=1e-12,
+        pred_logits,  # (B*(T-1), V) 或 (B, T-1, V)
+        yt,  # (B, T-1, V) 或 (B*(T-1), V)
+        gold,  # (B, T-1)  真实下一题 id
+        k=100,
+        tau=1.0,
+        pad_id=0,
+        eps=1e-12,
 ):
     """
-    只在 topK 候选集上做蒸馏：
-      teacher = softmax(log(yt_prob)/tau)
-      student = softmax(logits/tau)
-      L = KL(teacher || student)
+    基于 ZPD (最近发展区) 的知识蒸馏：
+    让推荐模块输出的分布，去拟合“掌握度最接近 0.6”的题目分布，而不是拟合“绝对掌握度最高”的题目。
     """
-    # ---- reshape logits -> (N, V) ----
     if pred_logits.dim() == 3:
         B, Tm1, V = pred_logits.size()
         pred_logits = pred_logits.reshape(-1, V)
     else:
         V = pred_logits.size(-1)
 
-    # ---- reshape yt -> (N, V) ----
     if yt.dim() == 3:
         yt = yt.reshape(-1, yt.size(-1))
-    assert yt.size(-1) == V, f"yt V={yt.size(-1)} != logits V={V}"
 
-    # ---- valid positions (exclude PAD targets) ----
-    # valid = gold.ne(pad_id).reshape(-1)  # (N,)
     valid = ((gold != pad_id) & (gold != 1)).reshape(-1)
     if valid.sum().item() == 0:
         return pred_logits.new_tensor(0.0)
 
-    logits_v = pred_logits[valid]  # (Nvalid, V)
-    yt_v = yt[valid]               # (Nvalid, V)
+    logits_v = pred_logits[valid]
+    yt_v = yt[valid]
 
-    # ---- topK candidate indices from student logits ----
     kk = min(k, V)
-    cand_idx = torch.topk(logits_v, k=kk, dim=-1).indices  # (Nvalid, K)
+    cand_idx = torch.topk(logits_v, k=kk, dim=-1).indices
 
-    # ---- gather candidate scores ----
-    stu_cand = torch.gather(logits_v, dim=1, index=cand_idx)  # (Nvalid, K)
-    tea_prob = torch.gather(yt_v, dim=1, index=cand_idx)      # (Nvalid, K)
+    stu_cand = torch.gather(logits_v, dim=1, index=cand_idx)
+    tea_prob = torch.gather(yt_v, dim=1, index=cand_idx)
 
-    # ---- teacher distribution from KT prob ----
-    # 用 log(yt) 再 softmax，更“像分布”，且数值稳定
-    tea_logits = torch.log(tea_prob + eps) / tau
-    tea_dist = torch.softmax(tea_logits, dim=-1).detach()  # teacher 不回传梯度
+    # ==========================================================
+    # ✅ 核心创新：基于最近发展区 (ZPD) 的教师分布重构
+    # ==========================================================
+    target_mastery = 0.6  # 设定 ZPD 最佳认知收益点为 0.6 (60% 掌握度)
 
-    # ---- student log-prob ----
+    # 1. 计算偏离 ZPD 目标的绝对距离
+    distance = torch.abs(tea_prob - target_mastery)
+
+    # 2. 将距离转化为 Logits (距离越小，Logit 越大，概率越高)
+    tea_zpd_logits = -distance / tau
+
+    # 3. 经过 Softmax 形成真正的 Teacher 分布 (截断梯度，保护 KT)
+    tea_dist = torch.softmax(tea_zpd_logits, dim=-1).detach()
+    # ==========================================================
+
     log_stu = torch.log_softmax(stu_cand / tau, dim=-1)
-
-    # ---- KL(teacher || student) ----
-    # kl_div expects input=log-prob, target=prob
     loss = F.kl_div(log_stu, tea_dist, reduction="batchmean")
-
-    # 常见做法：乘 tau^2 保持梯度尺度（可选，建议保留）
     loss = loss * (tau * tau)
+
     return loss
+# def kt_guided_distill_loss(
+#     pred_logits,  # (B*(T-1), V) 或 (B, T-1, V)
+#     yt,           # (B, T-1, V) 或 (B*(T-1), V)
+#     gold,         # (B, T-1)  真实下一题 id
+#     k=100,
+#     tau=1.0,
+#     pad_id=0,
+#     eps=1e-12,
+# ):
+#     """
+#     只在 topK 候选集上做蒸馏：
+#       teacher = softmax(log(yt_prob)/tau)
+#       student = softmax(logits/tau)
+#       L = KL(teacher || student)
+#     """
+#     # ---- reshape logits -> (N, V) ----
+#     if pred_logits.dim() == 3:
+#         B, Tm1, V = pred_logits.size()
+#         pred_logits = pred_logits.reshape(-1, V)
+#     else:
+#         V = pred_logits.size(-1)
+#
+#     # ---- reshape yt -> (N, V) ----
+#     if yt.dim() == 3:
+#         yt = yt.reshape(-1, yt.size(-1))
+#     assert yt.size(-1) == V, f"yt V={yt.size(-1)} != logits V={V}"
+#
+#     # ---- valid positions (exclude PAD targets) ----
+#     # valid = gold.ne(pad_id).reshape(-1)  # (N,)
+#     valid = ((gold != pad_id) & (gold != 1)).reshape(-1)
+#     if valid.sum().item() == 0:
+#         return pred_logits.new_tensor(0.0)
+#
+#     logits_v = pred_logits[valid]  # (Nvalid, V)
+#     yt_v = yt[valid]               # (Nvalid, V)
+#
+#     # ---- topK candidate indices from student logits ----
+#     kk = min(k, V)
+#     cand_idx = torch.topk(logits_v, k=kk, dim=-1).indices  # (Nvalid, K)
+#
+#     # ---- gather candidate scores ----
+#     stu_cand = torch.gather(logits_v, dim=1, index=cand_idx)  # (Nvalid, K)
+#     tea_prob = torch.gather(yt_v, dim=1, index=cand_idx)      # (Nvalid, K)
+#
+#     # ---- teacher distribution from KT prob ----
+#     # 用 log(yt) 再 softmax，更“像分布”，且数值稳定
+#     tea_logits = torch.log(tea_prob + eps) / tau
+#     tea_dist = torch.softmax(tea_logits, dim=-1).detach()  # teacher 不回传梯度
+#
+#     # ---- student log-prob ----
+#     log_stu = torch.log_softmax(stu_cand / tau, dim=-1)
+#
+#     # ---- KL(teacher || student) ----
+#     # kl_div expects input=log-prob, target=prob
+#     loss = F.kl_div(log_stu, tea_dist, reduction="batchmean")
+#
+#     # 常见做法：乘 tau^2 保持梯度尺度（可选，建议保留）
+#     loss = loss * (tau * tau)
+#     return loss
 
 def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss, optimizer):
     # train
@@ -383,15 +439,15 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         # 1. 拿到三个原始损失 (Raw Loss)
         loss_rec_raw, n_correct = get_performance(loss_func, pred, gold)
         loss_kt_raw, auc, acc = kt_loss(pred_res, ans, kt_mask)
-        # loss_distill_raw = kt_guided_distill_loss(
-        #     pred_logits=pred,  # (B*(T-1), V)
-        #     yt=yt,  # (B, T-1, V)
-        #     gold=gold,  # (B, T-1)
-        #     k=opt.distill_k,
-        #     tau=opt.distill_tau,
-        #     pad_id=Constants.PAD,
-        #     eps=opt.distill_eps,
-        # )
+        loss_distill_raw = kt_guided_distill_loss(
+            pred_logits=pred,  # (B*(T-1), V)
+            yt=yt,  # (B, T-1, V)
+            gold=gold,  # (B, T-1)
+            k=opt.distill_k,
+            tau=opt.distill_tau,
+            pad_id=Constants.PAD,
+            eps=opt.distill_eps,
+        )
 
         # 2. 分别计算三个任务的自适应权重，并加权
         # 公式：(1 / e^log_var) * Raw_Loss + log_var
@@ -405,11 +461,11 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         loss_kt_adaptive = weight_kt * loss_kt_raw + model.log_var_kt
 
         # # 蒸馏损失 (或者是你提到的第三个其他损失)
-        # weight_distill = torch.exp(-model.log_var_distill)
-        # loss_distill_adaptive = weight_distill * loss_distill_raw + model.log_var_distill
+        weight_distill = torch.exp(-model.log_var_distill)
+        loss_distill_adaptive = weight_distill * loss_distill_raw + model.log_var_distill
 
         # 3. 最终的总 Loss
-        loss = loss_rec_adaptive + loss_kt_adaptive
+        loss = loss_rec_adaptive + loss_kt_adaptive + loss_distill_adaptive
 
         # 反向传播，这一步会让模型自动去更新那三个 log_var_xxx 参数
         loss.backward()
@@ -480,7 +536,7 @@ def train_model(MSHGAT, data_path):
         # 使用 .item() 将单个元素的 Tensor 转换为普通的 Python 浮点数
         w_rec = torch.exp(-model.log_var_rec).item()
         w_kt = torch.exp(-model.log_var_kt).item()
-        # w_distill = torch.exp(-model.log_var_distill).item()
+        w_distill = torch.exp(-model.log_var_distill).item()
         # =========================================================================
 
         print('  - (Training)   loss: {loss: 8.5f}, accuracy: {accu:3.3f} %, ' \
@@ -491,7 +547,7 @@ def train_model(MSHGAT, data_path):
               'acc_train: {:.10f}'.format(np.mean(train_acc)))
 
         # ==================== 新增：打印权重信息 ====================
-        # print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} | Distill: {w_distill:.4f}')
+        print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} | Distill: {w_distill:.4f}')
         print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} ')
         # ==========================================================
 

@@ -240,7 +240,7 @@ class MSHGAT(nn.Module):
         # 定义三个可学习的对数方差参数（初始化为0）
         self.log_var_rec = nn.Parameter(torch.zeros(1))
         self.log_var_kt = nn.Parameter(torch.zeros(1))
-        # self.log_var_distill = nn.Parameter(torch.zeros(1))  # 新增第三个任务的自适应参数
+        self.log_var_distill = nn.Parameter(torch.zeros(1))  # 新增第三个任务的自适应参数
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.hidden_size)
