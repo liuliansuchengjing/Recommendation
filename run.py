@@ -787,7 +787,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
                                 # --- 6. 算法登场：为了 target_pred 生成变长优化路径 ---
                                 gen_path = generate_dynamic_ep_path(
                                     model_rec=model,
-                                    model_kt=model,
+                                    model_kt=kt_referee,
                                     hist_seq=hist_seq,
                                     hist_ans=hist_ans,
                                     target_pred=target_pred,
