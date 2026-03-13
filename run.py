@@ -453,19 +453,20 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         # 公式：(1 / e^log_var) * Raw_Loss + log_var
 
         # 推荐系统损失
-        weight_rec = torch.exp(-model.log_var_rec)
-        loss_rec_adaptive = weight_rec * loss_rec_raw + model.log_var_rec
-
-        # 知识追踪损失
-        weight_kt = torch.exp(-model.log_var_kt)
-        loss_kt_adaptive = weight_kt * loss_kt_raw + model.log_var_kt
-
-        # # 蒸馏损失 (或者是你提到的第三个其他损失)
-        weight_distill = torch.exp(-model.log_var_distill)
-        loss_distill_adaptive = weight_distill * loss_distill_raw + model.log_var_distill
-
-        # 3. 最终的总 Loss
-        loss = loss_rec_adaptive  + loss_distill_adaptive
+        # weight_rec = torch.exp(-model.log_var_rec)
+        # loss_rec_adaptive = weight_rec * loss_rec_raw + model.log_var_rec
+        #
+        # # 知识追踪损失
+        # weight_kt = torch.exp(-model.log_var_kt)
+        # loss_kt_adaptive = weight_kt * loss_kt_raw + model.log_var_kt
+        #
+        # # # 蒸馏损失 (或者是你提到的第三个其他损失)
+        # weight_distill = torch.exp(-model.log_var_distill)
+        # loss_distill_adaptive = weight_distill * loss_distill_raw + model.log_var_distill
+        #
+        # # 3. 最终的总 Loss
+        # loss = loss_rec_adaptive  + loss_distill_adaptive
+        loss = loss_rec_raw + loss_distill_raw * 4000
 
         # 反向传播，这一步会让模型自动去更新那三个 log_var_xxx 参数
         loss.backward()
@@ -1046,13 +1047,13 @@ def test_model(MSHGAT, data_path):
     # model.cuda()
     kt_loss = kt_loss.cuda()
     # 4. 分别加载它们的最优权重
-    # model_rec.load_state_dict(torch.load(opt.save_rec_path))
-    # model_kt.load_state_dict(torch.load(opt.save_kt_path))
-    # 推荐模型是你刚刚新训练的，大概率不需要加，但加上也无妨
-    model_rec.load_state_dict(torch.load(opt.save_rec_path), strict=False)
-
-    # 🚨 裁判是老版本模型，必须加上 strict=False 允许缺失新参数！
-    model_kt.load_state_dict(torch.load(opt.save_kt_path), strict=False)
+    model_rec.load_state_dict(torch.load(opt.save_rec_path))
+    model_kt.load_state_dict(torch.load(opt.save_kt_path))
+    # # 推荐模型是你刚刚新训练的，大概率不需要加，但加上也无妨
+    # model_rec.load_state_dict(torch.load(opt.save_rec_path), strict=False)
+    #
+    # # 🚨 裁判是老版本模型，必须加上 strict=False 允许缺失新参数！
+    # model_kt.load_state_dict(torch.load(opt.save_kt_path), strict=False)
 
     # 使用 model_rec 跑测试
     scores, _, _ = test_epoch(model_rec, test_data, relation_graph, hypergraph_list, kt_loss,kt_evaluator=model_kt,
@@ -1084,7 +1085,7 @@ def test_model(MSHGAT, data_path):
 
 if __name__ == "__main__":
     model = MSHGAT
-    # train_model(model, opt.data_name)
-    test_model(model, opt.data_name)
+    train_model(model, opt.data_name)
+    # test_model(model, opt.data_name)
     # 多目标评价指标计算
     # gain_test_model(model, opt.data_name, opt)
