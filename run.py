@@ -703,7 +703,7 @@ def generate_dynamic_ep_path(model_rec, model_kt, hist_seq, hist_ans, target_pre
     return generated_path, generated_ans
 
 
-def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evaluator=None, k_list=[1, 5, 10, 20]):
+def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evaluator=None, k_list=[1, 5, 10, 20], do_ep_eval=True):
     # 如果没有传，就用自己；传了，就用最优的 kt 模型当裁判
     kt_referee = kt_evaluator if kt_evaluator is not None else model
     ''' Epoch operation in evaluation phase '''
@@ -743,7 +743,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
             # 这里默认测该 Batch 里的所有学生
             for b in range(tgt.size(0)):
                 valid_len = (tgt[b] > 1).sum().item()
-                if valid_len > 20:
+                if valid_len > 20 and do_ep_eval:
 
                     # 💡 核心：设置滑动步长。step_size=5 表示第15题测一次，第20题测一次...
                     # 如果你想每个时间步都测，改成 step_size=1（速度会比较慢）
@@ -1137,7 +1137,7 @@ def test_model(MSHGAT, data_path):
     print('=======================================')
     # 使用 model_kt 跑测试
     _, auc_test, acc_test = test_epoch(model_kt, test_data, relation_graph, hypergraph_list, kt_loss,
-                                       k_list=[5])  # k_list 随便传个小的省时间，因为我们只取 AUC/ACC
+                                       k_list=[5], do_ep_eval=False)  # k_list 随便传个小的省时间，因为我们只取 AUC/ACC
     # 在验证阶段调用
     # 使用带有详细显示的版本
     # scores, auc_test, acc_test = test_epoch(
