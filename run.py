@@ -573,7 +573,7 @@ def generate_ep_greedy_path(model_rec, model_kt, hist_seq, hist_ans, target_set,
 
     with torch.no_grad():
         # 获取 GNN 的图特征
-        hidden_kt = model_kt.gnn(graph)
+        hidden_kt = model_kt.gnn2(graph)
 
         # 跑一次 KT 获取初始对所有题目的掌握度
         _, _, yt_init, _, _ = model_kt.ktmodel(hidden_kt, current_seq, current_ans)
@@ -640,7 +640,7 @@ def generate_dynamic_ep_path(model_rec, model_kt, hist_seq, hist_ans, target_pre
     current_ans = hist_ans.clone()
 
     with torch.no_grad():
-        hidden_kt = model_kt.gnn(graph)
+        hidden_kt = model_kt.gnn2(graph)
         _, _, yt_init, _,_ = model_kt.ktmodel(hidden_kt, current_seq, current_ans)
         p_current = yt_init[0, -1, :]
 
@@ -764,7 +764,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
                             target_pred = [int(x) for x in top5_preds if x > 1]
 
                             # 4. 计算做题前对真实目标的初始掌握度
-                            hidden_kt_eval = model.gnn(graph)
+                            hidden_kt_eval = kt_referee.gnn2(graph)
                             # 注意：使用 kt_referee 裁判模型
                             _, _, yt_init_eval, _, _ = kt_referee.ktmodel(hidden_kt_eval, hist_seq, hist_ans)
                             p_init = yt_init_eval[0, -1, :]
