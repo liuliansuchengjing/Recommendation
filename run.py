@@ -20,10 +20,10 @@ from calculate_muti_obj import gain_test_model, learning_effect_loss, learning_a
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 torch.backends.cudnn.deterministic = True
-torch.manual_seed(1)
-torch.cuda.manual_seed_all(1)
-np.random.seed(1)
-torch.cuda.manual_seed(1)
+torch.manual_seed(2)
+torch.cuda.manual_seed_all(2)
+np.random.seed(2)
+torch.cuda.manual_seed(2)
 
 metric = Metrics()
 
