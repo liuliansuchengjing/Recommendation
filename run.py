@@ -20,10 +20,10 @@ from calculate_muti_obj import gain_test_model, learning_effect_loss, learning_a
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 torch.backends.cudnn.deterministic = True
-torch.manual_seed(0)
-torch.cuda.manual_seed_all(0)
-np.random.seed(0)
-torch.cuda.manual_seed(0)
+torch.manual_seed(1)
+torch.cuda.manual_seed_all(1)
+np.random.seed(1)
+torch.cuda.manual_seed(1)
 
 metric = Metrics()
 
@@ -268,121 +268,65 @@ def get_performance(crit, pred, gold):
     n_correct = pred_id.eq(gold_flat).masked_select(valid_mask).sum().float()
     return loss, n_correct
 
-
 def kt_guided_distill_loss(
-        pred_logits,  # (B*(T-1), V) 或 (B, T-1, V)
-        yt,  # (B, T-1, V) 或 (B*(T-1), V)
-        gold,  # (B, T-1)  真实下一题 id
-        k=100,
-        tau=1.0,
-        pad_id=0,
-        eps=1e-12,
+    pred_logits,  # (B*(T-1), V) 或 (B, T-1, V)
+    yt,           # (B, T-1, V) 或 (B*(T-1), V)
+    gold,         # (B, T-1)  真实下一题 id
+    k=100,
+    tau=1.0,
+    pad_id=0,
+    eps=1e-12,
 ):
     """
-    基于 ZPD (最近发展区) 的知识蒸馏：
-    让推荐模块输出的分布，去拟合“掌握度最接近 0.6”的题目分布，而不是拟合“绝对掌握度最高”的题目。
+    只在 topK 候选集上做蒸馏：
+      teacher = softmax(log(yt_prob)/tau)
+      student = softmax(logits/tau)
+      L = KL(teacher || student)
     """
+    # ---- reshape logits -> (N, V) ----
     if pred_logits.dim() == 3:
         B, Tm1, V = pred_logits.size()
         pred_logits = pred_logits.reshape(-1, V)
     else:
         V = pred_logits.size(-1)
 
+    # ---- reshape yt -> (N, V) ----
     if yt.dim() == 3:
         yt = yt.reshape(-1, yt.size(-1))
+    assert yt.size(-1) == V, f"yt V={yt.size(-1)} != logits V={V}"
 
+    # ---- valid positions (exclude PAD targets) ----
+    # valid = gold.ne(pad_id).reshape(-1)  # (N,)
     valid = ((gold != pad_id) & (gold != 1)).reshape(-1)
     if valid.sum().item() == 0:
         return pred_logits.new_tensor(0.0)
 
-    logits_v = pred_logits[valid]
-    yt_v = yt[valid]
+    logits_v = pred_logits[valid]  # (Nvalid, V)
+    yt_v = yt[valid]               # (Nvalid, V)
 
+    # ---- topK candidate indices from student logits ----
     kk = min(k, V)
-    cand_idx = torch.topk(logits_v, k=kk, dim=-1).indices
+    cand_idx = torch.topk(logits_v, k=kk, dim=-1).indices  # (Nvalid, K)
 
-    stu_cand = torch.gather(logits_v, dim=1, index=cand_idx)
-    tea_prob = torch.gather(yt_v, dim=1, index=cand_idx)
+    # ---- gather candidate scores ----
+    stu_cand = torch.gather(logits_v, dim=1, index=cand_idx)  # (Nvalid, K)
+    tea_prob = torch.gather(yt_v, dim=1, index=cand_idx)      # (Nvalid, K)
 
-    # ==========================================================
-    # ✅ 核心创新：基于最近发展区 (ZPD) 的教师分布重构
-    # ==========================================================
-    target_mastery = 0.6  # 设定 ZPD 最佳认知收益点为 0.6 (60% 掌握度)
+    # ---- teacher distribution from KT prob ----
+    # 用 log(yt) 再 softmax，更“像分布”，且数值稳定
+    tea_logits = torch.log(tea_prob + eps) / tau
+    tea_dist = torch.softmax(tea_logits, dim=-1).detach()  # teacher 不回传梯度
 
-    # 1. 计算偏离 ZPD 目标的绝对距离
-    distance = torch.abs(tea_prob - target_mastery)
-
-    # 2. 将距离转化为 Logits (距离越小，Logit 越大，概率越高)
-    tea_zpd_logits = -distance / tau
-
-    # 3. 经过 Softmax 形成真正的 Teacher 分布 (截断梯度，保护 KT)
-    tea_dist = torch.softmax(tea_zpd_logits, dim=-1).detach()
-    # ==========================================================
-
+    # ---- student log-prob ----
     log_stu = torch.log_softmax(stu_cand / tau, dim=-1)
-    loss = F.kl_div(log_stu, tea_dist, reduction="batchmean")
-    loss = loss * (tau * tau)
 
+    # ---- KL(teacher || student) ----
+    # kl_div expects input=log-prob, target=prob
+    loss = F.kl_div(log_stu, tea_dist, reduction="batchmean")
+
+    # 常见做法：乘 tau^2 保持梯度尺度（可选，建议保留）
+    loss = loss * (tau * tau)
     return loss
-# def kt_guided_distill_loss(
-#     pred_logits,  # (B*(T-1), V) 或 (B, T-1, V)
-#     yt,           # (B, T-1, V) 或 (B*(T-1), V)
-#     gold,         # (B, T-1)  真实下一题 id
-#     k=100,
-#     tau=1.0,
-#     pad_id=0,
-#     eps=1e-12,
-# ):
-#     """
-#     只在 topK 候选集上做蒸馏：
-#       teacher = softmax(log(yt_prob)/tau)
-#       student = softmax(logits/tau)
-#       L = KL(teacher || student)
-#     """
-#     # ---- reshape logits -> (N, V) ----
-#     if pred_logits.dim() == 3:
-#         B, Tm1, V = pred_logits.size()
-#         pred_logits = pred_logits.reshape(-1, V)
-#     else:
-#         V = pred_logits.size(-1)
-#
-#     # ---- reshape yt -> (N, V) ----
-#     if yt.dim() == 3:
-#         yt = yt.reshape(-1, yt.size(-1))
-#     assert yt.size(-1) == V, f"yt V={yt.size(-1)} != logits V={V}"
-#
-#     # ---- valid positions (exclude PAD targets) ----
-#     # valid = gold.ne(pad_id).reshape(-1)  # (N,)
-#     valid = ((gold != pad_id) & (gold != 1)).reshape(-1)
-#     if valid.sum().item() == 0:
-#         return pred_logits.new_tensor(0.0)
-#
-#     logits_v = pred_logits[valid]  # (Nvalid, V)
-#     yt_v = yt[valid]               # (Nvalid, V)
-#
-#     # ---- topK candidate indices from student logits ----
-#     kk = min(k, V)
-#     cand_idx = torch.topk(logits_v, k=kk, dim=-1).indices  # (Nvalid, K)
-#
-#     # ---- gather candidate scores ----
-#     stu_cand = torch.gather(logits_v, dim=1, index=cand_idx)  # (Nvalid, K)
-#     tea_prob = torch.gather(yt_v, dim=1, index=cand_idx)      # (Nvalid, K)
-#
-#     # ---- teacher distribution from KT prob ----
-#     # 用 log(yt) 再 softmax，更“像分布”，且数值稳定
-#     tea_logits = torch.log(tea_prob + eps) / tau
-#     tea_dist = torch.softmax(tea_logits, dim=-1).detach()  # teacher 不回传梯度
-#
-#     # ---- student log-prob ----
-#     log_stu = torch.log_softmax(stu_cand / tau, dim=-1)
-#
-#     # ---- KL(teacher || student) ----
-#     # kl_div expects input=log-prob, target=prob
-#     loss = F.kl_div(log_stu, tea_dist, reduction="batchmean")
-#
-#     # 常见做法：乘 tau^2 保持梯度尺度（可选，建议保留）
-#     loss = loss * (tau * tau)
-#     return loss
 
 def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss, optimizer):
     # train
@@ -439,34 +383,33 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         # 1. 拿到三个原始损失 (Raw Loss)
         loss_rec_raw, n_correct = get_performance(loss_func, pred, gold)
         loss_kt_raw, auc, acc = kt_loss(pred_res, ans, kt_mask)
-        loss_distill_raw = kt_guided_distill_loss(
-            pred_logits=pred,  # (B*(T-1), V)
-            yt=yt,  # (B, T-1, V)
-            gold=gold,  # (B, T-1)
-            k=opt.distill_k,
-            tau=opt.distill_tau,
-            pad_id=Constants.PAD,
-            eps=opt.distill_eps,
-        )
+        # loss_distill_raw = kt_guided_distill_loss(
+        #     pred_logits=pred,  # (B*(T-1), V)
+        #     yt=yt,  # (B, T-1, V)
+        #     gold=gold,  # (B, T-1)
+        #     k=opt.distill_k,
+        #     tau=opt.distill_tau,
+        #     pad_id=Constants.PAD,
+        #     eps=opt.distill_eps,
+        # )
 
         # 2. 分别计算三个任务的自适应权重，并加权
         # 公式：(1 / e^log_var) * Raw_Loss + log_var
 
         # 推荐系统损失
-        # weight_rec = torch.exp(-model.log_var_rec)
-        # loss_rec_adaptive = weight_rec * loss_rec_raw + model.log_var_rec
-        #
-        # # 知识追踪损失
-        # weight_kt = torch.exp(-model.log_var_kt)
-        # loss_kt_adaptive = weight_kt * loss_kt_raw + model.log_var_kt
-        #
-        # # # 蒸馏损失 (或者是你提到的第三个其他损失)
+        weight_rec = torch.exp(-model.log_var_rec)
+        loss_rec_adaptive = weight_rec * loss_rec_raw + model.log_var_rec
+
+        # 知识追踪损失
+        weight_kt = torch.exp(-model.log_var_kt)
+        loss_kt_adaptive = weight_kt * loss_kt_raw + model.log_var_kt
+
+        # # 蒸馏损失 (或者是你提到的第三个其他损失)
         # weight_distill = torch.exp(-model.log_var_distill)
         # loss_distill_adaptive = weight_distill * loss_distill_raw + model.log_var_distill
-        #
-        # # 3. 最终的总 Loss
-        # loss = loss_rec_adaptive  + loss_distill_adaptive
-        loss = loss_rec_raw + loss_distill_raw * 4000
+
+        # 3. 最终的总 Loss
+        loss = loss_rec_adaptive + loss_kt_adaptive
 
         # 反向传播，这一步会让模型自动去更新那三个 log_var_xxx 参数
         loss.backward()
@@ -510,35 +453,10 @@ def train_model(MSHGAT, data_path):
 
     # ========= Preparing Model =========#
     model = MSHGAT(opt, dropout=opt.dropout)
-
-    # ==========================================================
-    # ✅ 核心手术：请特级教师出山，并冻结其大脑 (Teacher-Student 蒸馏)
-    # ==========================================================
-    print("\n[Teacher Initialization] 正在加载并冻结完美的 KT 教师参数...")
-    # 1. 加载你之前跑出来的、最好的纯 KT 模型权重 (即裁判权重)
-    pretrained_dict = torch.load(opt.save_kt_path)
-    model_dict = model.state_dict()
-
-    # 2. 像外科手术一样，只提取 gnn2 和 ktmodel 的参数
-    kt_weights = {k: v for k, v in pretrained_dict.items() if 'gnn2' in k or 'ktmodel' in k}
-
-    # 3. 完美缝合进当前模型
-    model_dict.update(kt_weights)
-    model.load_state_dict(model_dict)
-
-    # 4. 彻底锁死这些参数，绝对不允许优化器修改它们！
-    frozen_params = 0
-    for name, param in model.named_parameters():
-        if 'gnn2' in name or 'ktmodel' in name:
-            param.requires_grad = False
-            frozen_params += 1
-    print(f"[Teacher Initialization] 成功冻结了 {frozen_params} 个 KT 教师参数矩阵！\n")
-    # ==========================================================
     loss_func = nn.CrossEntropyLoss(size_average=False, ignore_index=Constants.PAD)
     kt_loss = KTLoss()
 
-    # params = model.parameters()
-    params = filter(lambda p: p.requires_grad, model.parameters())
+    params = model.parameters()
     optimizerAdam = torch.optim.Adam(params, betas=(0.9, 0.98), eps=1e-09)
     optimizer = ScheduledOptim(optimizerAdam, opt.d_model, opt.n_warmup_steps)
 
@@ -562,7 +480,7 @@ def train_model(MSHGAT, data_path):
         # 使用 .item() 将单个元素的 Tensor 转换为普通的 Python 浮点数
         w_rec = torch.exp(-model.log_var_rec).item()
         w_kt = torch.exp(-model.log_var_kt).item()
-        w_distill = torch.exp(-model.log_var_distill).item()
+        # w_distill = torch.exp(-model.log_var_distill).item()
         # =========================================================================
 
         print('  - (Training)   loss: {loss: 8.5f}, accuracy: {accu:3.3f} %, ' \
@@ -573,8 +491,8 @@ def train_model(MSHGAT, data_path):
               'acc_train: {:.10f}'.format(np.mean(train_acc)))
 
         # ==================== 新增：打印权重信息 ====================
-        print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} | Distill: {w_distill:.4f}')
-        # print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} ')
+        # print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} | Distill: {w_distill:.4f}')
+        print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} ')
         # ==========================================================
 
         if epoch_i >= 0:
@@ -610,15 +528,15 @@ def train_model(MSHGAT, data_path):
                 best_scores = scores
                 is_improved = True  # 只要推荐变好了，就标记为 True
 
-            # # 逻辑 2：保存知识追踪最好的模型（独立保存！）
-            # current_kt_auc = np.mean(auc_test)
-            # if current_kt_auc > best_kt_auc:
-            #     best_kt_auc = current_kt_auc
-            #     torch.save(model.state_dict(), opt.save_kt_path)
-            #     best_kt_metrics['auc'] = current_kt_auc
-            #     best_kt_metrics['acc'] = np.mean(acc_test)
-            #     print("Save Best KT Model!")
-            #     is_improved = True  # 只要 KT 变好了，也标记为 True
+            # 逻辑 2：保存知识追踪最好的模型（独立保存！）
+            current_kt_auc = np.mean(auc_test)
+            if current_kt_auc > best_kt_auc:
+                best_kt_auc = current_kt_auc
+                torch.save(model.state_dict(), opt.save_kt_path)
+                best_kt_metrics['auc'] = current_kt_auc
+                best_kt_metrics['acc'] = np.mean(acc_test)
+                print("Save Best KT Model!")
+                is_improved = True  # 只要 KT 变好了，也标记为 True
 
             # 4. 更新耐心计时器
             if is_improved:
@@ -818,7 +736,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
             tgt, tgt_timestamp, tgt_idx, ans = batch
             y_gold = tgt[:, 1:].contiguous().view(-1).detach().cpu().numpy()
 
-            # # =========================================================
+            # =========================================================
             # # ✅ 新增：滑动窗口/多时间步的严谨离线评估 (预测 vs 真实)
             # # =========================================================
             # # 遍历 Batch 里的前 N 个学生（如果是最终跑数据，改成 range(tgt.size(0))）
@@ -934,6 +852,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
             #
             #                     print(
             #                         f"  [对决] 样本 {valid_ep_samples:04d} | 学生 {b:02d} | 步 {t:03d} | Base: {ep_base:+.4f} | Opt: {ep_opt:+.4f} | Delta: {delta_ep:+.4f}")
+            # =========================================================
 
             # forward
             # pred = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
@@ -1000,29 +919,29 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
         scores['hits@' + str(k)] = scores['hits@' + str(k)] / n_total_words
         scores['map@' + str(k)] = scores['map@' + str(k)] / n_total_words
 
-    # # ✅ 新增：在终端直接打印出这三个指标的平均值
-    # print('  [KT Metrics] Precision: {:.4f} | Recall: {:.4f} | F1: {:.4f}'.format(
-    #     np.mean(p_test_kt), np.mean(r_test_kt), np.mean(f1_test_kt)
-    # ))
-    # print('  [Rec Top-1]   Accuracy: {:.4f} | Precision: {:.4f} | Recall: {:.4f} | F1: {:.4f}'.format(
-    #     np.mean(acc_test_rec), np.mean(p_test_rec), np.mean(r_test_rec), np.mean(f1_test_rec)
-    # ))
-    # # ✅ 新增：计算并打印整个测试集上的最终平均 EP 收益
-    # if valid_ep_samples > 0:
-    #     avg_ep_real = total_ep_real / valid_ep_samples
-    #     avg_ep_gen = total_ep_gen / valid_ep_samples
-    #     avg_delta_ep = total_delta_ep / valid_ep_samples
-    #
-    #     print(f"\n========== 🏆 全局 EP 收益最终评估 ({valid_ep_samples} 个有效测试样本) ==========")
-    #     print(f"  => 平均真实 EP (学生自我摸索): {avg_ep_real:.4f}")
-    #     print(f"  => 平均生成 EP (算法智能推荐): {avg_ep_gen:.4f}")
-    #     print(f"  => 绝对平均净收益 (Average Delta EP): {avg_delta_ep:+.4f}")
-    #
-    #     # 计算相对提升百分比
-    #     if avg_ep_real > 0:
-    #         improvement_ratio = (avg_delta_ep / avg_ep_real) * 100
-    #         print(f"  => 相对学习效率提升: +{improvement_ratio:.2f}%")
-    #     print("=========================================================================\n")
+    # ✅ 新增：在终端直接打印出这三个指标的平均值
+    print('  [KT Metrics] Precision: {:.4f} | Recall: {:.4f} | F1: {:.4f}'.format(
+        np.mean(p_test_kt), np.mean(r_test_kt), np.mean(f1_test_kt)
+    ))
+    print('  [Rec Top-1]   Accuracy: {:.4f} | Precision: {:.4f} | Recall: {:.4f} | F1: {:.4f}'.format(
+        np.mean(acc_test_rec), np.mean(p_test_rec), np.mean(r_test_rec), np.mean(f1_test_rec)
+    ))
+    # ✅ 新增：计算并打印整个测试集上的最终平均 EP 收益
+    if valid_ep_samples > 0:
+        avg_ep_real = total_ep_real / valid_ep_samples
+        avg_ep_gen = total_ep_gen / valid_ep_samples
+        avg_delta_ep = total_delta_ep / valid_ep_samples
+
+        print(f"\n========== 🏆 全局 EP 收益最终评估 ({valid_ep_samples} 个有效测试样本) ==========")
+        print(f"  => 平均真实 EP (学生自我摸索): {avg_ep_real:.4f}")
+        print(f"  => 平均生成 EP (算法智能推荐): {avg_ep_gen:.4f}")
+        print(f"  => 绝对平均净收益 (Average Delta EP): {avg_delta_ep:+.4f}")
+
+        # 计算相对提升百分比
+        if avg_ep_real > 0:
+            improvement_ratio = (avg_delta_ep / avg_ep_real) * 100
+            print(f"  => 相对学习效率提升: +{improvement_ratio:.2f}%")
+        print("=========================================================================\n")
     return scores, auc_test, acc_test
 
 def test_model(MSHGAT, data_path):
@@ -1049,11 +968,6 @@ def test_model(MSHGAT, data_path):
     # 4. 分别加载它们的最优权重
     model_rec.load_state_dict(torch.load(opt.save_rec_path))
     model_kt.load_state_dict(torch.load(opt.save_kt_path))
-    # # 推荐模型是你刚刚新训练的，大概率不需要加，但加上也无妨
-    # model_rec.load_state_dict(torch.load(opt.save_rec_path), strict=False)
-    #
-    # # 🚨 裁判是老版本模型，必须加上 strict=False 允许缺失新参数！
-    # model_kt.load_state_dict(torch.load(opt.save_kt_path), strict=False)
 
     # 使用 model_rec 跑测试
     scores, _, _ = test_epoch(model_rec, test_data, relation_graph, hypergraph_list, kt_loss,kt_evaluator=model_kt,
@@ -1086,6 +1000,6 @@ def test_model(MSHGAT, data_path):
 if __name__ == "__main__":
     model = MSHGAT
     train_model(model, opt.data_name)
-    # test_model(model, opt.data_name)
+    test_model(model, opt.data_name)
     # 多目标评价指标计算
     # gain_test_model(model, opt.data_name, opt)
