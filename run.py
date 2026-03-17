@@ -877,7 +877,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, kt_evalu
                     # 如果你想每个时间步都测，改成 step_size=1（速度会比较慢）
                     step_size = 5
                     # ✅ 新增：设置你要对比的真实未来路径长度 (比如你想看 5题、10题)
-                    look_ahead_len = 5  # <-- 你想对比多长，就改这里！
+                    look_ahead_len = 3  # <-- 你想对比多长，就改这里！
 
                     # ✅ 修复循环边界：保证剩下的题目够 look_ahead_len 道
                     for t in range(15, valid_len - (look_ahead_len - 1), step_size):
