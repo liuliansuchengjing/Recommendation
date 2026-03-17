@@ -19,6 +19,7 @@ from Optim import ScheduledOptim
 from calculate_muti_obj import gain_test_model, learning_effect_loss, learning_adaptive_loss
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
 torch.backends.cudnn.deterministic = True
 torch.manual_seed(0)
 torch.cuda.manual_seed_all(0)
@@ -46,13 +47,13 @@ parser.add_argument('-pos_emb', type=bool, default=True)
 # --- KT-guided distillation (train-time) ---
 # parser.add_argument('--lambda_kt', type=float, default=5000.0)      # 保持你当前 5000 不变
 # parser.add_argument('--lambda_distill', type=float, default=0.1)    # 默认关闭，不影响现有结果
-parser.add_argument('--distill_k', type=int, default=30)           # topK 候选大小
-parser.add_argument('--distill_tau', type=float, default=1.0)       # 温度
-parser.add_argument('--distill_eps', type=float, default=1e-12)     # log/softmax 稳定项
-
+parser.add_argument('--distill_k', type=int, default=30)  # topK 候选大小
+parser.add_argument('--distill_tau', type=float, default=1.0)  # 温度
+parser.add_argument('--distill_eps', type=float, default=1e-12)  # log/softmax 稳定项
 
 opt = parser.parse_args()
 opt.d_word_vec = opt.d_model
+
 
 def compute_kt_clf_metrics(y_prob, y_true, mask):
     """
@@ -114,14 +115,14 @@ def compute_rec_clf_metrics(y_pred_logits, y_true, pad_id=0, skip_id=1):
 def compute_ranking_metrics(y_pred_logits, y_true, k_list=[1, 5, 10, 20], pad_id=0, skip_id=1):
     """
     计算推荐排序指标: Hit@K, NDCG@K, MRR@K
-    
+
     Args:
         y_pred_logits: (N, V) 模型预测的 logits
         y_true: (N,) 真实的目标物品 ID
         k_list: 要计算的 K 值列表
         pad_id: PAD 标记 ID
         skip_id: 跳过的标记 ID
-    
+
     Returns:
         dict: 包含 hit@k, ndcg@k, mrr@k 的字典
     """
@@ -129,7 +130,7 @@ def compute_ranking_metrics(y_pred_logits, y_true, k_list=[1, 5, 10, 20], pad_id
     valid_mask = (y_true != pad_id) & (y_true != skip_id)
     valid_true = y_true[valid_mask]
     valid_logits = y_pred_logits[valid_mask]
-    
+
     if len(valid_true) == 0:
         empty_results = {}
         for k in k_list:
@@ -137,25 +138,25 @@ def compute_ranking_metrics(y_pred_logits, y_true, k_list=[1, 5, 10, 20], pad_id
             empty_results[f'ndcg@{k}'] = 0.0
             empty_results[f'mrr@{k}'] = 0.0
         return empty_results
-    
+
     N = len(valid_true)
     V = valid_logits.shape[1]
-    
+
     # 获取排序后的索引 (降序)
     sorted_indices = np.argsort(-valid_logits, axis=1)  # (N, V)
-    
+
     results = {}
-    
+
     for k in k_list:
         k = min(k, V)  # 确保 k 不超过物品数量
         hits = 0
         ndcgs = 0.0
         mrrs = 0.0
-        
+
         for i in range(N):
             true_item = valid_true[i]
             top_k_items = sorted_indices[i, :k]
-            
+
             # Hit@K: 目标物品是否在 Top-K 中
             if true_item in top_k_items:
                 hits += 1
@@ -165,11 +166,11 @@ def compute_ranking_metrics(y_pred_logits, y_true, k_list=[1, 5, 10, 20], pad_id
                 ndcgs += 1.0 / np.log2(rank + 1)
                 # MRR@K: 平均倒数排名
                 mrrs += 1.0 / rank
-        
+
         results[f'hit@{k}'] = hits / N
         results[f'ndcg@{k}'] = ndcgs / N
         results[f'mrr@{k}'] = mrrs / N
-    
+
     return results
 
 
@@ -208,6 +209,8 @@ def kt_rerank_logits_numpy(logits_np, yt_tensor, base_k=100, beta=1.0, pad_id=0,
         out[n, cand] = score
 
     return out
+
+
 # print(opt)
 
 def batch_path_counts_from_logits(pred_logits, tgt, m, pad_id=0, skip_id=1):
@@ -221,7 +224,7 @@ def batch_path_counts_from_logits(pred_logits, tgt, m, pad_id=0, skip_id=1):
 
     if pred_logits.dim() == 2:
         V = pred_logits.size(-1)
-        pred_logits = pred_logits.view(B, T-1, V)
+        pred_logits = pred_logits.view(B, T - 1, V)
 
     pred_ids = pred_logits.argmax(dim=-1)  # (B, T-1)
 
@@ -238,6 +241,7 @@ def batch_path_counts_from_logits(pred_logits, tgt, m, pad_id=0, skip_id=1):
         FN += len(true_set - pred_set)
 
     return TP, FP, FN
+
 
 def prf_path_level_from_logits(pred_logits, tgt, m, pad_id=0, skip_id=1, average="micro"):
     """
@@ -330,14 +334,15 @@ def get_performance(crit, pred, gold):
     n_correct = pred_id.eq(gold_flat).masked_select(valid_mask).sum().float()
     return loss, n_correct
 
+
 def kt_guided_distill_loss(
-    pred_logits,  # (B*(T-1), V) 或 (B, T-1, V)
-    yt,           # (B, T-1, V) 或 (B*(T-1), V)
-    gold,         # (B, T-1)  真实下一题 id
-    k=100,
-    tau=1.0,
-    pad_id=0,
-    eps=1e-12,
+        pred_logits,  # (B*(T-1), V) 或 (B, T-1, V)
+        yt,  # (B, T-1, V) 或 (B*(T-1), V)
+        gold,  # (B, T-1)  真实下一题 id
+        k=100,
+        tau=1.0,
+        pad_id=0,
+        eps=1e-12,
 ):
     """
     只在 topK 候选集上做蒸馏：
@@ -364,7 +369,7 @@ def kt_guided_distill_loss(
         return pred_logits.new_tensor(0.0)
 
     logits_v = pred_logits[valid]  # (Nvalid, V)
-    yt_v = yt[valid]               # (Nvalid, V)
+    yt_v = yt[valid]  # (Nvalid, V)
 
     # ---- topK candidate indices from student logits ----
     kk = min(k, V)
@@ -372,7 +377,7 @@ def kt_guided_distill_loss(
 
     # ---- gather candidate scores ----
     stu_cand = torch.gather(logits_v, dim=1, index=cand_idx)  # (Nvalid, K)
-    tea_prob = torch.gather(yt_v, dim=1, index=cand_idx)      # (Nvalid, K)
+    tea_prob = torch.gather(yt_v, dim=1, index=cand_idx)  # (Nvalid, K)
 
     # ---- teacher distribution from KT prob ----
     # 用 log(yt) 再 softmax，更“像分布”，且数值稳定
@@ -389,6 +394,7 @@ def kt_guided_distill_loss(
     # 常见做法：乘 tau^2 保持梯度尺度（可选，建议保留）
     loss = loss * (tau * tau)
     return loss
+
 
 def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss, optimizer):
     # train
@@ -434,7 +440,6 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         # loss_eff = learning_effect_loss(model, yt, tgt.tolist(), ans.tolist(), topk_sequence, graph, batch_size, topnum = 1)
         # loss_eff = learning_effect_loss(yt)
         # adaptivity_loss = learning_adaptive_loss(tgt.tolist(), ans.tolist(), topk_sequence, opt.data_name)
-
 
         # loss = loss + 5000 * loss_kt
         # loss = loss_rec + opt.lambda_kt * loss_kt + opt.lambda_distill * loss_distill
@@ -493,8 +498,9 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
 
 def train_model(MSHGAT, data_path):
     # ========= Preparing DataLoader =========#
-    resource_size, total_cascades, timestamps, train, valid, test = Split_data(data_path, opt.train_rate, opt.valid_rate,
-                                                                           load_dict=True)
+    resource_size, total_cascades, timestamps, train, valid, test = Split_data(data_path, opt.train_rate,
+                                                                               opt.valid_rate,
+                                                                               load_dict=True)
 
     train_data = DataLoader(train, batch_size=opt.batch_size, load_dict=True, cuda=False)
     valid_data = DataLoader(valid, batch_size=opt.batch_size, load_dict=True, cuda=False)
@@ -743,6 +749,7 @@ def generate_rec_only_path(model_rec, model_kt, hist_seq, hist_ans, graph, max_l
 
     return generated_path, generated_ans
 
+
 def generate_dynamic_ep_path(model_rec, model_kt, hist_seq, hist_ans, target_pred, graph, max_length=10,
                              candidate_size=150):
     """
@@ -755,7 +762,7 @@ def generate_dynamic_ep_path(model_rec, model_kt, hist_seq, hist_ans, target_pre
 
     with torch.no_grad():
         hidden_kt = model_kt.gnn2(graph)
-        _, _, yt_init, _,_ = model_kt.ktmodel(hidden_kt, current_seq, current_ans)
+        _, _, yt_init, _, _ = model_kt.ktmodel(hidden_kt, current_seq, current_ans)
         p_current = yt_init[0, -1, :]
 
         for step in range(max_length):  # 最多允许生成 max_length 道题
@@ -782,7 +789,7 @@ def generate_dynamic_ep_path(model_rec, model_kt, hist_seq, hist_ans, target_pre
                 sim_seq = torch.cat([current_seq, torch.tensor([[cand_id]], device=current_seq.device)], dim=1)
                 sim_ans = torch.cat([current_ans, torch.tensor([[1]], device=current_ans.device)], dim=1)
 
-                _, _, yt_sim, _,_ = model_kt.ktmodel(hidden_kt, sim_seq, sim_ans)
+                _, _, yt_sim, _, _ = model_kt.ktmodel(hidden_kt, sim_seq, sim_ans)
                 p_sim = yt_sim[0, -1, :]
 
                 # 计算针对 【预测目标 target_pred】 的边际归一化增益
@@ -808,7 +815,8 @@ def generate_dynamic_ep_path(model_rec, model_kt, hist_seq, hist_ans, target_pre
             if best_candidate != -1:
                 generated_path.append(best_candidate)
                 generated_ans.append(best_ans_val)  # <--- ✅ 把模拟对错加入记录
-                current_seq = torch.cat([current_seq, torch.tensor([[best_candidate]], device=current_seq.device)],dim=1)
+                current_seq = torch.cat([current_seq, torch.tensor([[best_candidate]], device=current_seq.device)],
+                                        dim=1)
                 current_ans = torch.cat([current_ans, torch.tensor([[1]], device=current_ans.device)], dim=1)
                 p_current = best_p_next
             else:
@@ -817,7 +825,8 @@ def generate_dynamic_ep_path(model_rec, model_kt, hist_seq, hist_ans, target_pre
     return generated_path, generated_ans
 
 
-def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evaluator=None, k_list=[1, 5, 10, 20], do_ep_eval=True):
+def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, kt_evaluator=None, k_list=[1, 5, 10, 20],
+               do_ep_eval=True):
     # 如果没有传，就用自己；传了，就用最优的 kt 模型当裁判
     kt_referee = kt_evaluator if kt_evaluator is not None else model
     ''' Epoch operation in evaluation phase '''
@@ -842,12 +851,13 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
         scores['map@' + str(k)] = 0
 
     n_total_words = 0
-    #全局累计器
+    # 全局累计器
     paper_ms = [3, 5, 7, 9]
     paper_totals = {m: {"TP": 0, "FP": 0, "FN": 0} for m in paper_ms}
 
     with torch.no_grad():
-        for i, batch in enumerate(validation_data):  # tqdm(validation_data, mininterval=2, desc='  - (Validation) ', leave=False):
+        for i, batch in enumerate(
+                validation_data):  # tqdm(validation_data, mininterval=2, desc='  - (Validation) ', leave=False):
             # print("Validation batch ", i)
             # prepare data
             # tgt, tgt_timestamp, tgt_idx = batch
@@ -908,18 +918,18 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
                             # （你可以根据数据集的难度，把 0.8 改成 0.85 或 0.90）
                             if avg_init_mastery < 0.85:
 
-                                # # --- 5. 评估学生真实的瞎做路径 (Base EP) ---
-                                # real_seq = tgt[b:b + 1, :t + len(target_actual)].cuda()
-                                # real_ans = ans[b:b + 1, :t + len(target_actual)].cuda()
-                                # _, _, yt_base, _, _ = kt_referee.ktmodel(hidden_kt_eval, real_seq, real_ans)
-                                # p_base = yt_base[0, -1, :]
-                                #
-                                # ep_base = 0.0
-                                # for t_id in target_actual:
-                                #     gain = p_base[t_id].item() - p_init[t_id].item()
-                                #     room = 1.0 - p_init[t_id].item() if gain > 0 else p_init[t_id].item()
-                                #     ep_base += gain / (max(room, 0.1) + 1e-9)
-                                # ep_base = ep_base / len(target_actual)  # 严格求均值
+                                # --- 5. 评估学生真实的瞎做路径 (Base EP) ---
+                                real_seq = tgt[b:b + 1, :t + len(target_actual)].cuda()
+                                real_ans = ans[b:b + 1, :t + len(target_actual)].cuda()
+                                _, _, yt_base, _, _ = kt_referee.ktmodel(hidden_kt_eval, real_seq, real_ans)
+                                p_base = yt_base[0, -1, :]
+
+                                ep_base = 0.0
+                                for t_id in target_actual:
+                                    gain = p_base[t_id].item() - p_init[t_id].item()
+                                    room = 1.0 - p_init[t_id].item() if gain > 0 else p_init[t_id].item()
+                                    ep_base += gain / (max(room, 0.1) + 1e-9)
+                                ep_base = ep_base / len(target_actual)  # 严格求均值
 
                                 # ==========================================================
                                 # --- 5.5 新增：算法盲推，评估纯推荐路径 (Rec-Only EP) ---
@@ -945,46 +955,47 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
                                 else:
                                     ep_rec = 0.0
 
-                                # # --- 6. 算法登场：为了 target_pred 生成带 KT 前瞻的优化路径 (Opt EP) ---
-                                # gen_path, gen_ans = generate_dynamic_ep_path(
-                                #     model_rec=model, model_kt=kt_referee,
-                                #     hist_seq=hist_seq, hist_ans=hist_ans, target_pred=target_pred,
-                                #     graph=graph, max_length=10, candidate_size=150
-                                # )
-                                #
-                                # # --- 7. 终极审判：评估生成路径在 target_actual 上的收益 (Opt EP) ---
-                                # if len(gen_path) > 0:
-                                #     opt_seq = torch.cat([hist_seq, torch.tensor([gen_path]).cuda()], dim=1)
-                                #     opt_ans_tensor = torch.cat([hist_ans, torch.tensor([gen_ans]).cuda()], dim=1)
-                                #     _, _, yt_opt, _, _ = kt_referee.ktmodel(hidden_kt_eval, opt_seq, opt_ans_tensor)
-                                #     p_opt = yt_opt[0, -1, :]
-                                #
-                                #     ep_opt = 0.0
-                                #     for t_id in target_actual:
-                                #         gain = p_opt[t_id].item() - p_init[t_id].item()
-                                #         room = 1.0 - p_init[t_id].item() if gain > 0 else p_init[t_id].item()
-                                #         ep_opt += gain / (max(room, 0.1) + 1e-9)
-                                #     ep_opt = ep_opt / len(target_actual)
-                                # else:
-                                #     ep_opt = 0.0
-                                #
-                                # delta_ep = ep_opt - ep_base
+                                # --- 6. 算法登场：为了 target_pred 生成带 KT 前瞻的优化路径 (Opt EP) ---
+                                gen_path, gen_ans = generate_dynamic_ep_path(
+                                    model_rec=model, model_kt=kt_referee,
+                                    hist_seq=hist_seq, hist_ans=hist_ans, target_pred=target_pred,
+                                    graph=graph, max_length=10, candidate_size=150
+                                )
+
+                                # --- 7. 终极审判：评估生成路径在 target_actual 上的收益 (Opt EP) ---
+                                if len(gen_path) > 0:
+                                    opt_seq = torch.cat([hist_seq, torch.tensor([gen_path]).cuda()], dim=1)
+                                    opt_ans_tensor = torch.cat([hist_ans, torch.tensor([gen_ans]).cuda()], dim=1)
+                                    _, _, yt_opt, _, _ = kt_referee.ktmodel(hidden_kt_eval, opt_seq, opt_ans_tensor)
+                                    p_opt = yt_opt[0, -1, :]
+
+                                    ep_opt = 0.0
+                                    for t_id in target_actual:
+                                        gain = p_opt[t_id].item() - p_init[t_id].item()
+                                        room = 1.0 - p_init[t_id].item() if gain > 0 else p_init[t_id].item()
+                                        ep_opt += gain / (max(room, 0.1) + 1e-9)
+                                    ep_opt = ep_opt / len(target_actual)
+                                else:
+                                    ep_opt = 0.0
+
+                                delta_ep = ep_opt - ep_base
 
                                 # 全局累加
-                                # total_ep_real += ep_base
+                                total_ep_real += ep_base
                                 total_ep_rec += ep_rec  # <--- 新增
-                                # total_ep_gen += ep_opt
-                                # total_delta_ep += delta_ep
+                                total_ep_gen += ep_opt
+                                total_delta_ep += delta_ep
                                 valid_ep_samples += 1
 
-                                print(f"  [纯推荐评测] 样本 {valid_ep_samples:04d} | Rec(盲推): {ep_rec:+.4f}")
-                                # print(
-                                #     f"  [对决] 样本 {valid_ep_samples:04d} | Base(瞎做): {ep_base:+.4f} | Rec(盲推): {ep_rec:+.4f} | Opt(导航): {ep_opt:+.4f}")
+                                # print(f"  [纯推荐评测] 样本 {valid_ep_samples:04d} | Rec(盲推): {ep_rec:+.4f}")
+                                print(
+                                    f"  [对决] 样本 {valid_ep_samples:04d} | Base(瞎做): {ep_base:+.4f} | Rec(盲推): {ep_rec:+.4f} | Opt(导航): {ep_opt:+.4f}")
             # =========================================================
 
             # forward
             # pred = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
-            pred, pred_res, kt_mask, yt, _, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)  # ==================================
+            pred, pred_res, kt_mask, yt, _, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph,
+                                                      hypergraph_list)  # ==================================
 
             # for m in paper_ms:
             #     tp, fp, fn = batch_path_counts_from_logits(pred, tgt, m, pad_id=Constants.PAD, skip_id=1)
@@ -1014,12 +1025,13 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
                     skip_id=1
                 )
 
-
             loss_kt, auc, acc = kt_loss(pred_res.cpu(), ans.cpu(),
                                         kt_mask.cpu())  # ====================================================================
             if auc != -1 and acc != -1:  # ========================================================================================
-                auc_test.append(auc)  # ====================================================================================
-                acc_test.append(acc)  # ==========================================================================================
+                auc_test.append(
+                    auc)  # ====================================================================================
+                acc_test.append(
+                    acc)  # ==========================================================================================
 
             # =========================================================
             # ✅ 新增：计算 Precision, Recall, F1
@@ -1031,7 +1043,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
                 f1_test_kt.append(batch_f1)
             # =========================================================
             scores_batch, scores_len = metric.compute_metric(y_pred, y_gold, k_list)
-            
+
             # =========================================================
             # ✅ 新增：计算排序指标 (Hit@K, NDCG@K, MRR@K)
             # =========================================================
@@ -1046,7 +1058,6 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
             # for m in [3, 5, 7, 9]:
             #     prf = prf_path_level_from_logits(pred, tgt, m=m, pad_id=Constants.PAD, skip_id=1, average="micro")
             #     print(f"[Paper-style PRF] m={m}  P={prf['P']:.4f} R={prf['R']:.4f} F1={prf['F1']:.4f}")
-
 
             n_total_words += scores_len
             for k in k_list:
@@ -1076,24 +1087,26 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss,kt_evalua
     # # ✅ 新增：计算并打印整个测试集上的最终平均 EP 收益
     # ✅ 新增：计算并打印整个测试集上的最终平均 EP 收益
     if valid_ep_samples > 0:
-        # avg_ep_real = total_ep_real / valid_ep_samples
+        avg_ep_real = total_ep_real / valid_ep_samples
         avg_ep_rec = total_ep_rec / valid_ep_samples  # <--- 新增计算
-        # avg_ep_gen = total_ep_gen / valid_ep_samples
-        # avg_delta_ep = total_delta_ep / valid_ep_samples
+        avg_ep_gen = total_ep_gen / valid_ep_samples
+        avg_delta_ep = total_delta_ep / valid_ep_samples
 
         print(f"\n========== 🏆 全局 EP 收益最终评估 ({valid_ep_samples} 个有效测试样本) ==========")
-        # print(f"  => 平均真实 EP (Base - 自我摸索): {avg_ep_real:+.4f}")
+        print(f"  => 平均真实 EP (Base - 自我摸索): {avg_ep_real:+.4f}")
         print(f"  => 平均推荐 EP (Rec  - 纯推荐无指导): {avg_ep_rec:+.4f}")  # <--- 新增打印
-        # print(f"  => 平均生成 EP (Opt  - KT智能导航): {avg_ep_gen:+.4f}")
-        # print(f"  => 绝对平均净收益 (Opt vs Base): {avg_delta_ep:+.4f}")
+        print(f"  => 平均生成 EP (Opt  - KT智能导航): {avg_ep_gen:+.4f}")
+        print(f"  => 绝对平均净收益 (Opt vs Base): {avg_delta_ep:+.4f}")
         print("=========================================================================\n")
     return scores, auc_test, acc_test
+
 
 def test_model(MSHGAT, data_path):
     kt_loss = KTLoss()
     # 1. 获取数据，务必接收 train_history_cas 和 train_history_t 用于纯净建图
-    resource_size, total_cascades, timestamps, train, valid, test = Split_data(data_path, opt.train_rate, opt.valid_rate,
-                                                                           load_dict=True)
+    resource_size, total_cascades, timestamps, train, valid, test = Split_data(data_path, opt.train_rate,
+                                                                               opt.valid_rate,
+                                                                               load_dict=True)
 
     test_data = DataLoader(test, batch_size=opt.batch_size, load_dict=True, cuda=False)
 
@@ -1115,8 +1128,8 @@ def test_model(MSHGAT, data_path):
     model_kt.load_state_dict(torch.load(opt.save_kt_path))
 
     # 使用 model_rec 跑测试
-    scores, _, _ = test_epoch(model_rec, test_data, relation_graph, hypergraph_list, kt_loss,kt_evaluator=model_kt,
-                                            k_list=[1, 5, 10, 20])
+    scores, _, _ = test_epoch(model_rec, test_data, relation_graph, hypergraph_list, kt_loss, kt_evaluator=model_kt,
+                              k_list=[1, 5, 10, 20])
     # =========================================================
     # 6. 测试知识追踪模型 (KT Model) - 只看 KT 指标
     # =========================================================
@@ -1139,7 +1152,6 @@ def test_model(MSHGAT, data_path):
         print(metric + ' ' + str(scores[metric]))
     print('auc_test: {:.10f}'.format(np.mean(auc_test)),
           'acc_test: {:.10f}'.format(np.mean(acc_test)))
-
 
 
 if __name__ == "__main__":
