@@ -282,57 +282,132 @@ class MSHGAT(nn.Module):
         predictions = self.readout(pred_logits)
         return predictions
 
+    # def forward(self, input, input_timestamp, input_idx, ans, graph, hypergraph_list):
+    #     # 只使用图神经网络部分，跳过超图处理
+    #     original_input = input
+    #     input = input[:, :-1]  # 保持原始处理方式
+    #     input_timestamp = input_timestamp[:, :-1]  # 保持原始处理方式
+    # 
+    #     # 从original_input中提取对应的ans部分
+    #     # original_ans = ans
+    #     # ans = ans[:, :-1] if ans.size(1) > input.size(1) else ans
+    # 
+    #     # 仅使用图神经网络获取节点嵌入
+    #     hidden = self.dropout(self.gnn(graph))
+    #     hidden_kt = self.dropout(self.gnn2(graph))
+    # 
+    #     # 使用DKT模型获取知识追踪结果
+    #     # pred_res, kt_mask, yt, _ = self.ktmodel(hidden_kt, original_input, ans)
+    #     pred_res, kt_mask, yt, _, kt_hidden = self.ktmodel(hidden_kt, original_input, ans)
+    # 
+    #     # 直接使用图神经网络的输出作为序列嵌入
+    #     batch_size, max_len = input.size()
+    # 
+    #     # 使用图嵌入作为序列处理的输入
+    #     sequence_embeddings = F.embedding(input.cuda(), hidden.cuda())
+    # 
+    #     # 【核心魔法：残差相加融合】
+    #     # sequence_embeddings 是题目的客观属性
+    #     # kt_hidden 是学生的主观掌握状态
+    #     # 两者相加，Transformer 就能同时看到“题目是什么”和“学生会不会”！
+    #     # sequence_embeddings = sequence_embeddings + kt_hidden
+    #     # sequence_embeddings = sequence_embeddings + kt_hidden.detach()
+    #     # 添加位置编码
+    #     input_embeddings = sequence_embeddings
+    #     position_ids = torch.arange(input.size(1), dtype=torch.long, device=input.device)
+    #     position_ids = position_ids.unsqueeze(0).expand_as(input)
+    #     position_embedding = self.position_embedding(position_ids.cuda())
+    #     input_embeddings = input_embeddings + position_embedding
+    #     input_embeddings = self.LayerNorm(input_embeddings)
+    #     input_embeddings = self.dropout(input_embeddings)
+    # 
+    #     # 应用注意力掩码
+    #     extended_attention_mask = self.get_attention_mask(input)
+    # 
+    #     # Transformer处理
+    #     trm_output = self.trm_encoder(input_embeddings, extended_attention_mask, output_all_encoded_layers=False)
+    # 
+    #     status_emb = trm_output
+    #     # 预测
+    #     pred = self.pred(trm_output)
+    #     mask = get_previous_user_mask(input.cpu(), self.n_node)
+    # 
+    #     return (pred + mask).view(-1, pred.size(-1)).cuda(), pred_res, kt_mask, yt, hidden, status_emb
     def forward(self, input, input_timestamp, input_idx, ans, graph, hypergraph_list):
-        # 只使用图神经网络部分，跳过超图处理
+
         original_input = input
-        input = input[:, :-1]  # 保持原始处理方式
-        input_timestamp = input_timestamp[:, :-1]  # 保持原始处理方式
+        input = input[:, :-1]
 
-        # 从original_input中提取对应的ans部分
-        # original_ans = ans
-        # ans = ans[:, :-1] if ans.size(1) > input.size(1) else ans
-
-        # 仅使用图神经网络获取节点嵌入
+        input_timestamp = input_timestamp[:, :-1]
         hidden = self.dropout(self.gnn(graph))
+        memory_emb_list = self.hgnn(hidden, hypergraph_list)
         hidden_kt = self.dropout(self.gnn2(graph))
-
-        # 使用DKT模型获取知识追踪结果
-        # pred_res, kt_mask, yt, _ = self.ktmodel(hidden_kt, original_input, ans)
         pred_res, kt_mask, yt, _, kt_hidden = self.ktmodel(hidden_kt, original_input, ans)
 
-        # 直接使用图神经网络的输出作为序列嵌入
         batch_size, max_len = input.size()
 
-        # 使用图嵌入作为序列处理的输入
-        sequence_embeddings = F.embedding(input.cuda(), hidden.cuda())
+        zero_vec = torch.zeros_like(input)
+        dyemb = torch.zeros(batch_size, max_len, self.hidden_size).cuda()
+        cas_emb = torch.zeros(batch_size, max_len, self.hidden_size).cuda()
 
-        # 【核心魔法：残差相加融合】
-        # sequence_embeddings 是题目的客观属性
-        # kt_hidden 是学生的主观掌握状态
-        # 两者相加，Transformer 就能同时看到“题目是什么”和“学生会不会”！
-        # sequence_embeddings = sequence_embeddings + kt_hidden
-        # sequence_embeddings = sequence_embeddings + kt_hidden.detach()
-        # 添加位置编码
-        input_embeddings = sequence_embeddings
-        position_ids = torch.arange(input.size(1), dtype=torch.long, device=input.device)
-        position_ids = position_ids.unsqueeze(0).expand_as(input)
-        position_embedding = self.position_embedding(position_ids.cuda())
-        input_embeddings = input_embeddings + position_embedding
-        input_embeddings = self.LayerNorm(input_embeddings)
-        input_embeddings = self.dropout(input_embeddings)
+        sub_emb_list = []
+        sub_cas_list = []
+        sub_input_list = []
 
-        # 应用注意力掩码
+        for ind, time in enumerate(sorted(memory_emb_list.keys())):
+            if ind == 0:
+                sub_input = torch.where(input_timestamp <= time, input, zero_vec)
+                all_input = sub_input
+                sub_emb = F.embedding(sub_input.cuda(), hidden.cuda())
+                temp = sub_input == 0
+                sub_cas = sub_emb.clone()
+            else:
+                cur = torch.where(input_timestamp <= time, input, zero_vec) - sub_input
+                temp = cur == 0
+
+                sub_cas = torch.zeros_like(cur)
+                sub_cas[~temp] = 1
+                sub_cas = torch.einsum('ij,i->ij', sub_cas, input_idx)
+                sub_cas = F.embedding(sub_cas.cuda(), list(memory_emb_list.values())[ind - 1][1].cuda())
+                sub_emb = F.embedding(cur.cuda(), list(memory_emb_list.values())[ind - 1][0].cuda())
+                sub_input = cur + sub_input
+                all_input = cur + all_input
+
+            sub_cas[temp] = 0
+            sub_emb[temp] = 0
+            dyemb += sub_emb
+            cas_emb += sub_cas
+
+            if ind == len(memory_emb_list) - 1:
+                sub_input = input - sub_input
+                temp = sub_input == 0
+
+                sub_cas = torch.zeros_like(sub_input)
+                sub_cas[~temp] = 1
+                sub_cas = torch.einsum('ij,i->ij', sub_cas, input_idx)
+                sub_cas = F.embedding(sub_cas.cuda(), list(memory_emb_list.values())[ind - 1][1].cuda())
+                sub_cas[temp] = 0
+                sub_emb = F.embedding(sub_input.cuda(), list(memory_emb_list.values())[ind][0].cuda())
+                sub_emb[temp] = 0
+
+                all_emb = F.embedding(input.cuda(), list(memory_emb_list.values())[ind][2].cuda())
+
+                dyemb += sub_emb
+                cas_emb += sub_cas
+
+        item_emb, h_t1 = self.gru1(dyemb)  #
+        pos_emb, h_t2 = self.gru2(cas_emb)  #
+        input_emb = item_emb + pos_emb  #
+        input_emb = self.LayerNorm(input_emb)  #
+        input_emb = self.dropout(input_emb)  #
         extended_attention_mask = self.get_attention_mask(input)
-
-        # Transformer处理
-        trm_output = self.trm_encoder(input_embeddings, extended_attention_mask, output_all_encoded_layers=False)
-
-        status_emb = trm_output
-        # 预测
+        trm_output = self.trm_encoder(input_emb, extended_attention_mask,
+                                      output_all_encoded_layers=False)  # input_emb->dyemb
         pred = self.pred(trm_output)
         mask = get_previous_user_mask(input.cpu(), self.n_node)
+        pre = (pred + mask).view(-1, pred.size(-1)).cuda()
 
-        return (pred + mask).view(-1, pred.size(-1)).cuda(), pred_res, kt_mask, yt, hidden, status_emb
+        return pre, pred_res, kt_mask, yt, hidden, trm_output
 
 
 # 单独知识追踪模块用于有效性评价指标计算
