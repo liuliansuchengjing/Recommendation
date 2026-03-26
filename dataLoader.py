@@ -55,15 +55,25 @@ def Split_data(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_
         chunks = line.strip().split(',')
         for chunk in chunks:
             try:
-                if len(chunk.split()) == 3:
-                    user, timestamp, answer = chunk.split()
+                parts = chunk.split()
+                if len(parts) == 3:
+                    user, timestamp, answer = parts
+                elif len(parts) == 2:
+                    # 兼容只有 user 和 timestamp 的情况（默认 answer 为 1）
+                    user, timestamp = parts
+                    answer = '1'
+                else:
+                    # 格式不正确，跳过这个 chunk
+                    print(f"Warning: Skipping malformed chunk: {chunk}")
+                    continue
 
-            except:
-                print(chunk)
-            if user in u2idx:
-                userlist.append(u2idx[user])
-                timestamplist.append(float(timestamp))
-                answerlist.append(float(answer))
+                if user in u2idx:
+                    userlist.append(u2idx[user])
+                    timestamplist.append(float(timestamp))
+                    answerlist.append(float(answer))
+            except Exception as e:
+                print(f"Error processing chunk '{chunk}': {e}")
+                continue
 
         if len(userlist) > 1 and len(userlist) <= 500:
             if with_EOS:

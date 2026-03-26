@@ -23,7 +23,8 @@ def ConRelationGraph(data):
                 relation_list = [edge.split(',') for edge in relation_list]
 
                 relation_list = [(_u2idx[edge[0]], _u2idx[edge[1]]) for edge in relation_list if edge[0] in _u2idx and edge[1] in _u2idx]
-                # 单向图：直接使用原始边 (A -> B)
+                # relation_list_reverse = [edge[::-1] for edge in relation_list]
+                # edges_list += relation_list_reverse
                 edges_list += relation_list
         else:
             return [] 

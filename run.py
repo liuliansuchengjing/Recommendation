@@ -40,7 +40,7 @@ parser.add_argument('-n_warmup_steps', type=int, default=1000)
 parser.add_argument('-dropout', type=float, default=0.3)
 parser.add_argument('-log', default=None)
 parser.add_argument('-save_rec_path', default="./checkpoint/REC_Prediction_M100.pt")
-parser.add_argument('-save_kt_path', default="./checkpoint/KT_Prediction_M100.pt")
+# parser.add_argument('-save_kt_path', default="./checkpoint/KT_Prediction_M100.pt")  # 注释 KT 相关
 parser.add_argument('-save_mode', type=str, choices=['all', 'best'], default='best')
 parser.add_argument('-no_cuda', action='store_true')
 parser.add_argument('-pos_emb', type=bool, default=True)
@@ -396,7 +396,7 @@ def kt_guided_distill_loss(
     return loss
 
 
-def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss, optimizer):
+def train_epoch(model, training_data, graph, hypergraph_list, loss_func, optimizer):  # 移除 kt_loss 参数
     # train
 
     model.train()
@@ -405,8 +405,8 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
     n_total_words = 0.0
     n_total_correct = 0.0
     batch_num = 0.0
-    auc_train = []
-    acc_train = []
+    # auc_train = []  # 注释 KT 相关
+    # acc_train = []
 
     for i, batch in enumerate(
             training_data):  # tqdm(training_data, mininterval=2, desc='  - (Training)   ', leave=False):
@@ -426,7 +426,7 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         # training
         optimizer.zero_grad()
         # pred= model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
-        pred, pred_res, kt_mask, yt, _, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph,
+        pred= model(tgt, tgt_timestamp, tgt_idx, ans, graph,
                                                   hypergraph_list)  # ==================================
 
         # loss
@@ -449,7 +449,7 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
 
         # 1. 拿到三个原始损失 (Raw Loss)
         loss_rec_raw, n_correct = get_performance(loss_func, pred, gold)
-        loss_kt_raw, auc, acc = kt_loss(pred_res, ans, kt_mask)
+        # loss_kt_raw, auc, acc = kt_loss(pred_res, ans, kt_mask)  # 注释 KT 相关
         # loss_distill_raw = kt_guided_distill_loss(
         #     pred_logits=pred,  # (B*(T-1), V)
         #     yt=yt,  # (B, T-1, V)
@@ -467,16 +467,16 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
         weight_rec = torch.exp(-model.log_var_rec)
         loss_rec_adaptive = weight_rec * loss_rec_raw + model.log_var_rec
 
-        # 知识追踪损失
-        weight_kt = torch.exp(-model.log_var_kt)
-        loss_kt_adaptive = weight_kt * loss_kt_raw + model.log_var_kt
+        # # 知识追踪损失  # 注释 KT 相关
+        # weight_kt = torch.exp(-model.log_var_kt)
+        # loss_kt_adaptive = weight_kt * loss_kt_raw + model.log_var_kt
 
         # # 蒸馏损失 (或者是你提到的第三个其他损失)
         # weight_distill = torch.exp(-model.log_var_distill)
         # loss_distill_adaptive = weight_distill * loss_distill_raw + model.log_var_distill
 
         # 3. 最终的总 Loss
-        loss = loss_rec_adaptive + loss_kt_adaptive
+        loss = loss_rec_adaptive  # + loss_kt_adaptive  # 注释 KT 相关，只保留推荐损失
 
         # 反向传播，这一步会让模型自动去更新那三个 log_var_xxx 参数
         loss.backward()
@@ -487,13 +487,11 @@ def train_epoch(model, training_data, graph, hypergraph_list, loss_func, kt_loss
 
         n_total_correct += n_correct
         total_loss += loss.item()
-        if auc != -1 and acc != -1:  # ========================================================================================
-            auc_train.append(
-                auc)  # ====================================================================================
-            acc_train.append(
-                acc)  # ==========================================================================================
+        # if auc != -1 and acc != -1:  # 注释 KT 相关
+        #     auc_train.append(auc)
+        #     acc_train.append(acc)
 
-    return total_loss / n_total_words, n_total_correct / n_total_words, auc_train, acc_train
+    return total_loss / n_total_words, n_total_correct / n_total_words  # , auc_train, acc_train  # 注释 KT 相关
 
 
 def train_model(MSHGAT, data_path):
@@ -513,7 +511,7 @@ def train_model(MSHGAT, data_path):
 
     # 1. 定义两个不同的最高分记录
     best_rec_hit = 0.0
-    best_kt_auc = 0.0
+    # best_kt_auc = 0.0  # 注释 KT 相关
 
     # 2. 初始化早停机制参数 (新增)
     patience = 5  # 容忍多少个 epoch 没有提升
@@ -522,7 +520,7 @@ def train_model(MSHGAT, data_path):
     # ========= Preparing Model =========#
     model = MSHGAT(opt, dropout=opt.dropout)
     loss_func = nn.CrossEntropyLoss(size_average=False, ignore_index=Constants.PAD)
-    kt_loss = KTLoss()
+    # kt_loss = KTLoss()  # 注释 KT 相关
 
     params = model.parameters()
     optimizerAdam = torch.optim.Adam(params, betas=(0.9, 0.98), eps=1e-09)
@@ -531,23 +529,25 @@ def train_model(MSHGAT, data_path):
     if torch.cuda.is_available():
         model = model.cuda()
         loss_func = loss_func.cuda()
-        kt_loss = kt_loss.cuda()
+        # kt_loss = kt_loss.cuda()  # 注释 KT 相关
 
     validation_history = 0.0
     best_scores = {}
-    best_kt_metrics = {'auc': 0.0, 'acc': 0.0}  # 新增逻辑：专门记录 KT 的最佳指标
+    # best_kt_metrics = {'auc': 0.0, 'acc': 0.0}  # 注释 KT 相关
     for epoch_i in range(opt.epoch):
         print('\n[ Epoch', epoch_i, ']')
 
         start = time.time()
-        train_loss, train_accu, train_auc, train_acc = train_epoch(model, train_data, relation_graph, hypergraph_list,
-                                                                   loss_func, kt_loss, optimizer)
+        # train_loss, train_accu, train_auc, train_acc = train_epoch(model, train_data, relation_graph, hypergraph_list,
+        #                                                            loss_func, kt_loss, optimizer)
+        train_loss, train_accu = train_epoch(model, train_data, relation_graph, hypergraph_list,
+                                                                   loss_func, optimizer)  # 注释 KT 相关，移除 kt_loss
 
         # ==================== 新增：获取并计算当前的自适应权重 ====================
         # 因为定义的参数是对数方差 (log_var)，实际的权重是 exp(-log_var)
         # 使用 .item() 将单个元素的 Tensor 转换为普通的 Python 浮点数
         w_rec = torch.exp(-model.log_var_rec).item()
-        w_kt = torch.exp(-model.log_var_kt).item()
+        # w_kt = torch.exp(-model.log_var_kt).item()  # 注释 KT 相关
         # w_distill = torch.exp(-model.log_var_distill).item()
         # =========================================================================
 
@@ -555,30 +555,33 @@ def train_model(MSHGAT, data_path):
               'elapse: {elapse:3.3f} min'.format(
             loss=train_loss, accu=100 * train_accu,
             elapse=(time.time() - start) / 60))
-        print('auc_train: {:.10f}'.format(np.mean(train_auc)),
-              'acc_train: {:.10f}'.format(np.mean(train_acc)))
+        # print('auc_train: {:.10f}'.format(np.mean(train_auc)),  # 注释 KT 相关
+        #       'acc_train: {:.10f}'.format(np.mean(train_acc)))
 
         # ==================== 新增：打印权重信息 ====================
         # print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} | Distill: {w_distill:.4f}')
-        print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} ')
+        # print(f'  - (Weights)    Rec: {w_rec:.4f} | KT: {w_kt:.4f} ')  # 注释 KT 相关
+        print(f'  - (Weights)    Rec: {w_rec:.4f}')  # 只保留推荐权重
         # ==========================================================
 
         if epoch_i >= 0:
             start = time.time()
-            scores, auc_valid, acc_valid = test_epoch(model, valid_data, relation_graph, hypergraph_list, kt_loss)
+            # scores, auc_valid, acc_valid = test_epoch(model, valid_data, relation_graph, hypergraph_list, kt_loss)  # 注释 KT 相关
+            scores = test_epoch(model, valid_data, relation_graph, hypergraph_list)
             print('  - ( Validation )) ')
             for metric in scores.keys():
                 print(metric + ' ' + str(scores[metric]))
-            print('auc_valid: {:.10f}'.format(np.mean(auc_valid)),
-                  'acc_valid: {:.10f}'.format(np.mean(acc_valid)))
+            # print('auc_valid: {:.10f}'.format(np.mean(auc_valid)),  # 注释 KT 相关
+            #       'acc_valid: {:.10f}'.format(np.mean(acc_valid)))
             print("Validation use time: ", (time.time() - start) / 60, "min")
 
             print('  - (Test) ')
-            scores, auc_test, acc_test = test_epoch(model, test_data, relation_graph, hypergraph_list, kt_loss)
+            # scores, auc_test, acc_test = test_epoch(model, test_data, relation_graph, hypergraph_list, kt_loss)  # 注释 KT 相关
+            scores = test_epoch(model, test_data, relation_graph, hypergraph_list)
             for metric in scores.keys():
                 print(metric + ' ' + str(scores[metric]))
-            print('auc_test: {:.10f}'.format(np.mean(auc_test)),
-                  'acc_test: {:.10f}'.format(np.mean(acc_test)))
+            # print('auc_test: {:.10f}'.format(np.mean(auc_test)),  # 注释 KT 相关
+            #       'acc_test: {:.10f}'.format(np.mean(acc_test)))
             # if validation_history <= sum(scores.values()):
             #     print("Best Validation hit@20:{} at Epoch:{}".format(scores["hits@20"], epoch_i))
             #     validation_history = sum(scores.values())
@@ -596,15 +599,15 @@ def train_model(MSHGAT, data_path):
                 best_scores = scores
                 is_improved = True  # 只要推荐变好了，就标记为 True
 
-            # 逻辑 2：保存知识追踪最好的模型（独立保存！）
-            current_kt_auc = np.mean(auc_test)
-            if current_kt_auc > best_kt_auc:
-                best_kt_auc = current_kt_auc
-                torch.save(model.state_dict(), opt.save_kt_path)
-                best_kt_metrics['auc'] = current_kt_auc
-                best_kt_metrics['acc'] = np.mean(acc_test)
-                print("Save Best KT Model!")
-                is_improved = True  # 只要 KT 变好了，也标记为 True
+            # # 逻辑 2：保存知识追踪最好的模型（独立保存！）  # 注释 KT 相关
+            # current_kt_auc = np.mean(auc_test)
+            # if current_kt_auc > best_kt_auc:
+            #     best_kt_auc = current_kt_auc
+            #     torch.save(model.state_dict(), opt.save_kt_path)
+            #     best_kt_metrics['auc'] = current_kt_auc
+            #     best_kt_metrics['acc'] = np.mean(acc_test)
+            #     print("Save Best KT Model!")
+            #     is_improved = True  # 只要 KT 变好了，也标记为 True
 
             # 4. 更新耐心计时器
             if is_improved:
@@ -622,9 +625,9 @@ def train_model(MSHGAT, data_path):
     for metric in best_scores.keys():
         print(metric + ' ' + str(best_scores[metric]))
 
-    print("\n Best Knowledge Tracing scores: ")
-    for metric in best_kt_metrics.keys():
-        print(f"    {metric}: {best_kt_metrics[metric]:.4f}")
+    # print("\n Best Knowledge Tracing scores: ")  # 注释 KT 相关
+    # for metric in best_kt_metrics.keys():
+    #     print(f"    {metric}: {best_kt_metrics[metric]:.4f}")
 
 
 def generate_ep_greedy_path(model_rec, model_kt, hist_seq, hist_ans, target_set, graph, path_length=10,
@@ -791,7 +794,7 @@ def generate_rec_only_path(model_rec, model_kt, hist_seq, hist_ans, graph, max_l
 
         for step in range(max_length):  # 推理 max_length 步
             # 1. 纯依靠推荐模型给出下一步的预测
-            pred_logits, _, _, _, _, _ = model_rec(current_seq, current_seq, current_seq, current_ans, graph, None)
+            pred_logits = model_rec(current_seq, current_seq, current_seq, current_ans, graph, None)
             last_step_logits = pred_logits[-1, :]
 
             # 把所有概率从大到小排序
@@ -824,26 +827,25 @@ def generate_rec_only_path(model_rec, model_kt, hist_seq, hist_ans, graph, max_l
 
     return generated_path, generated_ans
 
-def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, kt_evaluator=None, k_list=[1, 5, 10, 20],
-               do_ep_eval=True):
+def test_epoch(model, validation_data, graph, hypergraph_list, k_list=[1, 5, 10, 15]):  # 移除 kt_loss 和 kt_evaluator 参数
     # 如果没有传，就用自己；传了，就用最优的 kt 模型当裁判
-    kt_referee = kt_evaluator if kt_evaluator is not None else model
+    # kt_referee = kt_evaluator if kt_evaluator is not None else model  # 注释 KT 相关
     ''' Epoch operation in evaluation phase '''
     model.eval()
     # KT 的指标列表
-    auc_test, acc_test = [], []
-    p_test_kt, r_test_kt, f1_test_kt = [], [], []
+    # auc_test, acc_test = [], []  # 注释 KT 相关
+    # p_test_kt, r_test_kt, f1_test_kt = [], [], []
     # ✅ 新增：推荐任务 (Rec) 的 Top-1 指标列表
     acc_test_rec, p_test_rec, r_test_rec, f1_test_rec = [], [], [], []
     # ✅ 新增：排序指标累计器 (Hit, NDCG, MRR)
     ranking_totals = {k: {'hit': 0.0, 'ndcg': 0.0, 'mrr': 0.0} for k in k_list}
     ranking_count = 0
     # ✅ 新增：用于统计全局 EP 收益的累加器
-    total_ep_real = 0.0
-    total_ep_rec = 0.0  # <--- 新增：纯推荐的累加器
-    total_ep_gen = 0.0
-    total_delta_ep = 0.0
-    valid_ep_samples = 0
+    # total_ep_real = 0.0  # 注释 KT 相关
+    # total_ep_rec = 0.0  # <--- 新增：纯推荐的累加器
+    # total_ep_gen = 0.0
+    # total_delta_ep = 0.0
+    # valid_ep_samples = 0
     scores = {}
     for k in k_list:
         scores['hits@' + str(k)] = 0
@@ -1024,7 +1026,7 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, kt_evalu
 
             # forward
             # pred = model(tgt, tgt_timestamp, tgt_idx, ans, graph, hypergraph_list)
-            pred, pred_res, kt_mask, yt, _, _ = model(tgt, tgt_timestamp, tgt_idx, ans, graph,
+            pred = model(tgt, tgt_timestamp, tgt_idx, ans, graph,
                                                       hypergraph_list)  # ==================================
 
             # for m in paper_ms:
@@ -1044,22 +1046,20 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, kt_evalu
                 r_test_rec.append(rec_r)
                 f1_test_rec.append(rec_f1)
 
-            loss_kt, auc, acc = kt_loss(pred_res.cpu(), ans.cpu(),
-                                        kt_mask.cpu())  # ====================================================================
-            if auc != -1 and acc != -1:  # ========================================================================================
-                auc_test.append(
-                    auc)  # ====================================================================================
-                acc_test.append(
-                    acc)  # ==========================================================================================
+            # loss_kt, auc, acc = kt_loss(pred_res.cpu(), ans.cpu(),
+            #                             kt_mask.cpu())  # 注释 KT 相关
+            # if auc != -1 and acc != -1:
+            #     auc_test.append(auc)
+            #     acc_test.append(acc)
 
-            # =========================================================
-            # ✅ 新增：计算 Precision, Recall, F1
-            # 这里的 pred_res 是知识追踪预测的概率，ans 是真实答案，kt_mask 是掩码
-            batch_acc, batch_p, batch_r, batch_f1 = compute_kt_clf_metrics(pred_res, ans[:, 1:], kt_mask)
-            if batch_acc != -1:
-                p_test_kt.append(batch_p)
-                r_test_kt.append(batch_r)
-                f1_test_kt.append(batch_f1)
+            # # =========================================================  # 注释 KT 相关
+            # # ✅ 新增：计算 Precision, Recall, F1
+            # # 这里的 pred_res 是知识追踪预测的概率，ans 是真实答案，kt_mask 是掩码
+            # batch_acc, batch_p, batch_r, batch_f1 = compute_kt_clf_metrics(pred_res, ans[:, 1:], kt_mask)
+            # if batch_acc != -1:
+            #     p_test_kt.append(batch_p)
+            #     r_test_kt.append(batch_r)
+            #     f1_test_kt.append(batch_f1)
             # =========================================================
             scores_batch, scores_len = metric.compute_metric(y_pred, y_gold, k_list)
 
@@ -1097,9 +1097,9 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, kt_evalu
     print('==========================================\n')
 
     # ✅ 新增：在终端直接打印出这三个指标的平均值
-    print('  [KT Metrics] Precision: {:.4f} | Recall: {:.4f} | F1: {:.4f}'.format(
-        np.mean(p_test_kt), np.mean(r_test_kt), np.mean(f1_test_kt)
-    ))
+    # print('  [KT Metrics] Precision: {:.4f} | Recall: {:.4f} | F1: {:.4f}'.format(  # 注释 KT 相关
+    #     np.mean(p_test_kt), np.mean(r_test_kt), np.mean(f1_test_kt)
+    # ))
     print('  [Rec Top-1]   Accuracy: {:.4f} | Precision: {:.4f} | Recall: {:.4f} | F1: {:.4f}'.format(
         np.mean(acc_test_rec), np.mean(p_test_rec), np.mean(r_test_rec), np.mean(f1_test_rec)
     ))
@@ -1121,21 +1121,21 @@ def test_epoch(model, validation_data, graph, hypergraph_list, kt_loss, kt_evalu
     #         improvement_ratio = (avg_delta_ep / avg_ep_real) * 100
     #         print(f"  => 相对学习效率提升: +{improvement_ratio:.2f}%")
     #     print("=========================================================================\n")
-    return scores, auc_test, acc_test
+    return scores  # , auc_test, acc_test  # 注释 KT 相关，只返回 scores
 
 
 def test_model(MSHGAT, data_path):
-    kt_loss = KTLoss()
-    # 1. 获取数据，务必接收 train_history_cas 和 train_history_t 用于纯净建图
-    resource_size, total_cascades, timestamps, train, valid, test = Split_data(data_path, opt.train_rate,
-                                                                               opt.valid_rate,
-                                                                               load_dict=True)
+    # kt_loss = KTLoss()  # 注释 KT 相关
+    # 1. 修复：正确接收 Split_data 的 7 个返回值
+    resource_size, train_history_cas, train_history_t, train, valid, test = Split_data(
+        data_path, opt.train_rate, opt.valid_rate, load_dict=True
+    )
 
     test_data = DataLoader(test, batch_size=opt.batch_size, load_dict=True, cuda=False)
 
     # 2. 永远只用训练集历史来建图！(防止任何测试集泄露)
     relation_graph = ConRelationGraph(data_path)
-    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, resource_size)
+    hypergraph_list = ConHyperGraphList(train_history_cas, train_history_t, resource_size)
 
     opt.resource_size = resource_size
 
@@ -1143,38 +1143,43 @@ def test_model(MSHGAT, data_path):
     # model.load_state_dict(torch.load(opt.save_path))
     # 3. 实例化两个模型：一个用于推荐，一个用于知识追踪
     model_rec = MSHGAT(opt, dropout=opt.dropout).cuda()
-    model_kt = MSHGAT(opt, dropout=opt.dropout).cuda()
+    # model_kt = MSHGAT(opt, dropout=opt.dropout).cuda()  # 注释 KT 相关
     # model.cuda()
-    kt_loss = kt_loss.cuda()
+    # kt_loss = kt_loss.cuda()  # 注释 KT 相关
     # 4. 分别加载它们的最优权重
     model_rec.load_state_dict(torch.load(opt.save_rec_path))
-    model_kt.load_state_dict(torch.load(opt.save_kt_path))
+    # model_kt.load_state_dict(torch.load(opt.save_kt_path))  # 注释 KT 相关
 
     # 使用 model_rec 跑测试
-    scores, _, _ = test_epoch(model_rec, test_data, relation_graph, hypergraph_list, kt_loss, kt_evaluator=model_kt,
-                              k_list=[1, 5, 10, 20])
-    # =========================================================
-    # 6. 测试知识追踪模型 (KT Model) - 只看 KT 指标
-    # =========================================================
-    print('\n=======================================')
-    print('  Testing Knowledge Tracing Model...')
-    print('=======================================')
-    # 使用 model_kt 跑测试
-    _, auc_test, acc_test = test_epoch(model_kt, test_data, relation_graph, hypergraph_list, kt_loss,
-                                       k_list=[5], do_ep_eval=False)  # k_list 随便传个小的省时间，因为我们只取 AUC/ACC
-    # 在验证阶段调用
-    # 使用带有详细显示的版本
-    # scores, auc_test, acc_test = test_epoch(
-    #     model, test_data, relation_graph, hypergraph_list, kt_loss,
-    #     k_list=[5, 10, 20],
-    #     show_examples=True,  # 启用示例显示
-    # )
+    # scores, _, _ = test_epoch(model_rec, test_data, relation_graph, hypergraph_list, kt_loss, kt_evaluator=model_kt,
+    #                           k_list=[1, 5, 10, 20])  # 注释 KT 相关
+    scores = test_epoch(model_rec, test_data, relation_graph, hypergraph_list, k_list=[1, 5, 10, 15])
+    # # =========================================================  # 注释 KT 相关
+    # # 6. 测试知识追踪模型 (KT Model) - 只看 KT 指标
+    # # =========================================================
+    # print('\n=======================================')
+    # print('  Testing Knowledge Tracing Model...')
+    # print('=======================================')
+    # # 使用 model_kt 跑测试
+    # _, auc_test, acc_test = test_epoch(model_kt, test_data, relation_graph, hypergraph_list, kt_loss,
+    #                                    k_list=[5], do_ep_eval=False)  # k_list 随便传个小的省时间，因为我们只取 AUC/ACC
+    # # 在验证阶段调用
+    # # 使用带有详细显示的版本
+    # # scores, auc_test, acc_test = test_epoch(
+    # #     model, test_data, relation_graph, hypergraph_list, kt_loss,
+    # #     k_list=[5, 10, 20],
+    # #     show_examples=True,  # 启用示例显示
+    # # )
+    #
+    # print('  - (Test) ')
+    # for metric in scores.keys():
+    #     print(metric + ' ' + str(scores[metric]))
+    # print('auc_test: {:.10f}'.format(np.mean(auc_test)),
+    #       'acc_test: {:.10f}'.format(np.mean(acc_test)))
 
     print('  - (Test) ')
     for metric in scores.keys():
         print(metric + ' ' + str(scores[metric]))
-    print('auc_test: {:.10f}'.format(np.mean(auc_test)),
-          'acc_test: {:.10f}'.format(np.mean(acc_test)))
 
 
 if __name__ == "__main__":

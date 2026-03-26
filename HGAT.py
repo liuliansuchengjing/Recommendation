@@ -10,6 +10,7 @@ import Constants
 from TransformerBlock import TransformerBlock
 from torch.autograd import Variable
 from DKT import DKT
+from torch_geometric.nn import GATConv
 
 
 class HGNN_conv(nn.Module):
@@ -138,6 +139,8 @@ class GraphNN(nn.Module):
         return graph_output.cuda()
 
 
+'''Learn friendship network / Knowledge Dependency Graph'''
+
 '''Learn diffusion network'''
 
 
@@ -199,19 +202,17 @@ class MSHGAT(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.initial_feature = opt.initialFeatureSize
 
-        self.hgnn = HGNN_ATT(self.initial_feature, self.hidden_size * 2, self.hidden_size, dropout=dropout)
+        # ==================== 1. 空间图卷积模块 ====================
+        # 保留静态图GNN，彻底剥离冗余的超图(HGNN_ATT)及其特征融合门控(Fusion)
         self.gnn = GraphNN(self.n_node, self.initial_feature, dropout=dropout)
         self.gnn2 = GraphNN(self.n_node, self.initial_feature, dropout=dropout)
-        self.fus = Fusion(self.hidden_size)
-        self.fus1 = Fusion(self.hidden_size)
-        self.fus2 = Fusion(self.hidden_size)
 
         self.embedding = nn.Embedding(self.n_node, self.initial_feature, padding_idx=0)
-        self.reset_parameters()
         self.readout = MLPReadout(self.hidden_size, self.n_node, None)
-        self.gru1 = nn.GRU(self.hidden_size, self.hidden_size, num_layers=1, batch_first=True)
-        self.gru2 = nn.GRU(self.hidden_size, self.hidden_size, num_layers=1, batch_first=True)
 
+        # 注：已移除冗余的 self.gru1 和 self.gru2，时序建模任务完全交由 Transformer 负责
+
+        # ==================== 2. 时序建模模块 (Transformer) ====================
         self.n_layers = 1
         self.n_heads = 2
         self.inner_size = 64
@@ -219,9 +220,11 @@ class MSHGAT(nn.Module):
         self.attn_dropout_prob = 0.3
         self.layer_norm_eps = 1e-12
         self.hidden_act = 'gelu'
-        self.item_embedding = nn.Embedding(self.n_node + 1, self.hidden_size, padding_idx=0)  # mask token add 1
-        self.position_embedding = nn.Embedding(500, self.hidden_size)  # add mask_token at the last
+
+        self.item_embedding = nn.Embedding(self.n_node + 1, self.hidden_size, padding_idx=0)
+        self.position_embedding = nn.Embedding(500, self.hidden_size)
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
+
         self.trm_encoder = TransformerEncoder(
             n_layers=self.n_layers,
             n_heads=self.n_heads,
@@ -234,45 +237,34 @@ class MSHGAT(nn.Module):
             multiscale=False
         )
 
+        # ==================== 3. 知识追踪模块 (KT) ====================
         self.num_skills = opt.resource_size
         self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
 
-        # 定义三个可学习的对数方差参数（初始化为0）
+        # ==================== 4. 多任务自适应优化参数 ====================
         self.log_var_rec = nn.Parameter(torch.zeros(1))
         self.log_var_kt = nn.Parameter(torch.zeros(1))
-        # self.log_var_distill = nn.Parameter(torch.zeros(1))  # 新增第三个任务的自适应参数
+
+        self.reset_parameters()
 
     def reset_parameters(self):
+        """参数初始化：使用均匀分布初始化权重，避免破坏标量参数"""
         stdv = 1.0 / math.sqrt(self.hidden_size)
         for weight in self.parameters():
-            weight.data.uniform_(-stdv, stdv)
+            if weight.dim() > 1:  # 仅对非标量参数进行均匀初始化
+                weight.data.uniform_(-stdv, stdv)
 
-    # def get_attention_mask(self, item_seq):
-    #     """Generate bidirectional attention mask for multi-scale attention."""
-    #     attention_mask = (item_seq > 0).long()
-    #     extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # torch.int64
-    #     # bidirectional mask
-    #     extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
-    #     extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-    #     return extended_attention_mask
     def get_attention_mask(self, item_seq):
-        """Generate CAUSAL (unidirectional) attention mask for next-item prediction."""
+        """生成严格的因果注意力掩码（Causal Attention Mask），防止未来信息泄露"""
         batch_size, seq_len = item_seq.size()
 
-        # 1. 屏蔽掉补零(PAD)的位置
         padding_mask = (item_seq > 0).long()
-        extended_padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)  # [batch_size, 1, 1, seq_len]
+        extended_padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)
 
-        # 2. 核心修复：生成下三角因果掩码 (防止看到未来的题目)
-        # torch.tril 生成下三角矩阵：当前时间步只能看到自己及之前的，右上方全为 0
         causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=item_seq.device))
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
 
-        # 3. 将 Padding Mask 和 Causal Mask 结合
-        # 只有在两个 mask 中都是 1 的位置，才是模型被允许看到的
         extended_attention_mask = extended_padding_mask * causal_mask
-
-        # 4. 转换为 Transformer 兼容的负无穷格式
         extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
@@ -282,132 +274,235 @@ class MSHGAT(nn.Module):
         predictions = self.readout(pred_logits)
         return predictions
 
-    # def forward(self, input, input_timestamp, input_idx, ans, graph, hypergraph_list):
-    #     # 只使用图神经网络部分，跳过超图处理
-    #     original_input = input
-    #     input = input[:, :-1]  # 保持原始处理方式
-    #     input_timestamp = input_timestamp[:, :-1]  # 保持原始处理方式
-    # 
-    #     # 从original_input中提取对应的ans部分
-    #     # original_ans = ans
-    #     # ans = ans[:, :-1] if ans.size(1) > input.size(1) else ans
-    # 
-    #     # 仅使用图神经网络获取节点嵌入
-    #     hidden = self.dropout(self.gnn(graph))
-    #     hidden_kt = self.dropout(self.gnn2(graph))
-    # 
-    #     # 使用DKT模型获取知识追踪结果
-    #     # pred_res, kt_mask, yt, _ = self.ktmodel(hidden_kt, original_input, ans)
-    #     pred_res, kt_mask, yt, _, kt_hidden = self.ktmodel(hidden_kt, original_input, ans)
-    # 
-    #     # 直接使用图神经网络的输出作为序列嵌入
-    #     batch_size, max_len = input.size()
-    # 
-    #     # 使用图嵌入作为序列处理的输入
-    #     sequence_embeddings = F.embedding(input.cuda(), hidden.cuda())
-    # 
-    #     # 【核心魔法：残差相加融合】
-    #     # sequence_embeddings 是题目的客观属性
-    #     # kt_hidden 是学生的主观掌握状态
-    #     # 两者相加，Transformer 就能同时看到“题目是什么”和“学生会不会”！
-    #     # sequence_embeddings = sequence_embeddings + kt_hidden
-    #     # sequence_embeddings = sequence_embeddings + kt_hidden.detach()
-    #     # 添加位置编码
-    #     input_embeddings = sequence_embeddings
-    #     position_ids = torch.arange(input.size(1), dtype=torch.long, device=input.device)
-    #     position_ids = position_ids.unsqueeze(0).expand_as(input)
-    #     position_embedding = self.position_embedding(position_ids.cuda())
-    #     input_embeddings = input_embeddings + position_embedding
-    #     input_embeddings = self.LayerNorm(input_embeddings)
-    #     input_embeddings = self.dropout(input_embeddings)
-    # 
-    #     # 应用注意力掩码
-    #     extended_attention_mask = self.get_attention_mask(input)
-    # 
-    #     # Transformer处理
-    #     trm_output = self.trm_encoder(input_embeddings, extended_attention_mask, output_all_encoded_layers=False)
-    # 
-    #     status_emb = trm_output
-    #     # 预测
-    #     pred = self.pred(trm_output)
-    #     mask = get_previous_user_mask(input.cpu(), self.n_node)
-    # 
-    #     return (pred + mask).view(-1, pred.size(-1)).cuda(), pred_res, kt_mask, yt, hidden, status_emb
     def forward(self, input, input_timestamp, input_idx, ans, graph, hypergraph_list):
-
+        """
+        核心前向传播逻辑重构：图特征提取 -> 位置编码融合 -> Transformer 时序建模
+        """
+        # 1. 序列预处理
         original_input = input
         input = input[:, :-1]
 
-        input_timestamp = input_timestamp[:, :-1]
+        # 2. 空间特征提取：使用静态图神经网络获取全局题目表征
         hidden = self.dropout(self.gnn(graph))
-        memory_emb_list = self.hgnn(hidden, hypergraph_list)
-        hidden_kt = self.dropout(self.gnn2(graph))
-        pred_res, kt_mask, yt, _, kt_hidden = self.ktmodel(hidden_kt, original_input, ans)
 
-        batch_size, max_len = input.size()
+        # 3. 知识追踪分支：平行运算，评估认知状态
+        # hidden_kt = self.dropout(self.gnn2(graph))
+        # pred_res, kt_mask, yt, _, kt_hidden = self.ktmodel(hidden_kt, original_input, ans)
 
-        zero_vec = torch.zeros_like(input)
-        dyemb = torch.zeros(batch_size, max_len, self.hidden_size).cuda()
-        cas_emb = torch.zeros(batch_size, max_len, self.hidden_size).cuda()
+        # 4. 推荐系统分支：直接查表获取当前序列的题目特征矩阵
+        seq_emb = F.embedding(input.cuda(), hidden)
 
-        sub_emb_list = []
-        sub_cas_list = []
-        sub_input_list = []
+        # 5. 时序信号注入：生成并融合位置编码
+        position_ids = torch.arange(input.size(1), dtype=torch.long, device=input.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(input)
+        pos_emb = self.position_embedding(position_ids.cuda())
 
-        for ind, time in enumerate(sorted(memory_emb_list.keys())):
-            if ind == 0:
-                sub_input = torch.where(input_timestamp <= time, input, zero_vec)
-                all_input = sub_input
-                sub_emb = F.embedding(sub_input.cuda(), hidden.cuda())
-                temp = sub_input == 0
-                sub_cas = sub_emb.clone()
-            else:
-                cur = torch.where(input_timestamp <= time, input, zero_vec) - sub_input
-                temp = cur == 0
+        input_emb = seq_emb + pos_emb
+        input_emb = self.LayerNorm(input_emb)
+        input_emb = self.dropout(input_emb)
 
-                sub_cas = torch.zeros_like(cur)
-                sub_cas[~temp] = 1
-                sub_cas = torch.einsum('ij,i->ij', sub_cas, input_idx)
-                sub_cas = F.embedding(sub_cas.cuda(), list(memory_emb_list.values())[ind - 1][1].cuda())
-                sub_emb = F.embedding(cur.cuda(), list(memory_emb_list.values())[ind - 1][0].cuda())
-                sub_input = cur + sub_input
-                all_input = cur + all_input
-
-            sub_cas[temp] = 0
-            sub_emb[temp] = 0
-            dyemb += sub_emb
-            cas_emb += sub_cas
-
-            if ind == len(memory_emb_list) - 1:
-                sub_input = input - sub_input
-                temp = sub_input == 0
-
-                sub_cas = torch.zeros_like(sub_input)
-                sub_cas[~temp] = 1
-                sub_cas = torch.einsum('ij,i->ij', sub_cas, input_idx)
-                sub_cas = F.embedding(sub_cas.cuda(), list(memory_emb_list.values())[ind - 1][1].cuda())
-                sub_cas[temp] = 0
-                sub_emb = F.embedding(sub_input.cuda(), list(memory_emb_list.values())[ind][0].cuda())
-                sub_emb[temp] = 0
-
-                all_emb = F.embedding(input.cuda(), list(memory_emb_list.values())[ind][2].cuda())
-
-                dyemb += sub_emb
-                cas_emb += sub_cas
-
-        item_emb, h_t1 = self.gru1(dyemb)  #
-        pos_emb, h_t2 = self.gru2(cas_emb)  #
-        input_emb = item_emb + pos_emb  #
-        input_emb = self.LayerNorm(input_emb)  #
-        input_emb = self.dropout(input_emb)  #
+        # 6. 动态意图建模：送入 Transformer 捕捉严格的序列因果关系
         extended_attention_mask = self.get_attention_mask(input)
-        trm_output = self.trm_encoder(input_emb, extended_attention_mask,
-                                      output_all_encoded_layers=False)  # input_emb->dyemb
+        trm_output = self.trm_encoder(
+            input_emb,
+            extended_attention_mask,
+            output_all_encoded_layers=False
+        )
+
+        # 7. 预测生成与掩码处理
         pred = self.pred(trm_output)
         mask = get_previous_user_mask(input.cpu(), self.n_node)
         pre = (pred + mask).view(-1, pred.size(-1)).cuda()
 
-        return pre, pred_res, kt_mask, yt, hidden, trm_output
+        # 保持返回值格式兼容原始 run.py 接口
+        return pre
+
+
+# class MSHGAT(nn.Module):
+#     def __init__(self, opt, dropout=0.3):
+#         super(MSHGAT, self).__init__()
+#         self.hidden_size = opt.d_word_vec
+#         self.n_node = opt.resource_size
+#         self.dropout = nn.Dropout(dropout)
+#         self.initial_feature = opt.initialFeatureSize
+
+#         self.hgnn = HGNN_ATT(self.initial_feature, self.hidden_size * 2, self.hidden_size, dropout=dropout)
+#         self.gnn = GraphNN(self.n_node, self.initial_feature, dropout=dropout)
+#         self.gnn2 = GraphNN(self.n_node, self.initial_feature, dropout=dropout)
+#         self.fus = Fusion(self.hidden_size)
+#         self.fus1 = Fusion(self.hidden_size)
+#         self.fus2 = Fusion(self.hidden_size)
+
+#         self.embedding = nn.Embedding(self.n_node, self.initial_feature, padding_idx=0)
+#         self.reset_parameters()
+#         self.readout = MLPReadout(self.hidden_size, self.n_node, None)
+#         self.gru1 = nn.GRU(self.hidden_size, self.hidden_size, num_layers=1, batch_first=True)
+#         self.gru2 = nn.GRU(self.hidden_size, self.hidden_size, num_layers=1, batch_first=True)
+
+#         self.n_layers = 1
+#         self.n_heads = 2
+#         self.inner_size = 64
+#         self.hidden_dropout_prob = 0.3
+#         self.attn_dropout_prob = 0.3
+#         self.layer_norm_eps = 1e-12
+#         self.hidden_act = 'gelu'
+#         self.item_embedding = nn.Embedding(self.n_node + 1, self.hidden_size, padding_idx=0)  # mask token add 1
+#         self.position_embedding = nn.Embedding(500, self.hidden_size)  # add mask_token at the last
+#         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
+#         self.trm_encoder = TransformerEncoder(
+#             n_layers=self.n_layers,
+#             n_heads=self.n_heads,
+#             hidden_size=self.hidden_size,
+#             inner_size=self.inner_size,
+#             hidden_dropout_prob=self.hidden_dropout_prob,
+#             attn_dropout_prob=self.attn_dropout_prob,
+#             hidden_act=self.hidden_act,
+#             layer_norm_eps=self.layer_norm_eps,
+#             multiscale=False
+#         )
+
+#         self.num_skills = opt.resource_size
+#         self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
+
+#         # 定义三个可学习的对数方差参数（初始化为0）
+#         self.log_var_rec = nn.Parameter(torch.zeros(1))
+#         self.log_var_kt = nn.Parameter(torch.zeros(1))
+#         # self.log_var_distill = nn.Parameter(torch.zeros(1))  # 新增第三个任务的自适应参数
+
+#     def reset_parameters(self):
+#         stdv = 1.0 / math.sqrt(self.hidden_size)
+#         for weight in self.parameters():
+#             weight.data.uniform_(-stdv, stdv)
+
+#     # def get_attention_mask(self, item_seq):
+#     #     """Generate bidirectional attention mask for multi-scale attention."""
+#     #     attention_mask = (item_seq > 0).long()
+#     #     extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # torch.int64
+#     #     # bidirectional mask
+#     #     extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
+#     #     extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+#     #     return extended_attention_mask
+#     def get_attention_mask(self, item_seq):
+#         """Generate CAUSAL (unidirectional) attention mask for next-item prediction."""
+#         batch_size, seq_len = item_seq.size()
+
+#         # 1. 屏蔽掉补零(PAD)的位置
+#         padding_mask = (item_seq > 0).long()
+#         extended_padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)  # [batch_size, 1, 1, seq_len]
+
+#         # 2. 核心修复：生成下三角因果掩码 (防止看到未来的题目)
+#         # torch.tril 生成下三角矩阵：当前时间步只能看到自己及之前的，右上方全为 0
+#         causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=item_seq.device))
+#         causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+
+#         # 3. 将 Padding Mask 和 Causal Mask 结合
+#         # 只有在两个 mask 中都是 1 的位置，才是模型被允许看到的
+#         extended_attention_mask = extended_padding_mask * causal_mask
+
+#         # 4. 转换为 Transformer 兼容的负无穷格式
+#         extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
+#         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
+#         return extended_attention_mask
+
+#     def pred(self, pred_logits):
+#         predictions = self.readout(pred_logits)
+#         return predictions
+
+#     # def forward(self, input, input_timestamp, input_idx, ans, graph, hypergraph_list):
+#     #     # 只使用图神经网络部分，跳过超图处理
+#     #     original_input = input
+#     #     input = input[:, :-1]  # 保持原始处理方式
+#     #     input_timestamp = input_timestamp[:, :-1]  # 保持原始处理方式
+#     #
+#     #     # 从original_input中提取对应的ans部分
+#     #     # original_ans = ans
+#     #     # ans = ans[:, :-1] if ans.size(1) > input.size(1) else ans
+#     #
+#     #     # 仅使用图神经网络获取节点嵌入
+#     #     hidden = self.dropout(self.gnn(graph))
+#     #     hidden_kt = self.dropout(self.gnn2(graph))
+#     #
+#     #     # 使用DKT模型获取知识追踪结果
+#     #     # pred_res, kt_mask, yt, _ = self.ktmodel(hidden_kt, original_input, ans)
+#     #     pred_res, kt_mask, yt, _, kt_hidden = self.ktmodel(hidden_kt, original_input, ans)
+#     #
+#     #     # 直接使用图神经网络的输出作为序列嵌入
+#     #     batch_size, max_len = input.size()
+#     #
+#     #     # 使用图嵌入作为序列处理的输入
+#     #     sequence_embeddings = F.embedding(input.cuda(), hidden.cuda())
+#     #
+#     #     # 【核心魔法：残差相加融合】
+#     #     # sequence_embeddings 是题目的客观属性
+#     #     # kt_hidden 是学生的主观掌握状态
+#     #     # 两者相加，Transformer 就能同时看到“题目是什么”和“学生会不会”！
+#     #     # sequence_embeddings = sequence_embeddings + kt_hidden
+#     #     # sequence_embeddings = sequence_embeddings + kt_hidden.detach()
+#     #     # 添加位置编码
+#     #     input_embeddings = sequence_embeddings
+#     #     position_ids = torch.arange(input.size(1), dtype=torch.long, device=input.device)
+#     #     position_ids = position_ids.unsqueeze(0).expand_as(input)
+#     #     position_embedding = self.position_embedding(position_ids.cuda())
+#     #     input_embeddings = input_embeddings + position_embedding
+#     #     input_embeddings = self.LayerNorm(input_embeddings)
+#     #     input_embeddings = self.dropout(input_embeddings)
+#     #
+#     #     # 应用注意力掩码
+#     #     extended_attention_mask = self.get_attention_mask(input)
+#     #
+#     #     # Transformer处理
+#     #     trm_output = self.trm_encoder(input_embeddings, extended_attention_mask, output_all_encoded_layers=False)
+#     #
+#     #     status_emb = trm_output
+#     #     # 预测
+#     #     pred = self.pred(trm_output)
+#     #     mask = get_previous_user_mask(input.cpu(), self.n_node)
+#     #
+#     #     return (pred + mask).view(-1, pred.size(-1)).cuda(), pred_res, kt_mask, yt, hidden, status_emb
+#     def forward(self, input, input_timestamp, input_idx, ans, graph, hypergraph_list):
+
+#         # 1. 序列预处理
+#         original_input = input
+#         input = input[:, :-1]
+
+#         # 2. 空间特征提取：使用 GNN 提取全局题目特征 (抛弃超图)
+#         hidden = self.dropout(self.gnn(graph))
+
+#         # # 3. 知识追踪分支：平行运行，互不干扰
+#         # hidden_kt = self.dropout(self.gnn2(graph))
+#         # pred_res, kt_mask, yt, _, kt_hidden = self.ktmodel(hidden_kt, original_input, ans)
+
+#         # 4. 推荐系统分支：直接查表获取序列特征，拒绝花里胡哨的切片
+#         # input 的 shape 是 [batch_size, seq_len]
+#         # 查表后 seq_emb 的 shape 是 [batch_size, seq_len, hidden_size]
+#         seq_emb = F.embedding(input.cuda(), hidden)
+
+#         # 5. 时序特征注入：生成并加上位置编码 (取代 GRU 的作用)
+#         position_ids = torch.arange(input.size(1), dtype=torch.long, device=input.device)
+#         position_ids = position_ids.unsqueeze(0).expand_as(input)
+#         pos_emb = self.position_embedding(position_ids.cuda())
+
+#         input_emb = seq_emb + pos_emb
+#         input_emb = self.LayerNorm(input_emb)
+#         input_emb = self.dropout(input_emb)
+
+#         # 6. 动态意图建模：一键送入 Transformer
+#         extended_attention_mask = self.get_attention_mask(input)
+#         trm_output = self.trm_encoder(
+#             input_emb,
+#             extended_attention_mask,
+#             output_all_encoded_layers=False
+#         )
+
+#         # 7. 预测与掩码
+#         pred = self.pred(trm_output)
+#         mask = get_previous_user_mask(input.cpu(), self.n_node)
+#         pre = (pred + mask).view(-1, pred.size(-1)).cuda()
+
+#         # 返回值保持不变，以兼容你外部的 loss 计算逻辑
+#         # 注意：此处返回的 trm_output 替代了原来无用的返回值
+#         return pre
 
 
 # 单独知识追踪模块用于有效性评价指标计算
