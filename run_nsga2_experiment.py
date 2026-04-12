@@ -82,8 +82,20 @@ def evaluate_path(path_ids, hist_seq, hist_ans, hist_time_bins, model_kt, graph,
     L_TARGET = len(path_ids)
     path_tensor = torch.tensor([path_ids], device='cuda')
 
-    # 模拟作答状态: 假设都作对(1)，时间分箱设为2(1-3分钟)
-    ans_tensor = torch.ones((1, L_TARGET), device='cuda')
+    # # 模拟作答状态: 假设都作对(1)，时间分箱设为2(1-3分钟)
+    # ans_tensor = torch.ones((1, L_TARGET), device='cuda')
+    # time_bins_tensor = torch.full((1, L_TARGET), 2, device='cuda')
+    # ==========================================
+    # 核心修复：基于初始知识状态动态模拟作答表现
+    # ==========================================
+    ans_list = []
+    for idx in path_ids:
+        # 认知模拟：如果对该题相关知识的预测掌握度 >= 0.5，则有能力做对 (1)；否则做错 (0)
+        sim_ans = 1.0 if p_before[idx].item() >= 0.5 else 0.0
+        ans_list.append(sim_ans)
+
+    ans_tensor = torch.tensor([ans_list], device='cuda')
+    # 时间分箱依然设为 2 (代表 1-3 分钟的正常作答时间)
     time_bins_tensor = torch.full((1, L_TARGET), 2, device='cuda')
 
     # 拼接历史与生成的候选路径
