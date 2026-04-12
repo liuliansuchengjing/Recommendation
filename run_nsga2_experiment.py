@@ -194,7 +194,9 @@ def main():
     model_kt.eval()
 
     # 3. 提取真实学生数据进行实验
-    print("正在从测试集中提取有效学生序列...")
+    print("正在从测试集中扫描有效学生序列...")
+    candidate_students = []  # 用来装所有符合条件的候选学生
+
     for batch in test_data:
         tgt, tgt_timestamp, tgt_idx, ans, tgt_end_time, _, _, _ = [item.cuda() for item in batch]
         time_bins = calc_time_bins(tgt_timestamp, tgt_end_time)
@@ -219,21 +221,83 @@ def main():
             if p_before.mean().item() > 0.8:
                 continue
 
-                # --- 步骤 B: 用推荐模型生成 TopK (K=50) 候选池 ---
+            # --- 步骤 B: 用推荐模型生成 TopK (K=50) 候选池 ---
             with torch.no_grad():
                 pred_logits, _, _, _, _ = model_rec(hist_seq, hist_timestamp, hist_idx, hist_ans, relation_graph,
                                                     hypergraph_list, hist_time_bins)
                 last_step_logits = pred_logits[-1, :]
 
                 # 提取 Top 50 并且过滤掉已经做过的题和无效占位符
-                top50_indices = torch.topk(last_step_logits, 80).indices.cpu().numpy()  # 多取一点用来过滤
+                top50_indices = torch.topk(last_step_logits, 80).indices.cpu().numpy()
                 hist_list = hist_seq[0].cpu().numpy().tolist()
                 topK_candidates = [int(x) for x in top50_indices if x > 1 and x not in hist_list][:50]
 
-            # 成功提取，跳出循环
-            break
+            # 把符合条件的学生存进列表，去掉原来的 break！
+            candidate_students.append({
+                'hist_seq': hist_seq,
+                'hist_ans': hist_ans,
+                'hist_time_bins': hist_time_bins,
+                'p_before': p_before,
+                'topK_candidates': topK_candidates
+            })
 
-    print("成功提取学生样本！初始知识平均掌握度: {:.4f}".format(p_before.mean().item()))
+    print(f"扫描完毕！测试集中共找到 {len(candidate_students)} 个符合条件的候选学生。")
+
+    if len(candidate_students) == 0:
+        print("未找到符合条件的学生，请调低学霸过滤阈值！")
+        return
+
+    # 从候选池中随机挑一个学生进行本次实验！
+    selected_student = random.choice(candidate_students)
+
+    hist_seq = selected_student['hist_seq']
+    hist_ans = selected_student['hist_ans']
+    hist_time_bins = selected_student['hist_time_bins']
+    p_before = selected_student['p_before']
+    topK_candidates = selected_student['topK_candidates']
+
+    print("成功随机抽取一名学生样本！初始知识平均掌握度: {:.4f}".format(p_before.mean().item()))
+    # # 3. 提取真实学生数据进行实验
+    # print("正在从测试集中提取有效学生序列...")
+    # for batch in test_data:
+    #     tgt, tgt_timestamp, tgt_idx, ans, tgt_end_time, _, _, _ = [item.cuda() for item in batch]
+    #     time_bins = calc_time_bins(tgt_timestamp, tgt_end_time)
+    #
+    #     valid_len = (tgt[0] > 1).sum().item()
+    #     if valid_len > 15:  # 找一个答题记录够长的学生
+    #         # 截取前 15 题作为历史序列
+    #         t = 15
+    #         hist_seq = tgt[0:1, :t]
+    #         hist_ans = ans[0:1, :t]
+    #         hist_time_bins = time_bins[0:1, :t]
+    #         hist_timestamp = tgt_timestamp[0:1, :t]
+    #         hist_idx = tgt_idx[0:1]
+    #
+    #         # --- 步骤 A: 用 DKT 评估初始知识状态 (p_before) ---
+    #         with torch.no_grad():
+    #             hidden_kt = model_kt.gnn2(relation_graph)
+    #             _, _, yt_init, _, _ = model_kt.ktmodel(hidden_kt, hist_seq, hist_ans, hist_time_bins)
+    #             p_before = yt_init[0, -1, :]  # 获取学完 15 题后的掌握度
+    #
+    #         # 学霸过滤：如果该学生已经掌握了大多数知识（均值>0.8），换一个学生
+    #         if p_before.mean().item() > 0.8:
+    #             continue
+    #
+    #             # --- 步骤 B: 用推荐模型生成 TopK (K=50) 候选池 ---
+    #         with torch.no_grad():
+    #             pred_logits, _, _, _, _ = model_rec(hist_seq, hist_timestamp, hist_idx, hist_ans, relation_graph,
+    #                                                 hypergraph_list, hist_time_bins)
+    #             last_step_logits = pred_logits[-1, :]
+    #
+    #             # 提取 Top 50 并且过滤掉已经做过的题和无效占位符
+    #             top50_indices = torch.topk(last_step_logits, 80).indices.cpu().numpy()  # 多取一点用来过滤
+    #             hist_list = hist_seq[0].cpu().numpy().tolist()
+    #             topK_candidates = [int(x) for x in top50_indices if x > 1 and x not in hist_list][:50]
+    #
+    #         # 成功提取，跳出循环
+    #         break
+
+    # print("成功提取学生样本！初始知识平均掌握度: {:.4f}".format(p_before.mean().item()))
 
     # 4. 执行 NSGA-II 对比实验
     print("Running NSGA-II Strategy A (Random)...")
