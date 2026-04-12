@@ -182,6 +182,7 @@ def main():
     hypergraph_list = ConHyperGraphList(train_history_cas, train_history_t, resource_size)
 
     valid_resource_ids = list(range(2, resource_size))  # 排除 PAD=0 和 SKIP=1
+    opt.resource_size = resource_size
 
     # 2. 加载模型
     model_rec = MSHGAT(opt, dropout=opt.dropout).cuda()
