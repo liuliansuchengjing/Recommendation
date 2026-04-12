@@ -136,7 +136,7 @@ def train_one_epoch(rl: RLPathOptimizer, train_loader, graph, hypergraph_list, d
         # tgt_timestamp: 时间戳 [B, L] - 每个序列的时间戳
         # tgt_idx: 索引 [B] - 每个序列的级联ID
         # ans: 答案 [B, L] - 每个交互的正确性标签
-        tgt, tgt_timestamp, tgt_idx, ans = batch
+        tgt, tgt_timestamp, tgt_idx, ans, tgt_end_time, tgt_answer_open, tgt_retry_status, tgt_evaluate_count = batch
         tgt = tgt.to(device)  # [B, L] - 目标序列，批量大小×序列长度
         tgt_timestamp = tgt_timestamp.to(device)  # [B, L] - 时间戳张量
         tgt_idx = tgt_idx.to(device)  # [B] - 级联索引张量
@@ -203,16 +203,17 @@ def main():
     # total_cascades: 总级联数 [list of lists]
     # timestamps: 时间戳 [list of lists]
     # train, valid, test: 训练/验证/测试集，格式为(tgt, tgt_timestamp, tgt_idx, ans)
-    user_size, total_cascades, timestamps, train, valid, test = Split_data(
+    # Split_data 返回: resource_size, train_history_cas, train_history_t, train, valid, test
+    resource_size, train_history_cas, train_history_t, train, valid, test = Split_data(
         args.data_name, args.train_rate, args.valid_rate, load_dict=True
     )
 
     # 构建关系图和超图
     relation_graph = ConRelationGraph(args.data_name)  # 关系图结构
-    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)  # 超图列表
+    hypergraph_list = ConHyperGraphList(train_history_cas, train_history_t, resource_size)  # 超图列表（使用训练集历史）
 
     args.d_word_vec = args.d_model  # 词向量维度
-    args.user_size = user_size  # 用户/物品总数
+    args.user_size = resource_size  # 用户/物品总数
     # 基础模型MSHGAT，接收参数并构建：
     # - 输入: [B, L] 序列，[B, L] 时间戳，[B] 级联ID，[B, L] 答案
     # - 输出: 预测概率分布和其他状态信息
@@ -323,7 +324,7 @@ def evaluate_base_top1_terminal_metrics_like_rl(
         if i >= max_batches:
             break
 
-        tgt, ts, idx, ans = batch[0].to(device), batch[1].to(device), batch[2].to(device), batch[3].to(device)
+        tgt, ts, idx, ans = batch[0].to(device), batch[1].to(device), batch[2].to(device), batch[3].to(device)  # 新增字段 batch[4:8] 可按需使用
 
         # 对齐训练/论文：windows 抽样（扩展 batch）
         src_idx, start_t = rl._sample_starts(tgt)
@@ -409,7 +410,7 @@ def test_rl_like_training(
 
     # lazy init
     first_batch = next(iter(eval_loader))
-    tgt, ts, idx, ans = (x.to(device) for x in first_batch)
+    tgt, ts, idx, ans = (x.to(device) for x in first_batch[:4])  # 只取前4个字段，新增字段可按需使用
     rl.ensure_initialized(tgt, ts, idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
 
     # ===== Base greedy-top1 rollout (same horizon_H as RL) =====
@@ -517,7 +518,7 @@ def test_rl():
 #
 #     # 触发 lazy init（你现在就是这么做的）:contentReference[oaicite:2]{index=2}
 #     first_batch = next(iter(eval_loader))
-#     tgt, ts, idx, ans = (x.to(device) for x in first_batch)
+#     tgt, ts, idx, ans = (x.to(device) for x in first_batch[:4])  # 只取前4个字段，新增字段可按需使用
 #     rl.ensure_initialized(tgt, ts, idx, ans, graph=relation_graph, hypergraph_list=hypergraph_list)
 #
 #     # 加载 policy ckpt（你现在固定写死 A_rl_policy.pt）:contentReference[oaicite:3]{index=3}

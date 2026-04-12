@@ -244,8 +244,11 @@ class MSHGAT(nn.Module):
         # ==================== 4. 多任务自适应优化参数 ====================
         self.log_var_rec = nn.Parameter(torch.zeros(1))
         self.log_var_kt = nn.Parameter(torch.zeros(1))
+        self.log_var_distill = nn.Parameter(torch.zeros(1))
 
         self.reset_parameters()
+        # 直接使用多层超图卷积网络 (不再需要 HGNN_ATT 的时间循环和门控)
+        self.hgnn = HGNNLayer(self.hidden_size, dropout=dropout)
 
     def reset_parameters(self):
         """参数初始化：使用均匀分布初始化权重，避免破坏标量参数"""
@@ -274,23 +277,45 @@ class MSHGAT(nn.Module):
         predictions = self.readout(pred_logits)
         return predictions
 
-    def forward(self, input, input_timestamp, input_idx, ans, graph, hypergraph_list):
+    def forward(self, input, input_timestamp, input_idx, ans, graph, hypergraph_list, time_bins):
         """
-        核心前向传播逻辑重构：图特征提取 -> 位置编码融合 -> Transformer 时序建模
+        核心前向传播：多阶超图特征聚合 (Multi-hop Aggregation) -> Transformer 时序建模
         """
         # 1. 序列预处理
         original_input = input
         input = input[:, :-1]
 
-        # 2. 空间特征提取：使用静态图神经网络获取全局题目表征
-        hidden = self.dropout(self.gnn(graph))
+        # 2. 获取 0 阶基础特征 (空间 GNN 输出，即节点自身的拓扑特征)
+        hidden_0 = self.dropout(self.gnn(graph))
 
-        # 3. 知识追踪分支：平行运算，评估认知状态
-        # hidden_kt = self.dropout(self.gnn2(graph))
-        # pred_res, kt_mask, yt, _, kt_hidden = self.ktmodel(hidden_kt, original_input, ans)
+        # 3. 知识追踪分支：平行运算
+        hidden_kt = self.dropout(self.gnn2(graph))
+        pred_res, kt_mask, yt, _, kt_hidden = self.ktmodel(hidden_kt, original_input, ans, time_bins)
 
-        # 4. 推荐系统分支：直接查表获取当前序列的题目特征矩阵
-        seq_emb = F.embedding(input.cuda(), hidden)
+        # =======================================================
+        # 🌟【全新架构】：多跳超图残差聚合 (Multi-hop Hypergraph Aggregation)
+        # =======================================================
+        # 安全获取 GPU 上的超图发生矩阵 G
+        if isinstance(hypergraph_list, (list, tuple)):
+            hypergraph_dict = hypergraph_list[0]
+            last_key = sorted(hypergraph_dict.keys())[-1]
+            G = hypergraph_dict[last_key].cuda()
+        else:
+            G = hypergraph_list.cuda()
+
+        # 第一跳 (1-hop)：捕获直接的群体协同关系 (做过这道题的学霸还做过什么)
+        hidden_1, _ = self.hgnn(hidden_0, G)
+
+        # 第二跳 (2-hop)：捕获间接的群体协同关系 ("同学的同学"的潜在关联)
+        # 注意：这里直接复用 self.hgnn，不增加任何新的可学习参数，防止过拟合！
+        hidden_2, _ = self.hgnn(hidden_1, G)
+
+        # 🌟 LightGCN 经典思想：将多阶特征直接等权重相加，构造出最强词表
+        # 这样既保留了题目自身的特性，又融合了广阔的全局图谱视野
+        final_item_hidden = hidden_0 + hidden_1 + hidden_2
+
+        # 4. 推荐系统分支：使用聚合后的【多阶混合特征库】进行查表
+        seq_emb = F.embedding(input.cuda(), final_item_hidden)
 
         # 5. 时序信号注入：生成并融合位置编码
         position_ids = torch.arange(input.size(1), dtype=torch.long, device=input.device)
@@ -301,7 +326,8 @@ class MSHGAT(nn.Module):
         input_emb = self.LayerNorm(input_emb)
         input_emb = self.dropout(input_emb)
 
-        # 6. 动态意图建模：送入 Transformer 捕捉严格的序列因果关系
+        # 6. 动态意图建模：送入 Transformer
+        # Transformer 此时看到的序列，其底层特征已经富含了丰富的多阶高阶协同信息
         extended_attention_mask = self.get_attention_mask(input)
         trm_output = self.trm_encoder(
             input_emb,
@@ -314,8 +340,7 @@ class MSHGAT(nn.Module):
         mask = get_previous_user_mask(input.cpu(), self.n_node)
         pre = (pred + mask).view(-1, pred.size(-1)).cuda()
 
-        # 保持返回值格式兼容原始 run.py 接口
-        return pre
+        return pre, pred_res, kt_mask, yt, hidden_0
 
 
 # class MSHGAT(nn.Module):

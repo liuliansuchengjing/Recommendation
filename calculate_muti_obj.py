@@ -195,7 +195,7 @@ def gain_test_epoch(model, kt_model, test_data, graph, hypergraph_list, kt_loss,
 
     with torch.no_grad():    # 不进行梯度计算
         for i, batch in enumerate(test_data):  # 遍历测试数据的每个批次
-            tgt, tgt_timestamp, tgt_idx, ans = batch    # 解包批次数据
+            tgt, tgt_timestamp, tgt_idx, ans, tgt_end_time, tgt_answer_open, tgt_retry_status, tgt_evaluate_count = batch    # 解包批次数据
             batch_size, seq_len = tgt.size()  # tgt维度: [batch_size, seq_len]
             tgt = tgt.cuda()
             ans = ans.cuda()

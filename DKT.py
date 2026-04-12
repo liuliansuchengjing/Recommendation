@@ -12,10 +12,21 @@ class DKT(nn.Module):
         self.hidden_dim = hidden_dim
         self.bias = bias
         self.correct_embed = nn.Embedding(2, emb_dim)  # 答案结果嵌入（正确、错误）
-        self.rnn = nn.LSTM(emb_dim * 2, hidden_dim, bias=bias, dropout=dropout, batch_first=True)
+        # self.rnn = nn.LSTM(emb_dim * 2, hidden_dim, bias=bias, dropout=dropout, batch_first=True)
+        # self.fc = nn.Linear(hidden_dim, num_skills, bias=bias)
+
+        # ==========================================================
+        # ✅ 1. 新增：答题时间的分箱嵌入（7个类别：0表示无记录，1-6为不同时长）
+        # ==========================================================
+        self.time_embed = nn.Embedding(7, emb_dim)
+
+        # ==========================================================
+        # ✅ 2. 修改：因为多拼接了时间特征，LSTM的输入维度由 emb_dim*2 变成 emb_dim*3
+        # ==========================================================
+        self.rnn = nn.LSTM(emb_dim * 3, hidden_dim, bias=bias, dropout=dropout, batch_first=True)
         self.fc = nn.Linear(hidden_dim, num_skills, bias=bias)
 
-    def forward(self, dynamic_skill_embeds, questions, correct_seq):
+    def forward(self, dynamic_skill_embeds, questions, correct_seq, time_bins):
         """
                 Parameters:
                     dynamic_skill_embeds: 动态生成的题目嵌入 [num_skills, emb_dim]
@@ -34,8 +45,18 @@ class DKT(nn.Module):
         # 生成答题结果嵌入 [batch_size, seq_len, emb_dim]
         correct_embeds = self.correct_embed(correct_seq.long().to('cuda'))
 
-        # 拼接题目嵌入和答题结果嵌入 [batch_size, seq_len, emb_dim*2]
-        lstm_input = torch.cat([skill_embeds, correct_embeds], dim=-1)
+        # # 拼接题目嵌入和答题结果嵌入 [batch_size, seq_len, emb_dim*2]
+        # lstm_input = torch.cat([skill_embeds, correct_embeds], dim=-1)
+
+        # ==========================================================
+        # ✅ 4. 新增：获取答题时间的嵌入特征
+        # ==========================================================
+        time_embeds = self.time_embed(time_bins.long().to('cuda'))
+
+        # ==========================================================
+        # ✅ 5. 修改：将三种特征拼接到一起丢进 LSTM
+        # ==========================================================
+        lstm_input = torch.cat([skill_embeds, correct_embeds, time_embeds], dim=-1)
 
         # seq_lens = ((questions != 0) & (questions != 1)).sum(dim=1)
 

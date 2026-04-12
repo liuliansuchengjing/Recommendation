@@ -46,22 +46,48 @@ def Split_data(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_
     t_cascades = []
     timestamps = []
     answers = []
+    # 新增：存储其他字段
+    end_times = []
+    answer_opens = []
+    retry_statuses = []
+    evaluate_counts = []
+
     for line in open(options.data):
         if len(line.strip()) == 0:
             continue
         timestamplist = []
         userlist = []
         answerlist = []
+        end_timelist = []
+        answer_openlist = []
+        retry_statuslist = []
+        evaluate_countlist = []
+
         chunks = line.strip().split(',')
         for chunk in chunks:
             try:
                 parts = chunk.split()
-                if len(parts) == 3:
+                if len(parts) == 7:
+                    # 7个字段: challenge_id, open_time, 是否正确, end_time, answer_open, retry_status, evaluate_count
+                    challenge_id, open_time, is_correct, end_time, answer_open, retry_status, evaluate_count = parts
+                    user = challenge_id
+                    timestamp = open_time
+                    answer = is_correct
+                elif len(parts) == 3:
                     user, timestamp, answer = parts
+                    # 兼容3字段格式，其他字段设默认值
+                    end_time = '0'
+                    answer_open = '0'
+                    retry_status = '0'
+                    evaluate_count = '0'
                 elif len(parts) == 2:
                     # 兼容只有 user 和 timestamp 的情况（默认 answer 为 1）
                     user, timestamp = parts
                     answer = '1'
+                    end_time = '0'
+                    answer_open = '0'
+                    retry_status = '0'
+                    evaluate_count = '0'
                 else:
                     # 格式不正确，跳过这个 chunk
                     print(f"Warning: Skipping malformed chunk: {chunk}")
@@ -71,6 +97,10 @@ def Split_data(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_
                     userlist.append(u2idx[user])
                     timestamplist.append(float(timestamp))
                     answerlist.append(float(answer))
+                    end_timelist.append(float(end_time))
+                    answer_openlist.append(float(answer_open))
+                    retry_statuslist.append(float(retry_status))
+                    evaluate_countlist.append(float(evaluate_count))
             except Exception as e:
                 print(f"Error processing chunk '{chunk}': {e}")
                 continue
@@ -80,9 +110,17 @@ def Split_data(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_
                 userlist.append(Constants.EOS)
                 timestamplist.append(Constants.EOS)
                 answerlist.append(Constants.EOS)
+                end_timelist.append(Constants.EOS)
+                answer_openlist.append(Constants.EOS)
+                retry_statuslist.append(Constants.EOS)
+                evaluate_countlist.append(Constants.EOS)
             t_cascades.append(userlist)
             timestamps.append(timestamplist)
             answers.append(answerlist)
+            end_times.append(end_timelist)
+            answer_opens.append(answer_openlist)
+            retry_statuses.append(retry_statuslist)
+            evaluate_counts.append(evaluate_countlist)
 
     '''ordered by timestamps'''
     order = [i[0] for i in sorted(enumerate(timestamps), key=lambda x: x[1])]
@@ -101,6 +139,11 @@ def Split_data(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_
     train_t = timestamps[0:train_idx_]
     train_idx = cas_idx[0:train_idx_]
     train_ans = answers[0:train_idx_]
+    train_end_time = end_times[0:train_idx_]
+    train_answer_open = answer_opens[0:train_idx_]
+    train_retry_status = retry_statuses[0:train_idx_]
+    train_evaluate_count = evaluate_counts[0:train_idx_]
+
     n = len(train)
     indices = list(range(n))
     random.shuffle(indices)  # 生成随机索引序列
@@ -109,20 +152,33 @@ def Split_data(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_
     train_t = [train_t[i] for i in indices]
     train_idx = [train_idx[i] for i in indices]
     train_ans = [train_ans[i] for i in indices]
-    train = [train, train_t, train_idx, train_ans]
+    train_end_time = [train_end_time[i] for i in indices]
+    train_answer_open = [train_answer_open[i] for i in indices]
+    train_retry_status = [train_retry_status[i] for i in indices]
+    train_evaluate_count = [train_evaluate_count[i] for i in indices]
+
+    train = [train, train_t, train_idx, train_ans, train_end_time, train_answer_open, train_retry_status, train_evaluate_count]
 
     valid_idx_ = int((train_rate + valid_rate) * len(t_cascades))
     valid = t_cascades[train_idx_:valid_idx_]
     valid_t = timestamps[train_idx_:valid_idx_]
     valid_idx = cas_idx[train_idx_:valid_idx_]
     valid_ans = answers[train_idx_:valid_idx_]
-    valid = [valid, valid_t, valid_idx, valid_ans]
+    valid_end_time = end_times[train_idx_:valid_idx_]
+    valid_answer_open = answer_opens[train_idx_:valid_idx_]
+    valid_retry_status = retry_statuses[train_idx_:valid_idx_]
+    valid_evaluate_count = evaluate_counts[train_idx_:valid_idx_]
+    valid = [valid, valid_t, valid_idx, valid_ans, valid_end_time, valid_answer_open, valid_retry_status, valid_evaluate_count]
 
     test = t_cascades[valid_idx_:]
     test_t = timestamps[valid_idx_:]
     test_idx = cas_idx[valid_idx_:]
     test_ans = answers[valid_idx_:]
-    test = [test, test_t, test_idx, test_ans]
+    test_end_time = end_times[valid_idx_:]
+    test_answer_open = answer_opens[valid_idx_:]
+    test_retry_status = retry_statuses[valid_idx_:]
+    test_evaluate_count = evaluate_counts[valid_idx_:]
+    test = [test, test_t, test_idx, test_ans, test_end_time, test_answer_open, test_retry_status, test_evaluate_count]
 
     total_len = sum(len(i) - 1 for i in t_cascades)
     train_size = len(train_t)
@@ -151,10 +207,15 @@ def buildIndex(data):
         chunks = line.strip().split(',')
         for chunk in chunks:
             try:
-                if len(chunk.split()) == 2:
-                    user, timestamp = chunk.split()
-                elif len(chunk.split()) == 3:
-                    user, timestamp, answer = chunk.split()
+                parts = chunk.split()
+                if len(parts) == 7:
+                    # 7个字段: challenge_id, open_time, 是否正确, end_time, answer_open, retry_status, evaluate_count
+                    challenge_id = parts[0]
+                    user = challenge_id
+                elif len(parts) == 3:
+                    user = parts[0]
+                elif len(parts) == 2:
+                    user = parts[0]
             except:
                 print(line)
                 print(chunk)
@@ -183,10 +244,16 @@ class DataLoader(object):
     def __init__(
             self, cas, batch_size=64, load_dict=True, cuda=True, test=False, with_EOS=True):
         self._batch_size = batch_size
-        self.cas = cas[0]
-        self.time = cas[1]
-        self.idx = cas[2]
-        self.ans = cas[3]
+        self.cas = cas[0]           # challenge_id 序列
+        self.time = cas[1]          # open_time 序列
+        self.idx = cas[2]           # 序列索引
+        self.ans = cas[3]           # is_correct 序列
+        # 新增字段
+        self.end_time = cas[4] if len(cas) > 4 else None          # end_time 序列
+        self.answer_open = cas[5] if len(cas) > 5 else None       # answer_open 序列
+        self.retry_status = cas[6] if len(cas) > 6 else None      # retry_status 序列
+        self.evaluate_count = cas[7] if len(cas) > 7 else None    # evaluate_count 序列
+
         self.test = test
         self.with_EOS = with_EOS
         self.cuda = cuda
@@ -239,7 +306,32 @@ class DataLoader(object):
             seq_idx = Variable(
                 torch.LongTensor(self.idx[start_idx:end_idx]), volatile=self.test)
 
-            return seq_data, seq_data_timestamp, seq_idx, seq_data_answer
+            # 新增字段的处理
+            if self.end_time is not None:
+                seq_end_time = self.end_time[start_idx:end_idx]
+                seq_data_end_time = pad_to_longest(seq_end_time)
+            else:
+                seq_data_end_time = None
+
+            if self.answer_open is not None:
+                seq_answer_open = self.answer_open[start_idx:end_idx]
+                seq_data_answer_open = pad_to_longest(seq_answer_open)
+            else:
+                seq_data_answer_open = None
+
+            if self.retry_status is not None:
+                seq_retry_status = self.retry_status[start_idx:end_idx]
+                seq_data_retry_status = pad_to_longest(seq_retry_status)
+            else:
+                seq_data_retry_status = None
+
+            if self.evaluate_count is not None:
+                seq_evaluate_count = self.evaluate_count[start_idx:end_idx]
+                seq_data_evaluate_count = pad_to_longest(seq_evaluate_count)
+            else:
+                seq_data_evaluate_count = None
+
+            return seq_data, seq_data_timestamp, seq_idx, seq_data_answer, seq_data_end_time, seq_data_answer_open, seq_data_retry_status, seq_data_evaluate_count
         else:
 
             self._iter_count = 0

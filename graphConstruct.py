@@ -35,32 +35,76 @@ def ConRelationGraph(data):
         return data
 
 '''Diffusion hypergraph'''
-def ConHyperGraphList(cascades, timestamps, user_size, step_split=Constants.step_split):
-    '''split the graph to sub graphs, return the list'''
+# def ConHyperGraphList(cascades, timestamps, user_size, step_split=Constants.step_split):
+#     '''split the graph to sub graphs, return the list'''
+#
+#     times, root_list = ConHyperDiffsuionGraph(cascades, timestamps, user_size)
+#     zero_vec = torch.zeros_like(times)
+#     one_vec = torch.ones_like(times)
+#
+#     time_sorted = []
+#     graph_list = {}
+#
+#     for time in timestamps:
+#         time_sorted += time[:-1]
+#     time_sorted = sorted(time_sorted)
+#     split_length = len(time_sorted) // step_split
+#
+#     for x in range(split_length, split_length * step_split , split_length):
+#         if x == split_length:
+#             sub_graph = torch.where(times > 0, one_vec, zero_vec) - torch.where(times > time_sorted[x], one_vec, zero_vec)
+#         else:
+#             sub_graph = torch.where(times > time_sorted[x-split_length], one_vec, zero_vec) - torch.where(times > time_sorted[x], one_vec, zero_vec)
+#
+#         graph_list[time_sorted[x]] = sub_graph
+#
+#     graphs = [graph_list, root_list]
+#
+#     return graphs
 
-    times, root_list = ConHyperDiffsuionGraph(cascades, timestamps, user_size)
-    zero_vec = torch.zeros_like(times)
-    one_vec = torch.ones_like(times)
-    
-    time_sorted = []
-    graph_list = {}
-    
-    for time in timestamps:
-        time_sorted += time[:-1]
-    time_sorted = sorted(time_sorted)
-    split_length = len(time_sorted) // step_split
-    
-    for x in range(split_length, split_length * step_split , split_length):
-        if x == split_length:
-            sub_graph = torch.where(times > 0, one_vec, zero_vec) - torch.where(times > time_sorted[x], one_vec, zero_vec)
-        else:
-            sub_graph = torch.where(times > time_sorted[x-split_length], one_vec, zero_vec) - torch.where(times > time_sorted[x], one_vec, zero_vec)
-          
-        graph_list[time_sorted[x]] = sub_graph
-    
-    graphs = [graph_list, root_list]
-    
-    return graphs
+'''Diffusion hypergraph (重构版：全局协同超图)'''
+
+
+def ConHyperGraphList(cascades, timestamps, user_size, step_split=None):
+    """
+    抛弃绝对时间切片，将每一条学生训练序列视为一条超边。
+    构建 全局协同超图发生矩阵 (Global Collaborative Incidence Matrix)。
+    """
+    n_size = user_size
+    e_size = len(cascades)
+
+    rows = []
+    cols = []
+
+    for i, cas in enumerate(cascades):
+        # 过滤掉 PAD(0) 和 Skip/EOS(1) 等无效占位符
+        unique_items = list(set([x for x in cas if x > 1]))
+        if len(unique_items) == 0:
+            continue
+
+        rows.extend(unique_items)
+        cols.extend([i] * len(unique_items))
+
+    # 1. 构建超图关联矩阵 H [节点数, 超边数]
+    vals = [1.0] * len(rows)
+    H = torch.sparse_coo_tensor(torch.LongTensor([rows, cols]), torch.FloatTensor(vals), [n_size, e_size]).to_dense()
+
+    # 2. 计算节点度矩阵 Dv 和 超边度矩阵 De
+    D_v = H.sum(dim=1, keepdim=True)  # [n_size, 1]
+    D_e = H.sum(dim=0, keepdim=True)  # [1, e_size]
+
+    # 3. 计算度矩阵的 -1/2 次方
+    D_v_invsqrt = torch.pow(D_v, -0.5)
+    D_v_invsqrt[torch.isinf(D_v_invsqrt)] = 0.
+
+    D_e_invsqrt = torch.pow(D_e, -0.5)
+    D_e_invsqrt[torch.isinf(D_e_invsqrt)] = 0.
+
+    # 4. 拉普拉斯度归一化: G_norm = Dv^{-1/2} * H * De^{-1/2}
+    # 这一步极其关键，能有效防止热门题目主导图网络梯度
+    G_norm = D_v_invsqrt * H * D_e_invsqrt
+
+    return G_norm
     
     
 def ConHyperDiffsuionGraph(cascades, timestamps, user_size):

@@ -77,7 +77,7 @@ def train_rl_model(
             if batch_idx >= max_train_batches:
                 break
 
-            tgt, tgt_timestamp, tgt_idx, ans = batch
+            tgt, tgt_timestamp, tgt_idx, ans, tgt_end_time, tgt_answer_open, tgt_retry_status, tgt_evaluate_count = batch
             tgt = tgt.to(device)
             tgt_timestamp = tgt_timestamp.to(device)
             tgt_idx = tgt_idx.to(device)
