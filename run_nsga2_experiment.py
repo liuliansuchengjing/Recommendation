@@ -243,5 +243,65 @@ def main():
     pareto_prob = run_nsga2('Prob', hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids, model_kt,
                             relation_graph, p_before)
 
-    # ======= 可视化绘制 (和之前代码一致) =======
-    # [绘图代码保持不变...]
+    # ======= 可视化绘制 =======
+    print("实验完成，正在绘制帕累托前沿对比图...")
+    # 设置中文字体，防止图表中的中文变方块
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS']  # Windows用SimHei，Mac用Arial Unicode MS
+    plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号
+
+    fig = plt.figure(figsize=(15, 10))
+
+    # 解析数据 (增加防空判断)
+    r_gain, r_smooth, r_div = zip(*pareto_random) if pareto_random else ([], [], [])
+    p_gain, p_smooth, p_div = zip(*pareto_prob) if pareto_prob else ([], [], [])
+
+    # 子图1: 3D 前沿图
+    ax1 = fig.add_subplot(221, projection='3d')
+    ax1.scatter(r_gain, r_smooth, r_div, c='blue', marker='o', alpha=0.5, label='随机候选策略')
+    ax1.scatter(p_gain, p_smooth, p_div, c='red', marker='^', s=60, label='概率筛选策略')
+    ax1.set_xlabel('期望掌握度增益 (Gain)')
+    ax1.set_ylabel('难度平滑度 (Smoothness)')
+    ax1.set_zlabel('资源多样性 (Diversity)')
+    ax1.set_xlim([-1.0, 1.0])  # 明确标出负增益区间
+    ax1.set_title('三维帕累托前沿分布对比')
+    ax1.legend()
+
+    # 子图2: 增益 vs 平滑度
+    ax2 = fig.add_subplot(222)
+    ax2.scatter(r_gain, r_smooth, c='blue', alpha=0.5)
+    ax2.scatter(p_gain, p_smooth, c='red', marker='^')
+    ax2.axvline(0, color='gray', linestyle='--')  # 零增益基准线
+    ax2.set_xlabel('期望掌握度增益 (Gain)')
+    ax2.set_ylabel('难度平滑度 (Smoothness)')
+    ax2.set_xlim([-1.0, 1.0])
+    ax2.set_title('2D 投影: 增益 vs 平滑度')
+
+    # 子图3: 增益 vs 多样性
+    ax3 = fig.add_subplot(223)
+    ax3.scatter(r_gain, r_div, c='blue', alpha=0.5)
+    ax3.scatter(p_gain, p_div, c='red', marker='^')
+    ax3.axvline(0, color='gray', linestyle='--')
+    ax3.set_xlabel('期望掌握度增益 (Gain)')
+    ax3.set_ylabel('资源多样性 (Diversity)')
+    ax3.set_xlim([-1.0, 1.0])
+    ax3.set_title('2D 投影: 增益 vs 多样性')
+
+    # 子图4: 平滑度 vs 多样性
+    ax4 = fig.add_subplot(224)
+    ax4.scatter(r_smooth, r_div, c='blue', alpha=0.5)
+    ax4.scatter(p_smooth, p_div, c='red', marker='^')
+    ax4.set_xlabel('难度平滑度 (Smoothness)')
+    ax4.set_ylabel('资源多样性 (Diversity)')
+    ax4.set_title('2D 投影: 平滑度 vs 多样性')
+
+    plt.tight_layout()
+    plt.savefig('pareto_front_comparison.png', dpi=300)
+    print("可视化图像已成功保存为 pareto_front_comparison.png")
+    plt.show()
+
+
+# ==========================================
+# 执行入口 (这段一定要放在文件最末尾！)
+# ==========================================
+if __name__ == "__main__":
+    main()
