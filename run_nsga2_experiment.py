@@ -173,6 +173,18 @@ def run_nsga2(strategy, hist_seq, hist_ans, hist_time_bins, topK_candidates, val
 # 3. 主函数缝合执行
 # ==========================================
 def main():
+    # ==========================================
+    # 0. 固定全局随机种子 (保证实验完美可复现)
+    # ==========================================
+    seed_value = 42  # 🌟 这里的数字就是你的“盲盒编号”，你可以任意修改（如 0, 100, 2026 等）
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_value)
+        torch.backends.cudnn.deterministic = True
+
+    print(f"当前实验已固定随机种子为: {seed_value}")
     # 1. 基础配置与数据加载 (复用 run.py 逻辑)
 
     resource_size, train_history_cas, train_history_t, train, valid, test = Split_data(opt.data_name, load_dict=True)
