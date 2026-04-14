@@ -358,13 +358,77 @@ def main():
 
     # 4. 执行 NSGA-II 对比实验 (此时返回的都是字典)
     print("Running NSGA-II Strategy A (Random)...")
+    pareto_random = run_nsga2('Random', hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids,
+                              model_kt, relation_graph, p_before)
+
+    print("Running NSGA-II Strategy B (Probability Screening)...")
+    pareto_prob = run_nsga2('Prob', hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids, model_kt,
+                            relation_graph, p_before)
+
+
+    # ======= 可视化绘制 (纯英文版) =======
+    print("Experiment completed, drawing Pareto front comparison plots...")
+
+    # 移除原本的中文字体设置，使用系统默认的英文字体即可
+    # plt.rcParams['font.sans-serif'] = ['SimHei']
+
+    fig = plt.figure(figsize=(15, 10))
+
+    # 解析数据 (增加防空判断)
+    r_gain, r_smooth, r_div = zip(*pareto_random) if pareto_random else ([], [], [])
+    p_gain, p_smooth, p_div = zip(*pareto_prob) if pareto_prob else ([], [], [])
+
+    # 子图1: 3D 前沿图
+    ax1 = fig.add_subplot(221, projection='3d')
+    ax1.scatter(r_gain, r_smooth, r_div, c='blue', marker='o', alpha=0.5, label='Random Candidate')
+    ax1.scatter(p_gain, p_smooth, p_div, c='red', marker='^', s=60, label='Probability Screening')
+    ax1.set_xlabel('Proficiency Gain')
+    ax1.set_ylabel('Difficulty Smoothness')
+    ax1.set_zlabel('Resource Diversity')
+    ax1.set_xlim([-1.0, 1.0])  # 明确标出负增益区间
+    ax1.set_title('3D Pareto Front Distribution')
+    ax1.legend()
+
+    # 子图2: 增益 vs 平滑度
+    ax2 = fig.add_subplot(222)
+    ax2.scatter(r_gain, r_smooth, c='blue', alpha=0.5)
+    ax2.scatter(p_gain, p_smooth, c='red', marker='^')
+    ax2.axvline(0, color='gray', linestyle='--')  # 零增益基准线
+    ax2.set_xlabel('Proficiency Gain')
+    ax2.set_ylabel('Difficulty Smoothness')
+    ax2.set_xlim([-1.0, 1.0])
+    ax2.set_title('2D Projection: Gain vs. Smoothness')
+
+    # 子图3: 增益 vs 多样性
+    ax3 = fig.add_subplot(223)
+    ax3.scatter(r_gain, r_div, c='blue', alpha=0.5)
+    ax3.scatter(p_gain, p_div, c='red', marker='^')
+    ax3.axvline(0, color='gray', linestyle='--')
+    ax3.set_xlabel('Proficiency Gain')
+    ax3.set_ylabel('Resource Diversity')
+    ax3.set_xlim([-1.0, 1.0])
+    ax3.set_title('2D Projection: Gain vs. Diversity')
+
+    # 子图4: 平滑度 vs 多样性
+    ax4 = fig.add_subplot(224)
+    ax4.scatter(r_smooth, r_div, c='blue', alpha=0.5)
+    ax4.scatter(p_smooth, p_div, c='red', marker='^')
+    ax4.set_xlabel('Difficulty Smoothness')
+    ax4.set_ylabel('Resource Diversity')
+    ax4.set_title('2D Projection: Smoothness vs. Diversity')
+
+    plt.tight_layout()
+    plt.savefig('pareto_front_comparison.png', dpi=300)
+    print("Visualization saved as pareto_front_comparison.png")
+    plt.show()
+
+    print("Running NSGA-II Strategy A (Random)...")
     history_random = run_nsga2('Random', hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids,
                                model_kt, relation_graph, p_before)
 
     print("Running NSGA-II Strategy B (Probability Screening)...")
     history_prob = run_nsga2('Prob', hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids, model_kt,
                              relation_graph, p_before)
-
     # ======= 绘制进化轨迹与移动方向图 =======
     print("正在绘制进化轨迹图...")
     plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS']
@@ -386,16 +450,16 @@ def main():
     gen30_gain, gen30_smooth, _ = get_xyz(history_prob, 30)
 
     # 绘制散点
-    ax.scatter(gen1_gain, gen1_smooth, c='#FFB6C1', marker='o', s=40, label='Gen 1 (初始种群)', alpha=0.7)
-    ax.scatter(gen15_gain, gen15_smooth, c='#FF4500', marker='s', s=50, label='Gen 15 (中期演化)', alpha=0.8)
-    ax.scatter(gen30_gain, gen30_smooth, c='#8B0000', marker='^', s=70, label='Gen 30 (最终前沿)', alpha=1.0)
+    ax.scatter(gen1_gain, gen1_smooth, c='#FFB6C1', marker='o', s=40, label='Gen 1 ', alpha=0.7)
+    ax.scatter(gen15_gain, gen15_smooth, c='#FF4500', marker='s', s=50, label='Gen 15 ', alpha=0.8)
+    ax.scatter(gen30_gain, gen30_smooth, c='#8B0000', marker='^', s=70, label='Gen 30 ', alpha=1.0)
 
     # 绘制表示“移动方向”的引导箭头 (从 Gen1 的质心指向 Gen30 的质心)
     if gen1_gain and gen30_gain:
         c1_x, c1_y = np.mean(gen1_gain), np.mean(gen1_smooth)
         c30_x, c30_y = np.mean(gen30_gain), np.mean(gen30_smooth)
 
-        ax.annotate('种群进化与收敛方向',
+        ax.annotate('direction',
                     xy=(c30_x, c30_y - 0.02),  # 箭头终点稍微向下偏移以免遮挡散点
                     xytext=(c1_x, c1_y),  # 箭头起点
                     arrowprops=dict(facecolor='black', edgecolor='black', width=2, headwidth=10, alpha=0.6,
@@ -405,9 +469,9 @@ def main():
 
     # 图表修饰
     ax.axvline(0, color='gray', linestyle='--', alpha=0.5)
-    ax.set_xlabel('期望掌握度增益 (Expected Mastery Gain)', fontsize=12)
-    ax.set_ylabel('难度平滑度 (Smoothness)', fontsize=12)
-    ax.set_title('图 5.x 隐式约束下多目标演化的种群收敛轨迹', fontsize=14, pad=15)
+    ax.set_xlabel('Expected Mastery Gain', fontsize=12)
+    ax.set_ylabel('Smoothness', fontsize=12)
+    ax.set_title('Fig.5.x ', fontsize=14, pad=15)
     ax.legend(loc='lower right', framealpha=0.9)
     ax.grid(alpha=0.3)
 
