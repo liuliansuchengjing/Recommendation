@@ -377,15 +377,19 @@ def main():
         with torch.no_grad():
             _, _, yt_sim, _, _ = model_kt.ktmodel(hidden_kt, sim_seq, sim_ans, sim_time_bins)
 
-        hist_len = hist_seq.shape[1]
+        # 🌟 动态获取输出序列的真实长度，彻底免疫 DKT 模型的 T/T-1 长度截断问题
+        yt_sim_len = yt_sim.size(1)
 
         best_k = 1
         max_exp_gain = -999.0
         best_p_after = None
 
-        # 逐层遍历 1 到 6 步，寻找知识增益的最高峰 (Adaptive Length)
+        # 逐层遍历 1 到 L_TARGET 步，寻找知识增益的最高峰 (Adaptive Length)
         for k in range(1, L_TARGET + 1):
-            p_after_k = yt_sim[0, hist_len - 1 + k, :]  # 获取学完第 k 题后的状态
+            # 🌟 倒数索引法：
+            # 无论模型输出长度是20还是21，倒数第 (L_TARGET - k + 1) 个必定是第 k 题的状态！
+            target_idx = yt_sim_len - L_TARGET + k - 1
+            p_after_k = yt_sim[0, target_idx, :]
             g = 0.0
             for idx in path_ids[:k]:
                 gain = p_after_k[idx].item() - p_before[idx].item()
