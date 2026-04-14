@@ -264,17 +264,16 @@ def main():
     model_kt.load_state_dict(torch.load(opt.save_kt_path))
     model_kt.eval()
 
-    # 3. 提取真实学生数据进行实验
+    # 3. 提取真实学生数据进行实验 (带 ZPD 潜力筛选)
     print("正在从测试集中扫描有效学生序列...")
-    candidate_students = []  # 用来装所有符合条件的候选学生
+    candidate_students = []
 
     for batch in test_data:
         tgt, tgt_timestamp, tgt_idx, ans, tgt_end_time, _, _, _ = [item.cuda() for item in batch]
         time_bins = calc_time_bins(tgt_timestamp, tgt_end_time)
 
         valid_len = (tgt[0] > 1).sum().item()
-        if valid_len > 15:  # 找一个答题记录够长的学生
-            # 截取前 15 题作为历史序列
+        if valid_len > 15:
             t = 15
             hist_seq = tgt[0:1, :t]
             hist_ans = ans[0:1, :t]
@@ -282,197 +281,137 @@ def main():
             hist_timestamp = tgt_timestamp[0:1, :t]
             hist_idx = tgt_idx[0:1]
 
-            # --- 步骤 A: 用 DKT 评估初始知识状态 (p_before) ---
+            # 步骤 A: 评估初始状态
             with torch.no_grad():
                 hidden_kt = model_kt.gnn2(relation_graph)
                 _, _, yt_init, _, _ = model_kt.ktmodel(hidden_kt, hist_seq, hist_ans, hist_time_bins)
-                p_before = yt_init[0, -1, :]  # 获取学完 15 题后的掌握度
+                p_before = yt_init[0, -1, :]
 
-            # 学霸过滤：如果该学生已经掌握了大多数知识（均值>0.8），换一个学生
-            if p_before.mean().item() > 0.8:
+            # 注意：这里我们移除了对高分学霸的强制 continue，由后面的分组逻辑接管
+            # 仅过滤掉基础极差（均值 < 0.1），连题都看不懂的人
+            if p_before.mean().item() < 0.1:
                 continue
 
-            # --- 步骤 B: 用推荐模型生成 TopK (K=50) 候选池 ---
+            # 步骤 B: 推荐候选池
             with torch.no_grad():
                 pred_logits, _, _, _, _ = model_rec(hist_seq, hist_timestamp, hist_idx, hist_ans, relation_graph,
                                                     hypergraph_list, hist_time_bins)
                 last_step_logits = pred_logits[-1, :]
-
-                # 提取 Top 50 并且过滤掉已经做过的题和无效占位符
                 top50_indices = torch.topk(last_step_logits, 80).indices.cpu().numpy()
                 hist_list = hist_seq[0].cpu().numpy().tolist()
                 topK_candidates = [int(x) for x in top50_indices if x > 1 and x not in hist_list][:50]
 
-            # 把符合条件的学生存进列表，去掉原来的 break！
+            # 🌟 核心修复：ZPD 潜力甄别！确保推荐池里有 >= 15 道题是他能做对的
+            correct_capacity = sum(1 for x in topK_candidates if p_before[x].item() >= 0.5)
+            if correct_capacity < 15:
+                continue
+
             candidate_students.append({
                 'hist_seq': hist_seq,
                 'hist_ans': hist_ans,
                 'hist_time_bins': hist_time_bins,
                 'p_before': p_before,
-                'topK_candidates': topK_candidates
+                'topK_candidates': topK_candidates,
+                'p_mean': p_before.mean().item()
             })
 
-    print(f"扫描完毕！测试集中共找到 {len(candidate_students)} 个符合条件的候选学生。")
+    print(f"扫描完毕！测试集中共找到 {len(candidate_students)} 个具备干预价值的候选学生。")
 
-    if len(candidate_students) == 0:
-        print("未找到符合条件的学生，请调低学霸过滤阈值！")
+    # ==========================================
+    # 4. 划分三个认知阶段的学生群体 (调整了阈值为 0.8)
+    # ==========================================
+    group_weak, group_mid, group_strong = [], [], []
+    for stu in candidate_students:
+        p_mean = stu['p_mean']
+        if p_mean < 0.5:
+            group_weak.append(stu)
+        elif 0.5 <= p_mean < 0.8:  # 🌟 阈值调整为 0.8
+            group_mid.append(stu)
+        else:
+            group_strong.append(stu)
+
+    print(
+        f"分组情况: 基础薄弱组 {len(group_weak)} 人, 能力巩固组 {len(group_mid)} 人, 进阶提升组 {len(group_strong)} 人")
+
+    if not (group_weak and group_mid and group_strong):
+        print("警告：某一组人数为0，请检查数据分布！")
         return
 
-    # 从候选池中随机挑一个学生进行本次实验！
-    selected_student = random.choice(candidate_students)
+    rep_weak = random.choice(group_weak)
+    rep_mid = random.choice(group_mid)
+    rep_strong = random.choice(group_strong)
 
-    hist_seq = selected_student['hist_seq']
-    hist_ans = selected_student['hist_ans']
-    hist_time_bins = selected_student['hist_time_bins']
-    p_before = selected_student['p_before']
-    topK_candidates = selected_student['topK_candidates']
+    # 🌟 参数细化：从 0.1 到 0.7，步长为 0.05，产生更加平滑的连续曲线
+    lambda_1_range = np.round(np.arange(0.10, 0.75, 0.05), 2)
 
-    print("成功随机抽取一名学生样本！初始知识平均掌握度: {:.4f}".format(p_before.mean().item()))
+    def select_best_path_gain(pareto_front, w_gain, w_smooth, w_div=0.2):
+        if not pareto_front: return 0.0
+        front_arr = np.array(pareto_front)
+
+        # 极差标准化
+        mins = front_arr.min(axis=0)
+        maxs = front_arr.max(axis=0)
+        denoms = maxs - mins + 1e-8
+        norm_front = (front_arr - mins) / denoms
+
+        # 效用计算
+        utility = w_gain * norm_front[:, 0] + w_smooth * norm_front[:, 1] + w_div * norm_front[:, 2]
+        best_idx = np.argmax(utility)
+        return front_arr[best_idx, 0]
+
+        # ==========================================
+
+    # 5. 执行敏感性优化实验
+    # ==========================================
+    results_gain = {'weak': [], 'mid': [], 'strong': []}
+
+    print("开始执行更细粒度的连续敏感性分析 (步长 0.05)...")
+
+    for group_name, stu in zip(['weak', 'mid', 'strong'], [rep_weak, rep_mid, rep_strong]):
+        print(f"正在优化 {group_name} 组代表学生 (初始掌握度 {stu['p_mean']:.3f})...")
+        history = run_nsga2('Prob', stu['hist_seq'], stu['hist_ans'], stu['hist_time_bins'],
+                            stu['topK_candidates'], valid_resource_ids, model_kt, relation_graph, stu['p_before'])
+        final_front = history.get(30, [])
+
+        for l1 in lambda_1_range:
+            l2 = round(0.8 - l1, 2)
+            best_gain = select_best_path_gain(final_front, w_gain=l1, w_smooth=l2, w_div=0.2)
+            results_gain[group_name].append(best_gain)
 
     # ==========================================
-    # 4. 执行 NSGA-II 算法 (只需运行一次，获取完整的历史字典)
+    # 6. 绘制高精度连续敏感性曲线
     # ==========================================
-    print("Running NSGA-II Strategy A (Random)...")
-    history_random = run_nsga2('Random', hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids,
-                               model_kt, relation_graph, p_before)
+    print("实验完成，正在绘制高精度敏感性曲线...")
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+    plt.rcParams['axes.unicode_minus'] = False
 
-    random.seed(seed_value)
-    np.random.seed(seed_value)
-    torch.manual_seed(seed_value)
+    fig, ax = plt.subplots(figsize=(10, 6.5))
 
-    print("Running NSGA-II Strategy B (Probability Screening)...")
-    history_prob = run_nsga2('Prob', hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids, model_kt,
-                             relation_graph, p_before)
+    ax.plot(lambda_1_range, results_gain['weak'], marker='o', markersize=6, linewidth=2.5,
+            color='#4A90E2', label='基础薄弱组 ($p_{before} < 0.5$)', alpha=0.9)
+    ax.plot(lambda_1_range, results_gain['mid'], marker='s', markersize=6, linewidth=2.5,
+            color='#F5A623', label='能力巩固组 ($0.5 \leq p_{before} < 0.8$)', alpha=0.9)
+    ax.plot(lambda_1_range, results_gain['strong'], marker='^', markersize=7, linewidth=2.5,
+            color='#D0021B', label='进阶提升组 ($p_{before} \geq 0.8$)', alpha=0.9)
 
-    # 🌟 安全解包函数：彻底防止 NoneType 或者 zip 报错
-    def get_xyz(history_dict, gen):
-        front = history_dict.get(gen, [])
-        if not front:
-            return [], [], []
-        x, y, z = zip(*front)
-        return list(x), list(y), list(z)
+    # 绘制垂直辅助线：标出不同群体的“大概峰值区间”以辅助读者视觉对齐
+    best_weak_idx = np.argmax(results_gain['weak'])
+    best_strong_idx = np.argmax(results_gain['strong'])
+    ax.axvline(lambda_1_range[best_weak_idx], color='#4A90E2', linestyle=':', alpha=0.5)
+    ax.axvline(lambda_1_range[best_strong_idx], color='#D0021B', linestyle=':', alpha=0.5)
 
-    # ==========================================
-    # 可视化 1: 最终代 (Gen 30) 的帕累托前沿对比散点图
-    # ==========================================
-    print("Experiment completed, drawing Pareto front comparison plots...")
-    fig1 = plt.figure(figsize=(15, 10))
+    ax.set_xlabel('知识增益权重参数 $\lambda_1$\n(约束条件: $\lambda_2 = 0.8 - \lambda_1, \lambda_3 = 0.2$)',
+                  fontsize=13)
+    ax.set_ylabel('最终决策路径的离线迁移增益 (Selected Path Gain)', fontsize=13)
+    ax.set_title('图 5.x 多认知群体下的效用函数权重参数连续敏感性分析', fontsize=16, pad=15)
 
-    # 直接从历史字典中提取最后一代 (Gen 30)
-    r_gain, r_smooth, r_div = get_xyz(history_random, 30)
-    p_gain, p_smooth, p_div = get_xyz(history_prob, 30)
-
-    # 子图1: 3D 前沿图
-    ax1 = fig1.add_subplot(221, projection='3d')
-    ax1.scatter(r_gain, r_smooth, r_div, c='blue', marker='o', alpha=0.5, label='Random Candidate')
-    ax1.scatter(p_gain, p_smooth, p_div, c='red', marker='^', s=60, label='Probability Screening')
-    ax1.set_xlabel('Proficiency Gain')
-    ax1.set_ylabel('Difficulty Smoothness')
-    ax1.set_zlabel('Resource Diversity')
-    ax1.set_xlim([-1.0, 1.0])
-    ax1.set_title('3D Pareto Front Distribution')
-    ax1.legend()
-
-    # 子图2: 增益 vs 平滑度
-    ax2 = fig1.add_subplot(222)
-    ax2.scatter(r_gain, r_smooth, c='blue', alpha=0.5)
-    ax2.scatter(p_gain, p_smooth, c='red', marker='^')
-    ax2.axvline(0, color='gray', linestyle='--')
-    ax2.set_xlabel('Proficiency Gain')
-    ax2.set_ylabel('Difficulty Smoothness')
-    ax2.set_xlim([-1.0, 1.0])
-    ax2.set_title('2D Projection: Gain vs. Smoothness')
-
-    # 子图3: 增益 vs 多样性
-    ax3 = fig1.add_subplot(223)
-    ax3.scatter(r_gain, r_div, c='blue', alpha=0.5)
-    ax3.scatter(p_gain, p_div, c='red', marker='^')
-    ax3.axvline(0, color='gray', linestyle='--')
-    ax3.set_xlabel('Proficiency Gain')
-    ax3.set_ylabel('Resource Diversity')
-    ax3.set_xlim([-1.0, 1.0])
-    ax3.set_title('2D Projection: Gain vs. Diversity')
-
-    # 子图4: 平滑度 vs 多样性
-    ax4 = fig1.add_subplot(224)
-    ax4.scatter(r_smooth, r_div, c='blue', alpha=0.5)
-    ax4.scatter(p_smooth, p_div, c='red', marker='^')
-    ax4.set_xlabel('Difficulty Smoothness')
-    ax4.set_ylabel('Resource Diversity')
-    ax4.set_title('2D Projection: Smoothness vs. Diversity')
+    ax.set_xticks(np.round(np.arange(0.1, 0.8, 0.1), 1))  # X轴刻度保持干净，只显示0.1,0.2...
+    ax.grid(linestyle='--', alpha=0.4)
+    ax.legend(loc='best', fontsize=12, framealpha=0.9)
 
     plt.tight_layout()
-    plt.savefig('pareto_front_comparison41.png', dpi=300)
-    print("Visualization saved as pareto_front_comparison41.png")
-
-    # ==========================================
-    # 可视化 2: 种群收敛轨迹与移动方向图
-    # ==========================================
-    # ==========================================
-    # 可视化 2: 种群收敛轨迹与移动方向图 (三视图全景)
-    # ==========================================
-    print("Drawing comprehensive evolution trajectory plots...")
-
-    # 创建 1x3 的画布，尺寸横向拉长以适应三个子图
-    fig2, (ax_traj1, ax_traj2, ax_traj3) = plt.subplots(1, 3, figsize=(18, 5.5))
-
-    # 提取概率筛选策略在不同代数的数据
-    gen1_g, gen1_s, gen1_d = get_xyz(history_prob, 1)
-    gen15_g, gen15_s, gen15_d = get_xyz(history_prob, 15)
-    gen30_g, gen30_s, gen30_d = get_xyz(history_prob, 30)
-
-    # 定义一个内部辅助绘图函数，保持三个子图的代码极其精简和统一
-    def plot_trajectory(ax, x1, y1, x15, y15, x30, y30, xlabel, ylabel, title, show_zero_line=False):
-        # 绘制不同代数的散点
-        ax.scatter(x1, y1, c='#FFB6C1', marker='o', s=50, label='Gen 1', alpha=0.6)
-        ax.scatter(x15, y15, c='#FF4500', marker='s', s=60, label='Gen 15', alpha=0.7)
-        ax.scatter(x30, y30, c='#8B0000', marker='^', s=80, label='Gen 30', alpha=0.9)
-
-        # 绘制表示“移动方向”的引导箭头 (从 Gen1 质心指向 Gen30 质心)
-        if x1 and x30:
-            c1_x, c1_y = np.mean(x1), np.mean(y1)
-            c30_x, c30_y = np.mean(x30), np.mean(y30)
-
-            # shrink=0.1 使得箭头首尾留有空隙，不会遮挡质心点
-            ax.annotate('', xy=(c30_x, c30_y), xytext=(c1_x, c1_y),
-                        arrowprops=dict(facecolor='black', edgecolor='black', width=2, headwidth=10, alpha=0.5,
-                                        shrink=0.1))
-
-            # 在箭头的中间位置标注 'Direction'
-            text_x, text_y = (c1_x + c30_x) / 2, (c1_y + c30_y) / 2
-            # 略微上移文字以免和箭头重叠
-            ax.text(text_x, text_y + 0.015, 'Direction', fontsize=11, fontweight='bold', color='#444', ha='center',
-                    va='bottom')
-
-        # 图表基础修饰
-        if show_zero_line:
-            ax.axvline(0, color='gray', linestyle='--', alpha=0.5)  # 仅在包含 Gain 的图中画零线
-        ax.set_xlabel(xlabel, fontsize=12)
-        ax.set_ylabel(ylabel, fontsize=12)
-        ax.set_title(title, fontsize=14, pad=10)
-        ax.legend(loc='best', framealpha=0.9)
-        ax.grid(alpha=0.3)
-
-    # 依次调用绘制三个视图
-    # 视图 1：Gain vs. Smoothness
-    plot_trajectory(ax_traj1, gen1_g, gen1_s, gen15_g, gen15_s, gen30_g, gen30_s,
-                    'Expected Mastery Gain', 'Difficulty Smoothness',
-                    '(a) Gain vs. Smoothness Trajectory', show_zero_line=True)
-
-    # 视图 2：Gain vs. Diversity
-    plot_trajectory(ax_traj2, gen1_g, gen1_d, gen15_g, gen15_d, gen30_g, gen30_d,
-                    'Expected Mastery Gain', 'Resource Diversity',
-                    '(b) Gain vs. Diversity Trajectory', show_zero_line=True)
-
-    # 视图 3：Smoothness vs. Diversity
-    plot_trajectory(ax_traj3, gen1_s, gen1_d, gen15_s, gen15_d, gen30_s, gen30_d,
-                    'Difficulty Smoothness', 'Resource Diversity',
-                    '(c) Smoothness vs. Diversity Trajectory', show_zero_line=False)
-
-    plt.tight_layout()
-    plt.savefig('Evolution_Trajectory_3Views41.png', dpi=300)
-    print("Trajectory saved as Evolution_Trajectory_3Views41.png")
-
+    plt.savefig('Fine_Continuous_Sensitivity.png', dpi=300)
+    print("高精度敏感性曲线图已生成: Fine_Continuous_Sensitivity.png")
     plt.show()
 
 
