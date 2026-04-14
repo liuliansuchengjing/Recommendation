@@ -141,10 +141,7 @@ def evaluate_path(path_ids, hist_seq, hist_ans, hist_time_bins, model_kt, graph,
 
 
 # ==========================================
-# 2. 简易 NSGA-II 框架
-# ==========================================
-# ==========================================
-# 2. 简易 NSGA-II 框架 (补全了演化逻辑)
+# 2. 简易 NSGA-II 框架 (修复演化迭代逻辑)
 # ==========================================
 def non_dominated_sort(population_fitness):
     front = []
@@ -176,22 +173,26 @@ def run_nsga2(strategy, hist_seq, hist_ans, hist_time_bins, topK_candidates, val
     for _ in range(POPULATION_SIZE):
         population.append(random.sample(pool, L_TARGET))
 
-    # 记录初始种群 (Gen 1) 的前沿
+    # 评估与排序记录 Gen 1
     fitness = [evaluate_path(p, hist_seq, hist_ans, hist_time_bins, model_kt, graph, hidden_kt, p_before) for p in
                population]
     front_indices = non_dominated_sort(fitness)
     history_fronts[1] = [fitness[i] for i in front_indices]
 
-    # 2. 模拟演化迭代 (简化的交叉与变异)
+    # 2. 模拟演化迭代
     for gen in range(2, MAX_GEN + 1):
         new_population = []
         for i in range(POPULATION_SIZE):
             if i < POPULATION_SIZE // 2:
-                # 锦标赛选择/精英保留：复制当前前沿的优秀个体
-                new_population.append(population[front_indices[i % len(front_indices)]].copy())
+                # 锦标赛选择/精英保留：从当前的前沿解中复制优秀个体
+                if front_indices:
+                    idx = front_indices[i % len(front_indices)]
+                else:
+                    idx = random.randint(0, POPULATION_SIZE - 1)
+                new_population.append(population[idx].copy())
             else:
-                # 单点变异：随机替换路径中的一道题
-                child = population[i].copy()
+                # 单点变异：随机挑一个父代进行变异
+                child = population[random.randint(0, POPULATION_SIZE - 1)].copy()
                 mut_idx = random.randint(0, L_TARGET - 1)
                 child[mut_idx] = random.choice(pool)
                 new_population.append(child)
@@ -200,16 +201,17 @@ def run_nsga2(strategy, hist_seq, hist_ans, hist_time_bins, topK_candidates, val
         fitness = [evaluate_path(p, hist_seq, hist_ans, hist_time_bins, model_kt, graph, hidden_kt, p_before) for p in
                    population]
 
-        # 记录中期演化 (Gen 15) 的前沿
+        # ✅ 核心修复：必须在每一代结束时更新前沿，供下一代的精英保留使用！
+        front_indices = non_dominated_sort(fitness)
+
+        # 记录中期演化 (Gen 15)
         if gen == 15:
-            front_indices = non_dominated_sort(fitness)
             history_fronts[15] = [fitness[i] for i in front_indices]
 
-    # 记录最终种群 (Gen 30) 的前沿
-    front_indices = non_dominated_sort(fitness)
+    # 记录最终种群 (Gen 30)
     history_fronts[MAX_GEN] = [fitness[i] for i in front_indices]
 
-    return history_fronts  # 返回字典格式的历史前沿
+    return history_fronts
 
 
 # ==========================================
@@ -370,10 +372,18 @@ def main():
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    # 提取概率筛选策略在不同代数的数据 (增益 vs 平滑度)
-    gen1_gain, gen1_smooth, _ = zip(*history_prob[1]) if history_prob[1] else ([], [], [])
-    gen15_gain, gen15_smooth, _ = zip(*history_prob[15]) if history_prob[15] else ([], [], [])
-    gen30_gain, gen30_smooth, _ = zip(*history_prob[30]) if history_prob[30] else ([], [], [])
+    # 🌟 安全解包函数：彻底防止 NoneType 或者 zip 报错
+    def get_xyz(history_dict, gen):
+        front = history_dict.get(gen, [])
+        if not front:
+            return [], [], []
+        x, y, z = zip(*front)
+        return list(x), list(y), list(z)
+
+    # 提取不同代数的数据
+    gen1_gain, gen1_smooth, _ = get_xyz(history_prob, 1)
+    gen15_gain, gen15_smooth, _ = get_xyz(history_prob, 15)
+    gen30_gain, gen30_smooth, _ = get_xyz(history_prob, 30)
 
     # 绘制散点
     ax.scatter(gen1_gain, gen1_smooth, c='#FFB6C1', marker='o', s=40, label='Gen 1 (初始种群)', alpha=0.7)
@@ -386,7 +396,7 @@ def main():
         c30_x, c30_y = np.mean(gen30_gain), np.mean(gen30_smooth)
 
         ax.annotate('种群进化与收敛方向',
-                    xy=(c30_x, c30_y - 0.02),  # 箭头终点稍微偏移一点以免遮挡
+                    xy=(c30_x, c30_y - 0.02),  # 箭头终点稍微向下偏移以免遮挡散点
                     xytext=(c1_x, c1_y),  # 箭头起点
                     arrowprops=dict(facecolor='black', edgecolor='black', width=2, headwidth=10, alpha=0.6,
                                     shrink=0.05),
@@ -397,7 +407,7 @@ def main():
     ax.axvline(0, color='gray', linestyle='--', alpha=0.5)
     ax.set_xlabel('期望掌握度增益 (Expected Mastery Gain)', fontsize=12)
     ax.set_ylabel('难度平滑度 (Smoothness)', fontsize=12)
-    ax.set_title('图 5.x 多目标演化算法的种群收敛轨迹与移动方向', fontsize=14, pad=15)
+    ax.set_title('图 5.x 隐式约束下多目标演化的种群收敛轨迹', fontsize=14, pad=15)
     ax.legend(loc='lower right', framealpha=0.9)
     ax.grid(alpha=0.3)
 
