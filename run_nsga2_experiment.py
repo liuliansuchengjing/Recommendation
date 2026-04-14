@@ -10,7 +10,7 @@ from graphConstruct import ConRelationGraph, ConHyperGraphList
 from run import opt
 import pickle
 from dataLoader import Options
-
+import csv # 确保文件开头导入了 csv
 # ==========================================
 # 提取与映射难度字典 (与 Metrics.py 逻辑对齐)
 # ==========================================
@@ -325,7 +325,7 @@ def main():
     print(f"扫描完毕！找到 {len(candidate_students)} 个具备干预价值的候选学生。")
 
     # ==========================================
-    # 4. 划分群体与代表选取
+    # 4. 划分群体与随机多样本采样
     # ==========================================
     group_weak, group_mid, group_strong = [], [], []
     for stu in candidate_students:
@@ -339,43 +339,31 @@ def main():
 
     print(
         f"全局分组情况: 基础薄弱组 {len(group_weak)} 人, 能力巩固组 {len(group_mid)} 人, 进阶提升组 {len(group_strong)} 人")
-
     if not (group_weak and group_mid and group_strong):
         print("警告：某一组人数为0，请检查数据分布！")
         return
 
-    # 🌟 核心改进：设定每组的采样人数 (N)。建议平时测试设为 2，最终跑论文图设为 5 或 10
-    SAMPLE_N = 5
-
-    # 安全采样：如果该组总人数不足 N，则全量抽取
+    SAMPLE_N = 5  # 每组采样人数
     sample_weak = random.sample(group_weak, min(SAMPLE_N, len(group_weak)))
     sample_mid = random.sample(group_mid, min(SAMPLE_N, len(group_mid)))
     sample_strong = random.sample(group_strong, min(SAMPLE_N, len(group_strong)))
 
-    print(f"实际参与实验采样: 每组最多抽取 {SAMPLE_N} 人取平均值...")
-
-    # 🌟 核心函数 1：从帕累托前沿中挑出最佳路径 (保留返回路径题号，而不仅是内部增益)
+    # 🌟 核心函数 1：选出最优路径 (基于 6 道题的整体适应度)
     def select_best_path(front_fitness, front_paths, w_gain, w_smooth, w_div=0.2):
         if not front_fitness: return []
         front_arr = np.array(front_fitness)
-
-        # 极差标准化
         mins = front_arr.min(axis=0)
         maxs = front_arr.max(axis=0)
         denoms = maxs - mins + 1e-8
         norm_front = (front_arr - mins) / denoms
-
-        # 效用计算
         utility = w_gain * norm_front[:, 0] + w_smooth * norm_front[:, 1] + w_div * norm_front[:, 2]
-        best_idx = np.argmax(utility)
-        return front_paths[best_idx]  # 返回选中的具体路径题号
+        return front_paths[np.argmax(utility)]
 
-    # 🌟 核心函数 2：计算基于真实 Ground Truth 的离线迁移增益 (Migration Gain)
-    def eval_migration_gain(path_ids, future_seq, hist_seq, hist_ans, hist_time_bins, model_kt, graph, hidden_kt,
-                            p_before):
-        if not path_ids: return 0.0
+    # 🌟 核心函数 2：自适应长度截断与全指标评估！
+    def evaluate_adaptive_metrics(path_ids, future_seq, hist_seq, hist_ans, hist_time_bins, model_kt, graph, hidden_kt,
+                                  p_before):
+        if not path_ids: return 0.0, 0.0, 0.0, 0.0
 
-        # 1. 模拟学习推荐路径
         L_TARGET = len(path_ids)
         path_tensor = torch.tensor([path_ids], device='cuda')
         ans_list = [1.0 if p_before[idx].item() >= 0.5 else 0.0 for idx in path_ids]
@@ -388,52 +376,91 @@ def main():
 
         with torch.no_grad():
             _, _, yt_sim, _, _ = model_kt.ktmodel(hidden_kt, sim_seq, sim_ans, sim_time_bins)
-            p_after = yt_sim[0, -1, :]  # 学完推荐路径后的新状态
 
-        # 2. 在真实的未来序列 (Ground Truth) 上考核增益
+        hist_len = hist_seq.shape[1]
+
+        best_k = 1
+        max_exp_gain = -999.0
+        best_p_after = None
+
+        # 逐层遍历 1 到 6 步，寻找知识增益的最高峰 (Adaptive Length)
+        for k in range(1, L_TARGET + 1):
+            p_after_k = yt_sim[0, hist_len - 1 + k, :]  # 获取学完第 k 题后的状态
+            g = 0.0
+            for idx in path_ids[:k]:
+                gain = p_after_k[idx].item() - p_before[idx].item()
+                room = max(1.0 - p_before[idx].item(), 0.1)
+                g += max(-1.0, gain / room)
+            g /= k
+
+            if g > max_exp_gain:
+                max_exp_gain = g
+                best_k = k
+                best_p_after = p_after_k
+
+        # 基于最佳截断长度 best_k 计算剩余指标
+        adap_path = path_ids[:best_k]
+
+        # 1. 截断后的平滑度
+        valid_hist = [get_diff(int(x)) for x, y in zip(hist_seq[0], hist_ans[0]) if int(x) > 1 and int(y) == 1]
+        delta = np.mean(valid_hist[-5:]) if len(valid_hist) > 0 else 1.0
+        f_smooth = sum([1.0 - (abs(delta - get_diff(idx)) / 2.0) for idx in adap_path]) / best_k
+
+        # 2. 截断后的多样性
+        f_div = 1.0  # 默认 1.0
+        pairs = 0
+        if best_k > 1:
+            f_div = 0.0
+            embs = hidden_kt[adap_path]
+            for i in range(best_k):
+                for j in range(i + 1, best_k):
+                    sim = torch.cosine_similarity(embs[i].unsqueeze(0), embs[j].unsqueeze(0)).item()
+                    f_div += (1.0 - sim) / 2.0
+                    pairs += 1
+            f_div /= pairs
+
+        # 3. 截断路径的真实未来迁移增益 (Migration Gain)
         future_ids = [int(x) for x in future_seq[0] if int(x) > 1]
-        if not future_ids: return 0.0
-
         m_gain = 0.0
-        for idx in future_ids:
-            gain = p_after[idx].item() - p_before[idx].item()
-            room = max(1.0 - p_before[idx].item(), 0.1)  # 剩余提升空间
-            m_gain += max(-1.0, gain / room)
+        if future_ids:
+            for idx in future_ids:
+                gain = best_p_after[idx].item() - p_before[idx].item()
+                room = max(1.0 - p_before[idx].item(), 0.1)
+                m_gain += max(-1.0, gain / room)
+            m_gain /= len(future_ids)
 
-        return m_gain / len(future_ids)
+        return max_exp_gain, f_smooth, f_div, m_gain
 
     # ==========================================
-    # 5. 执行极高精度敏感性优化实验 (求平均增益)
+    # 5. 执行全指标敏感性分析 (细粒度 0.02)
     # ==========================================
-    # 绘图粒度: 0.02
     lambda_1_range = np.round(np.arange(0.10, 0.72, 0.02), 2)
-    results_gain = {'weak': [], 'mid': [], 'strong': []}
 
-    # 🌟 防弹级修复：直接固定表格提取的锚点，彻底杜绝浮点数判定导致的数据错位
-    table_l1_targets = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
-    table_data = {'l1': table_l1_targets, 'weak': [], 'mid': [], 'strong': []}
+    # 统一存储结构
+    results = {
+        'weak': {'exp_gain': [], 'smooth': [], 'div': [], 'mig_gain': []},
+        'mid': {'exp_gain': [], 'smooth': [], 'div': [], 'mig_gain': []},
+        'strong': {'exp_gain': [], 'smooth': [], 'div': [], 'mig_gain': []}
+    }
 
-    print("开始执行高精度参数连续敏感性分析 (多样本求平均)...")
+    # 用于写入 CSV 的扁平数据列表
+    csv_data_rows = []
+
+    print("开始执行高精度参数连续敏感性分析 (自适应长度 & 全指标)...")
 
     for group_name, sample_group in zip(['weak', 'mid', 'strong'], [sample_weak, sample_mid, sample_strong]):
-        print(f"\n正在处理 [{group_name}] 组, 共 {len(sample_group)} 名学生...")
+        print(f"\n处理 [{group_name}] 组...")
 
-        # 使用 round 保留两位小数作为字典 key，彻底屏蔽底层的浮点精度干扰
-        temp_group_results = {round(l1, 2): [] for l1 in lambda_1_range}
+        temp_res = {l1: {'exp_gain': [], 'smooth': [], 'div': [], 'mig_gain': []} for l1 in lambda_1_range}
 
-        for stu_idx, stu in enumerate(sample_group):
-            print(f"  -> 正在优化学生 {stu_idx + 1}/{len(sample_group)} (初始掌握度: {stu['p_mean']:.3f})")
-
+        for stu in sample_group:
             hidden_kt = model_kt.gnn2(relation_graph)
             history = run_nsga2('Prob', stu['hist_seq'], stu['hist_ans'], stu['hist_time_bins'],
-                                stu['topK_candidates'], valid_resource_ids, model_kt, relation_graph,
-                                stu['p_before'])
+                                stu['topK_candidates'], valid_resource_ids, model_kt, relation_graph, stu['p_before'])
 
-            # 重构前沿解的具体路径
             pop_pool = [random.sample(stu['topK_candidates'], 6) for _ in range(500)]
-            fits = [
-                evaluate_path(p, stu['hist_seq'], stu['hist_ans'], stu['hist_time_bins'], model_kt, relation_graph,
-                              hidden_kt, stu['p_before']) for p in pop_pool]
+            fits = [evaluate_path(p, stu['hist_seq'], stu['hist_ans'], stu['hist_time_bins'], model_kt, relation_graph,
+                                  hidden_kt, stu['p_before']) for p in pop_pool]
             f_idx = non_dominated_sort(fits)
             final_front_fits = [fits[i] for i in f_idx]
             final_front_paths = [pop_pool[i] for i in f_idx]
@@ -441,72 +468,105 @@ def main():
             for l1 in lambda_1_range:
                 l1_key = round(l1, 2)
                 l2 = round(0.8 - l1_key, 2)
-                best_path = select_best_path(final_front_fits, final_front_paths, w_gain=l1_key, w_smooth=l2,
-                                             w_div=0.2)
-                m_gain = eval_migration_gain(best_path, stu['future_seq'], stu['hist_seq'], stu['hist_ans'],
-                                             stu['hist_time_bins'], model_kt, relation_graph, hidden_kt,
-                                             stu['p_before'])
-                temp_group_results[l1_key].append(m_gain)
 
-        # 🌟 严格对齐：该循环与外层的“学生循环”同级！等一组内所有学生跑完后再结算均值
+                best_path = select_best_path(final_front_fits, final_front_paths, w_gain=l1_key, w_smooth=l2, w_div=0.2)
+                # 🌟 获取自适应长度下的 4 项核心指标
+                e_g, s_m, d_v, m_g = evaluate_adaptive_metrics(best_path, stu['future_seq'], stu['hist_seq'],
+                                                               stu['hist_ans'], stu['hist_time_bins'], model_kt,
+                                                               relation_graph, hidden_kt, stu['p_before'])
+
+                temp_res[l1_key]['exp_gain'].append(e_g)
+                temp_res[l1_key]['smooth'].append(s_m)
+                temp_res[l1_key]['div'].append(d_v)
+                temp_res[l1_key]['mig_gain'].append(m_g)
+
+        # 组内取平均值
         for l1 in lambda_1_range:
             l1_key = round(l1, 2)
-            # 安全求均值，防止分母为0
-            avg_gain = np.mean(temp_group_results[l1_key]) if temp_group_results[l1_key] else 0.0
-            results_gain[group_name].append(avg_gain)
+            avg_eg = np.mean(temp_res[l1_key]['exp_gain'])
+            avg_sm = np.mean(temp_res[l1_key]['smooth'])
+            avg_dv = np.mean(temp_res[l1_key]['div'])
+            avg_mg = np.mean(temp_res[l1_key]['mig_gain'])
 
-            # 严格按照固定锚点录入表格数据
-            if l1_key in table_l1_targets:
-                table_data[group_name].append(avg_gain)
+            results[group_name]['exp_gain'].append(avg_eg)
+            results[group_name]['smooth'].append(avg_sm)
+            results[group_name]['div'].append(avg_dv)
+            results[group_name]['mig_gain'].append(avg_mg)
 
-    # ==========================================
-    # 6. 打印完美可复制的 Markdown 表格 (纯英文)
-    # ==========================================
-    print("\n" + "=" * 60)
-    print("Table 5.x: Sensitivity Analysis of Utility Function Weights")
-    print("=" * 60)
-    print(
-        "| Gain Weight (λ1) | Smoothness Weight (λ2) | Weak Group Gain | Intermediate Group Gain | Advanced Group Gain |")
-    print("| :---: | :---: | :---: | :---: | :---: |")
-    for i in range(len(table_data['l1'])):
-        l1 = table_data['l1'][i]
-        l2 = round(0.8 - l1, 1)
-        # 加入防空安全访问，杜绝索引越界
-        w_val = table_data['weak'][i] if i < len(table_data['weak']) else 0.0
-        m_val = table_data['mid'][i] if i < len(table_data['mid']) else 0.0
-        s_val = table_data['strong'][i] if i < len(table_data['strong']) else 0.0
-        print(f"| {l1:.1f} | {l2:.1f} | {w_val:.4f} | {m_val:.4f} | {s_val:.4f} |")
-    print("=" * 60 + "\n")
+            # 记录到 CSV 数据行
+            csv_data_rows.append([l1_key, round(0.8 - l1_key, 2), group_name, avg_eg, avg_mg, avg_sm, avg_dv])
 
     # ==========================================
-    # 7. 绘制极度平滑的连续敏感性曲线 (纯英文版)
+    # 6. 导出包含所有细粒度参数的 CSV 报表
     # ==========================================
-    print("Drawing high-resolution sensitivity curve (English)...")
+    csv_filename = "Sensitivity_Detailed_Results.csv"
+    with open(csv_filename, mode='w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Lambda_1(Gain)', 'Lambda_2(Smooth)', 'Group', 'Expected_Gain', 'Migration_Gain', 'Smoothness',
+                         'Diversity'])
+        writer.writerows(csv_data_rows)
+    print(f"\n[成功] 全量细粒度数据已导出至文件: {csv_filename} (可用于Excel作表)")
 
-    # 移除中文字体设置，使用系统原生英文矢量字体
-    fig, ax = plt.subplots(figsize=(10, 6.5))
+    # ==========================================
+    # 7. 绘制极度震撼的 2x2 全景综合评估图 (纯英文版)
+    # ==========================================
+    print("Drawing comprehensive 2x2 multi-metric charts (English)...")
 
-    # 绘制无散点 marker 的高级平滑折线
-    ax.plot(lambda_1_range, results_gain['weak'], linewidth=3.0,
-            color='#4A90E2', label='Weak Group ($p_{before} < 0.5$)', alpha=0.9)
-    ax.plot(lambda_1_range, results_gain['mid'], linewidth=3.0,
-            color='#F5A623', label='Intermediate Group ($0.5 \leq p_{before} < 0.8$)', alpha=0.9)
-    ax.plot(lambda_1_range, results_gain['strong'], linewidth=3.0,
-            color='#D0021B', label='Advanced Group ($p_{before} \geq 0.8$)', alpha=0.9)
+    fig, axs = plt.subplots(2, 2, figsize=(16, 12))
 
-    ax.set_xlabel('Knowledge Gain Weight $\lambda_1$\n(Constraint: $\lambda_2 = 0.8 - \lambda_1, \lambda_3 = 0.2$)',
-                  fontsize=13)
-    ax.set_ylabel('Offline Migration Gain of Selected Path', fontsize=13)
-    ax.set_title('Fig 5.x Continuous Parameter Sensitivity Analysis on Migration Gain', fontsize=16, pad=15)
+    # 颜色配置
+    c_weak, c_mid, c_strong = '#4A90E2', '#F5A623', '#D0021B'
+    labels = ['Weak Group ($p_{before}<0.5$)', 'Intermediate Group ($0.5\leq p_{before}<0.8$)',
+              'Advanced Group ($p_{before}\geq0.8$)']
 
-    # X轴刻度保持干净，只显示 0.1, 0.2 ... 0.7
-    ax.set_xticks(np.round(np.arange(0.1, 0.8, 0.1), 1))
-    ax.grid(linestyle='--', alpha=0.4)
-    ax.legend(loc='best', fontsize=12, framealpha=0.9)
+    # --- 子图 1: 参数对 Expected Gain 的影响 ---
+    axs[0, 0].plot(lambda_1_range, results['weak']['exp_gain'], linewidth=3, color=c_weak, label=labels[0])
+    axs[0, 0].plot(lambda_1_range, results['mid']['exp_gain'], linewidth=3, color=c_mid, label=labels[1])
+    axs[0, 0].plot(lambda_1_range, results['strong']['exp_gain'], linewidth=3, color=c_strong, label=labels[2])
+    axs[0, 0].set_xlabel('Knowledge Gain Weight $\lambda_1$', fontsize=12)
+    axs[0, 0].set_ylabel('Adaptive Expected Mastery Gain', fontsize=12)
+    axs[0, 0].set_title('(a) Impact on Expected Knowledge Gain', fontsize=14)
+    axs[0, 0].grid(linestyle='--', alpha=0.4)
+    axs[0, 0].legend()
+
+    # --- 子图 2: 参数对 Smoothness 的影响 ---
+    axs[0, 1].plot(lambda_1_range, results['weak']['smooth'], linewidth=3, color=c_weak)
+    axs[0, 1].plot(lambda_1_range, results['mid']['smooth'], linewidth=3, color=c_mid)
+    axs[0, 1].plot(lambda_1_range, results['strong']['smooth'], linewidth=3, color=c_strong)
+    axs[0, 1].set_xlabel('Knowledge Gain Weight $\lambda_1$', fontsize=12)
+    axs[0, 1].set_ylabel('Adaptive Path Smoothness', fontsize=12)
+    axs[0, 1].set_title('(b) Impact on Difficulty Smoothness', fontsize=14)
+    axs[0, 1].grid(linestyle='--', alpha=0.4)
+
+    # --- 子图 3: 参数对 Diversity 的影响 ---
+    axs[1, 0].plot(lambda_1_range, results['weak']['div'], linewidth=3, color=c_weak)
+    axs[1, 0].plot(lambda_1_range, results['mid']['div'], linewidth=3, color=c_mid)
+    axs[1, 0].plot(lambda_1_range, results['strong']['div'], linewidth=3, color=c_strong)
+    axs[1, 0].set_xlabel('Knowledge Gain Weight $\lambda_1$', fontsize=12)
+    axs[1, 0].set_ylabel('Adaptive Resource Diversity', fontsize=12)
+    axs[1, 0].set_title('(c) Impact on Resource Diversity', fontsize=14)
+    axs[1, 0].grid(linestyle='--', alpha=0.4)
+
+    # --- 子图 4: Expected Gain vs. Migration Gain 的准确性对齐 ---
+    # 为了展示一致性，我们计算所有群体在各个参数下的平均 Expected Gain 和 平均 Migration Gain 进行拟合对比
+    global_exp_gain = np.mean([results['weak']['exp_gain'], results['mid']['exp_gain'], results['strong']['exp_gain']],
+                              axis=0)
+    global_mig_gain = np.mean([results['weak']['mig_gain'], results['mid']['mig_gain'], results['strong']['mig_gain']],
+                              axis=0)
+
+    axs[1, 1].plot(lambda_1_range, global_exp_gain, linewidth=3, color='#8B008B',
+                   label='Global Expected Gain (Internal)')
+    axs[1, 1].plot(lambda_1_range, global_mig_gain, linewidth=3, color='#2E8B57', linestyle='--',
+                   label='Global Migration Gain (Ground Truth)')
+    axs[1, 1].set_xlabel('Knowledge Gain Weight $\lambda_1$', fontsize=12)
+    axs[1, 1].set_ylabel('Average Gain Value', fontsize=12)
+    axs[1, 1].set_title('(d) Internal Expected vs. Real Migration Gain Alignment', fontsize=14)
+    axs[1, 1].grid(linestyle='--', alpha=0.4)
+    axs[1, 1].legend()
 
     plt.tight_layout()
-    plt.savefig('Smooth_Migration_Gain_Sensitivity_EN.png', dpi=300)
-    print("English sensitivity curve generated: Smooth_Migration_Gain_Sensitivity_EN.png")
+    plt.savefig('Comprehensive_Metrics_Sensitivity_EN.png', dpi=300)
+    print("Multi-metric sensitivity chart generated: Comprehensive_Metrics_Sensitivity_EN.png")
     plt.show()
 
 
