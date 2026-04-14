@@ -143,6 +143,9 @@ def evaluate_path(path_ids, hist_seq, hist_ans, hist_time_bins, model_kt, graph,
 # ==========================================
 # 2. 简易 NSGA-II 框架
 # ==========================================
+# ==========================================
+# 2. 简易 NSGA-II 框架 (补全了演化逻辑)
+# ==========================================
 def non_dominated_sort(population_fitness):
     front = []
     for i, fit_i in enumerate(population_fitness):
@@ -160,65 +163,53 @@ def non_dominated_sort(population_fitness):
 
 def run_nsga2(strategy, hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids, model_kt, graph,
               p_before):
-    # hidden_kt = model_kt.gnn2(graph)
-    # L_TARGET = 6
-    # POPULATION_SIZE = 50
-    #
-    # # 初始化种群
-    # population = []
-    # for _ in range(POPULATION_SIZE):
-    #     if strategy == 'Random':
-    #         # 全局随机策略：从所有有效资源中盲抽
-    #         population.append(random.sample(valid_resource_ids, L_TARGET))
-    #     elif strategy == 'Prob':
-    #         # 概率筛选策略：仅从推荐模型给出的 TopK (K=50) 候选集中抽取
-    #         population.append(random.sample(topK_candidates, L_TARGET))
-    #
-    # # 评估与非支配排序
-    # fitness = [evaluate_path(p, hist_seq, hist_ans, hist_time_bins, model_kt, graph, hidden_kt, p_before) for p in
-    #            population]
-    # front_indices = non_dominated_sort(fitness)
-    # return [fitness[i] for i in front_indices]
-    def run_nsga2(strategy, hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids, model_kt, graph,
-                  p_before):
-        hidden_kt = model_kt.gnn2(graph)
-        L_TARGET = 6
-        POPULATION_SIZE = 50
-        MAX_GEN = 30  # 最大迭代次数
+    hidden_kt = model_kt.gnn2(graph)
+    L_TARGET = 6
+    POPULATION_SIZE = 50
+    MAX_GEN = 30  # 最大迭代次数
 
-        # 记录不同阶段的帕累托前沿
-        history_fronts = {}
+    history_fronts = {}  # 记录不同阶段的帕累托前沿
 
-        # 初始化种群
-        population = []
-        for _ in range(POPULATION_SIZE):
-            if strategy == 'Random':
-                population.append(random.sample(valid_resource_ids, L_TARGET))
-            elif strategy == 'Prob':
-                population.append(random.sample(topK_candidates, L_TARGET))
+    # 1. 种群初始化
+    population = []
+    pool = valid_resource_ids if strategy == 'Random' else topK_candidates
+    for _ in range(POPULATION_SIZE):
+        population.append(random.sample(pool, L_TARGET))
 
-        # --- 记录初始种群 (Gen 1) 的前沿 ---
+    # 记录初始种群 (Gen 1) 的前沿
+    fitness = [evaluate_path(p, hist_seq, hist_ans, hist_time_bins, model_kt, graph, hidden_kt, p_before) for p in
+               population]
+    front_indices = non_dominated_sort(fitness)
+    history_fronts[1] = [fitness[i] for i in front_indices]
+
+    # 2. 模拟演化迭代 (简化的交叉与变异)
+    for gen in range(2, MAX_GEN + 1):
+        new_population = []
+        for i in range(POPULATION_SIZE):
+            if i < POPULATION_SIZE // 2:
+                # 锦标赛选择/精英保留：复制当前前沿的优秀个体
+                new_population.append(population[front_indices[i % len(front_indices)]].copy())
+            else:
+                # 单点变异：随机替换路径中的一道题
+                child = population[i].copy()
+                mut_idx = random.randint(0, L_TARGET - 1)
+                child[mut_idx] = random.choice(pool)
+                new_population.append(child)
+
+        population = new_population
         fitness = [evaluate_path(p, hist_seq, hist_ans, hist_time_bins, model_kt, graph, hidden_kt, p_before) for p in
                    population]
-        front_indices = non_dominated_sort(fitness)
-        history_fronts[1] = [fitness[i] for i in front_indices]
 
-        # 简易演化迭代 (含记录)
-        for gen in range(1, MAX_GEN + 1):
-            # ... (你的选择、交叉、变异逻辑) ...
-            # 注意：这里的 fitness 应当是经历过交叉变异后的新种群的适应度
+        # 记录中期演化 (Gen 15) 的前沿
+        if gen == 15:
+            front_indices = non_dominated_sort(fitness)
+            history_fronts[15] = [fitness[i] for i in front_indices]
 
-            # 为了演示收敛效果，假设经过演化，fitness 得到了更新
-            # --- 记录中期种群 (Gen 15) 的前沿 ---
-            if gen == 15:
-                front_indices = non_dominated_sort(fitness)
-                history_fronts[15] = [fitness[i] for i in front_indices]
+    # 记录最终种群 (Gen 30) 的前沿
+    front_indices = non_dominated_sort(fitness)
+    history_fronts[MAX_GEN] = [fitness[i] for i in front_indices]
 
-        # --- 记录最终种群 (Gen 30) 的前沿 ---
-        front_indices = non_dominated_sort(fitness)
-        history_fronts[MAX_GEN] = [fitness[i] for i in front_indices]
-
-        return history_fronts  # 返回的是一个包含多个代数前沿的字典
+    return history_fronts  # 返回字典格式的历史前沿
 
 
 # ==========================================
@@ -363,83 +354,28 @@ def main():
 
     # print("成功提取学生样本！初始知识平均掌握度: {:.4f}".format(p_before.mean().item()))
 
-    # 4. 执行 NSGA-II 对比实验
+    # 4. 执行 NSGA-II 对比实验 (此时返回的都是字典)
     print("Running NSGA-II Strategy A (Random)...")
-    pareto_random = run_nsga2('Random', hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids,
-                              model_kt, relation_graph, p_before)
+    history_random = run_nsga2('Random', hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids,
+                               model_kt, relation_graph, p_before)
 
     print("Running NSGA-II Strategy B (Probability Screening)...")
-    pareto_prob = run_nsga2('Prob', hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids, model_kt,
-                            relation_graph, p_before)
-
-    # ======= 可视化绘制 (纯英文版) =======
-    print("Experiment completed, drawing Pareto front comparison plots...")
-
-    # 移除原本的中文字体设置，使用系统默认的英文字体即可
-    # plt.rcParams['font.sans-serif'] = ['SimHei']
-
-    fig = plt.figure(figsize=(15, 10))
-
-    # 解析数据 (增加防空判断)
-    r_gain, r_smooth, r_div = zip(*pareto_random) if pareto_random else ([], [], [])
-    p_gain, p_smooth, p_div = zip(*pareto_prob) if pareto_prob else ([], [], [])
-
-    # 子图1: 3D 前沿图
-    ax1 = fig.add_subplot(221, projection='3d')
-    ax1.scatter(r_gain, r_smooth, r_div, c='blue', marker='o', alpha=0.5, label='Random Candidate')
-    ax1.scatter(p_gain, p_smooth, p_div, c='red', marker='^', s=60, label='Probability Screening')
-    ax1.set_xlabel('Proficiency Gain')
-    ax1.set_ylabel('Difficulty Smoothness')
-    ax1.set_zlabel('Resource Diversity')
-    ax1.set_xlim([-1.0, 1.0])  # 明确标出负增益区间
-    ax1.set_title('3D Pareto Front Distribution')
-    ax1.legend()
-
-    # 子图2: 增益 vs 平滑度
-    ax2 = fig.add_subplot(222)
-    ax2.scatter(r_gain, r_smooth, c='blue', alpha=0.5)
-    ax2.scatter(p_gain, p_smooth, c='red', marker='^')
-    ax2.axvline(0, color='gray', linestyle='--')  # 零增益基准线
-    ax2.set_xlabel('Proficiency Gain')
-    ax2.set_ylabel('Difficulty Smoothness')
-    ax2.set_xlim([-1.0, 1.0])
-    ax2.set_title('2D Projection: Gain vs. Smoothness')
-
-    # 子图3: 增益 vs 多样性
-    ax3 = fig.add_subplot(223)
-    ax3.scatter(r_gain, r_div, c='blue', alpha=0.5)
-    ax3.scatter(p_gain, p_div, c='red', marker='^')
-    ax3.axvline(0, color='gray', linestyle='--')
-    ax3.set_xlabel('Proficiency Gain')
-    ax3.set_ylabel('Resource Diversity')
-    ax3.set_xlim([-1.0, 1.0])
-    ax3.set_title('2D Projection: Gain vs. Diversity')
-
-    # 子图4: 平滑度 vs 多样性
-    ax4 = fig.add_subplot(224)
-    ax4.scatter(r_smooth, r_div, c='blue', alpha=0.5)
-    ax4.scatter(p_smooth, p_div, c='red', marker='^')
-    ax4.set_xlabel('Difficulty Smoothness')
-    ax4.set_ylabel('Resource Diversity')
-    ax4.set_title('2D Projection: Smoothness vs. Diversity')
-
-    plt.tight_layout()
-    plt.savefig('pareto_front_comparison.png', dpi=300)
-    print("Visualization saved as pareto_front_comparison.png")
-    plt.show()
+    history_prob = run_nsga2('Prob', hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids, model_kt,
+                             relation_graph, p_before)
 
     # ======= 绘制进化轨迹与移动方向图 =======
-    # 假设你获取了概率筛选策略的历史演化数据: prob_history = run_nsga2('Prob', ...)
-    prob_history = pareto_prob  # 替换为你修改后返回的 history_fronts 字典
+    print("正在绘制进化轨迹图...")
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS']
+    plt.rcParams['axes.unicode_minus'] = False
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    # 提取不同代数的数据 (这里以 增益 vs 平滑度 为例)
-    gen1_gain, gen1_smooth, _ = zip(*prob_history[1]) if prob_history[1] else ([], [], [])
-    gen15_gain, gen15_smooth, _ = zip(*prob_history[15]) if prob_history[15] else ([], [], [])
-    gen30_gain, gen30_smooth, _ = zip(*prob_history[30]) if prob_history[30] else ([], [], [])
+    # 提取概率筛选策略在不同代数的数据 (增益 vs 平滑度)
+    gen1_gain, gen1_smooth, _ = zip(*history_prob[1]) if history_prob[1] else ([], [], [])
+    gen15_gain, gen15_smooth, _ = zip(*history_prob[15]) if history_prob[15] else ([], [], [])
+    gen30_gain, gen30_smooth, _ = zip(*history_prob[30]) if history_prob[30] else ([], [], [])
 
-    # 使用不同颜色深浅代表代数递进
+    # 绘制散点
     ax.scatter(gen1_gain, gen1_smooth, c='#FFB6C1', marker='o', s=40, label='Gen 1 (初始种群)', alpha=0.7)
     ax.scatter(gen15_gain, gen15_smooth, c='#FF4500', marker='s', s=50, label='Gen 15 (中期演化)', alpha=0.8)
     ax.scatter(gen30_gain, gen30_smooth, c='#8B0000', marker='^', s=70, label='Gen 30 (最终前沿)', alpha=1.0)
@@ -450,7 +386,7 @@ def main():
         c30_x, c30_y = np.mean(gen30_gain), np.mean(gen30_smooth)
 
         ax.annotate('种群进化与收敛方向',
-                    xy=(c30_x, c30_y - 0.02),  # 箭头终点稍微偏移一点以免挡住点
+                    xy=(c30_x, c30_y - 0.02),  # 箭头终点稍微偏移一点以免遮挡
                     xytext=(c1_x, c1_y),  # 箭头起点
                     arrowprops=dict(facecolor='black', edgecolor='black', width=2, headwidth=10, alpha=0.6,
                                     shrink=0.05),
@@ -459,14 +395,15 @@ def main():
 
     # 图表修饰
     ax.axvline(0, color='gray', linestyle='--', alpha=0.5)
-    ax.set_xlabel('期望掌握度增益 (Gain)', fontsize=12)
+    ax.set_xlabel('期望掌握度增益 (Expected Mastery Gain)', fontsize=12)
     ax.set_ylabel('难度平滑度 (Smoothness)', fontsize=12)
-    ax.set_title('多目标演化算法的种群收敛轨迹与移动方向', fontsize=14, pad=15)
+    ax.set_title('图 5.x 多目标演化算法的种群收敛轨迹与移动方向', fontsize=14, pad=15)
     ax.legend(loc='lower right', framealpha=0.9)
     ax.grid(alpha=0.3)
 
     plt.tight_layout()
     plt.savefig('Evolution_Trajectory.png', dpi=300)
+    print("进化轨迹图像已成功保存为 Evolution_Trajectory.png")
     plt.show()
 
 
