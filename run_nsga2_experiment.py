@@ -390,45 +390,71 @@ def main():
     # ==========================================
     # 可视化 2: 种群收敛轨迹与移动方向图
     # ==========================================
-    print("Drawing evolution trajectory plot...")
-    fig2, ax_traj = plt.subplots(figsize=(8, 6))
+    # ==========================================
+    # 可视化 2: 种群收敛轨迹与移动方向图 (三视图全景)
+    # ==========================================
+    print("Drawing comprehensive evolution trajectory plots...")
+
+    # 创建 1x3 的画布，尺寸横向拉长以适应三个子图
+    fig2, (ax_traj1, ax_traj2, ax_traj3) = plt.subplots(1, 3, figsize=(18, 5.5))
 
     # 提取概率筛选策略在不同代数的数据
-    gen1_gain, gen1_smooth, _ = get_xyz(history_prob, 1)
-    gen15_gain, gen15_smooth, _ = get_xyz(history_prob, 15)
-    gen30_gain, gen30_smooth, _ = get_xyz(history_prob, 30)
+    gen1_g, gen1_s, gen1_d = get_xyz(history_prob, 1)
+    gen15_g, gen15_s, gen15_d = get_xyz(history_prob, 15)
+    gen30_g, gen30_s, gen30_d = get_xyz(history_prob, 30)
 
-    # 绘制散点
-    ax_traj.scatter(gen1_gain, gen1_smooth, c='#FFB6C1', marker='o', s=40, label='Gen 1', alpha=0.7)
-    ax_traj.scatter(gen15_gain, gen15_smooth, c='#FF4500', marker='s', s=50, label='Gen 15', alpha=0.8)
-    ax_traj.scatter(gen30_gain, gen30_smooth, c='#8B0000', marker='^', s=70, label='Gen 30', alpha=1.0)
+    # 定义一个内部辅助绘图函数，保持三个子图的代码极其精简和统一
+    def plot_trajectory(ax, x1, y1, x15, y15, x30, y30, xlabel, ylabel, title, show_zero_line=False):
+        # 绘制不同代数的散点
+        ax.scatter(x1, y1, c='#FFB6C1', marker='o', s=50, label='Gen 1', alpha=0.6)
+        ax.scatter(x15, y15, c='#FF4500', marker='s', s=60, label='Gen 15', alpha=0.7)
+        ax.scatter(x30, y30, c='#8B0000', marker='^', s=80, label='Gen 30', alpha=0.9)
 
-    # 绘制表示“移动方向”的引导箭头 (从 Gen1 的质心指向 Gen30 的质心)
-    if gen1_gain and gen30_gain:
-        c1_x, c1_y = np.mean(gen1_gain), np.mean(gen1_smooth)
-        c30_x, c30_y = np.mean(gen30_gain), np.mean(gen30_smooth)
+        # 绘制表示“移动方向”的引导箭头 (从 Gen1 质心指向 Gen30 质心)
+        if x1 and x30:
+            c1_x, c1_y = np.mean(x1), np.mean(y1)
+            c30_x, c30_y = np.mean(x30), np.mean(y30)
 
-        ax_traj.annotate('Evolution Direction',
-                         xy=(c30_x, c30_y - 0.02),
-                         xytext=(c1_x, c1_y),
-                         arrowprops=dict(facecolor='black', edgecolor='black', width=2, headwidth=10, alpha=0.6,
-                                         shrink=0.05),
-                         fontsize=12, fontweight='bold', color='#333333',
-                         ha='center', va='center')
+            # shrink=0.1 使得箭头首尾留有空隙，不会遮挡质心点
+            ax.annotate('', xy=(c30_x, c30_y), xytext=(c1_x, c1_y),
+                        arrowprops=dict(facecolor='black', edgecolor='black', width=2, headwidth=10, alpha=0.5,
+                                        shrink=0.1))
 
-    # 图表修饰
-    ax_traj.axvline(0, color='gray', linestyle='--', alpha=0.5)
-    ax_traj.set_xlabel('Expected Mastery Gain', fontsize=12)
-    ax_traj.set_ylabel('Smoothness', fontsize=12)
-    ax_traj.set_title('Population Convergence Trajectory', fontsize=14, pad=15)
-    ax_traj.legend(loc='lower right', framealpha=0.9)
-    ax_traj.grid(alpha=0.3)
+            # 在箭头的中间位置标注 'Direction'
+            text_x, text_y = (c1_x + c30_x) / 2, (c1_y + c30_y) / 2
+            # 略微上移文字以免和箭头重叠
+            ax.text(text_x, text_y + 0.015, 'Direction', fontsize=11, fontweight='bold', color='#444', ha='center',
+                    va='bottom')
+
+        # 图表基础修饰
+        if show_zero_line:
+            ax.axvline(0, color='gray', linestyle='--', alpha=0.5)  # 仅在包含 Gain 的图中画零线
+        ax.set_xlabel(xlabel, fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(title, fontsize=14, pad=10)
+        ax.legend(loc='best', framealpha=0.9)
+        ax.grid(alpha=0.3)
+
+    # 依次调用绘制三个视图
+    # 视图 1：Gain vs. Smoothness
+    plot_trajectory(ax_traj1, gen1_g, gen1_s, gen15_g, gen15_s, gen30_g, gen30_s,
+                    'Expected Mastery Gain', 'Difficulty Smoothness',
+                    '(a) Gain vs. Smoothness Trajectory', show_zero_line=True)
+
+    # 视图 2：Gain vs. Diversity
+    plot_trajectory(ax_traj2, gen1_g, gen1_d, gen15_g, gen15_d, gen30_g, gen30_d,
+                    'Expected Mastery Gain', 'Resource Diversity',
+                    '(b) Gain vs. Diversity Trajectory', show_zero_line=True)
+
+    # 视图 3：Smoothness vs. Diversity
+    plot_trajectory(ax_traj3, gen1_s, gen1_d, gen15_s, gen15_d, gen30_s, gen30_d,
+                    'Difficulty Smoothness', 'Resource Diversity',
+                    '(c) Smoothness vs. Diversity Trajectory', show_zero_line=False)
 
     plt.tight_layout()
-    plt.savefig('Evolution_Trajectory.png', dpi=300)
-    print("Trajectory saved as Evolution_Trajectory.png")
+    plt.savefig('Evolution_Trajectory_3Views.png', dpi=300)
+    print("Trajectory saved as Evolution_Trajectory_3Views.png")
 
-    # 统一展示两张图
     plt.show()
 
 
