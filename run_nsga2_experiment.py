@@ -235,7 +235,7 @@ def main():
     # ==========================================
     # 0. 固定全局随机种子 (保证实验完美可复现)
     # ==========================================
-    seed_value = 41  # 🌟 这里的数字就是你的“盲盒编号”，你可以任意修改（如 0, 100, 2026 等）
+    seed_value = 48  # 🌟 这里的数字就是你的“盲盒编号”，你可以任意修改（如 0, 100, 2026 等）
     random.seed(seed_value)
     np.random.seed(seed_value)
     torch.manual_seed(seed_value)
@@ -403,114 +403,111 @@ def main():
         return m_gain / len(future_ids)
 
     # ==========================================
-    # 5. 执行极高精度敏感性优化实验
+    # 5. 执行极高精度敏感性优化实验 (求平均增益)
     # ==========================================
-    # 绘图粒度: 0.02 (0.10, 0.12, 0.14 ... 0.70)
+    # 绘图粒度: 0.02
     lambda_1_range = np.round(np.arange(0.10, 0.72, 0.02), 2)
     results_gain = {'weak': [], 'mid': [], 'strong': []}
-    table_data = {'l1': [], 'weak': [], 'mid': [], 'strong': []}
+
+    # 🌟 防弹级修复：直接固定表格提取的锚点，彻底杜绝浮点数判定导致的数据错位
+    table_l1_targets = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+    table_data = {'l1': table_l1_targets, 'weak': [], 'mid': [], 'strong': []}
 
     print("开始执行高精度参数连续敏感性分析 (多样本求平均)...")
 
-    # 遍历三个组别，以及对应的样本列表
     for group_name, sample_group in zip(['weak', 'mid', 'strong'], [sample_weak, sample_mid, sample_strong]):
         print(f"\n正在处理 [{group_name}] 组, 共 {len(sample_group)} 名学生...")
 
-        # 临时字典，用于累加该组内所有学生在各个参数下的得分
-        temp_group_results = {l1: [] for l1 in lambda_1_range}
+        # 使用 round 保留两位小数作为字典 key，彻底屏蔽底层的浮点精度干扰
+        temp_group_results = {round(l1, 2): [] for l1 in lambda_1_range}
 
         for stu_idx, stu in enumerate(sample_group):
             print(f"  -> 正在优化学生 {stu_idx + 1}/{len(sample_group)} (初始掌握度: {stu['p_mean']:.3f})")
 
             hidden_kt = model_kt.gnn2(relation_graph)
             history = run_nsga2('Prob', stu['hist_seq'], stu['hist_ans'], stu['hist_time_bins'],
-                                stu['topK_candidates'], valid_resource_ids, model_kt, relation_graph, stu['p_before'])
+                                stu['topK_candidates'], valid_resource_ids, model_kt, relation_graph,
+                                stu['p_before'])
 
-            # 重构前沿路径 (与上版相同)
+            # 重构前沿解的具体路径
             pop_pool = [random.sample(stu['topK_candidates'], 6) for _ in range(500)]
-            fits = [evaluate_path(p, stu['hist_seq'], stu['hist_ans'], stu['hist_time_bins'], model_kt, relation_graph,
-                                  hidden_kt, stu['p_before']) for p in pop_pool]
+            fits = [
+                evaluate_path(p, stu['hist_seq'], stu['hist_ans'], stu['hist_time_bins'], model_kt, relation_graph,
+                              hidden_kt, stu['p_before']) for p in pop_pool]
             f_idx = non_dominated_sort(fits)
             final_front_fits = [fits[i] for i in f_idx]
             final_front_paths = [pop_pool[i] for i in f_idx]
 
-            # 遍历参数并打分
             for l1 in lambda_1_range:
-                l2 = round(0.8 - l1, 2)
-                best_path = select_best_path(final_front_fits, final_front_paths, w_gain=l1, w_smooth=l2, w_div=0.2)
+                l1_key = round(l1, 2)
+                l2 = round(0.8 - l1_key, 2)
+                best_path = select_best_path(final_front_fits, final_front_paths, w_gain=l1_key, w_smooth=l2,
+                                             w_div=0.2)
                 m_gain = eval_migration_gain(best_path, stu['future_seq'], stu['hist_seq'], stu['hist_ans'],
                                              stu['hist_time_bins'], model_kt, relation_graph, hidden_kt,
                                              stu['p_before'])
-                # 把该学生的得分存入临时列表
-                temp_group_results[l1].append(m_gain)
+                temp_group_results[l1_key].append(m_gain)
 
-        # 所有学生都跑完后，计算该组在各个参数下的平均值！
+        # 🌟 严格对齐：该循环与外层的“学生循环”同级！等一组内所有学生跑完后再结算均值
         for l1 in lambda_1_range:
-            avg_gain = np.mean(temp_group_results[l1])  # 🌟 取均值
+            l1_key = round(l1, 2)
+            # 安全求均值，防止分母为0
+            avg_gain = np.mean(temp_group_results[l1_key]) if temp_group_results[l1_key] else 0.0
             results_gain[group_name].append(avg_gain)
 
-            # 记录用于表格的 0.1 粒度数据
-            if abs(l1 * 10 - round(l1 * 10)) < 1e-5:
-                if group_name == 'weak':
-                    table_data['l1'].append(l1)
+            # 严格按照固定锚点录入表格数据
+            if l1_key in table_l1_targets:
                 table_data[group_name].append(avg_gain)
 
-        # ==========================================
-        # 6. 打印完美可复制的 Markdown 表格 (纯英文)
-        # ==========================================
-        print("\n" + "=" * 60)
-        print("Table 5.x: Sensitivity Analysis of Utility Function Weights")
-        print("=" * 60)
-        print(
-            "| Gain Weight (λ1) | Smoothness Weight (λ2) | Weak Group Gain | Intermediate Group Gain | Advanced Group Gain |")
-        print("| :---: | :---: | :---: | :---: | :---: |")
-        for i in range(len(table_data['l1'])):
-            l1 = table_data['l1'][i]
-            l2 = round(0.8 - l1, 1)
-            w_val = table_data['weak'][i]
-            m_val = table_data['mid'][i]
-            s_val = table_data['strong'][i]
-            print(f"| {l1:.1f} | {l2:.1f} | {w_val:.4f} | {m_val:.4f} | {s_val:.4f} |")
-        print("=" * 60 + "\n")
+    # ==========================================
+    # 6. 打印完美可复制的 Markdown 表格 (纯英文)
+    # ==========================================
+    print("\n" + "=" * 60)
+    print("Table 5.x: Sensitivity Analysis of Utility Function Weights")
+    print("=" * 60)
+    print(
+        "| Gain Weight (λ1) | Smoothness Weight (λ2) | Weak Group Gain | Intermediate Group Gain | Advanced Group Gain |")
+    print("| :---: | :---: | :---: | :---: | :---: |")
+    for i in range(len(table_data['l1'])):
+        l1 = table_data['l1'][i]
+        l2 = round(0.8 - l1, 1)
+        # 加入防空安全访问，杜绝索引越界
+        w_val = table_data['weak'][i] if i < len(table_data['weak']) else 0.0
+        m_val = table_data['mid'][i] if i < len(table_data['mid']) else 0.0
+        s_val = table_data['strong'][i] if i < len(table_data['strong']) else 0.0
+        print(f"| {l1:.1f} | {l2:.1f} | {w_val:.4f} | {m_val:.4f} | {s_val:.4f} |")
+    print("=" * 60 + "\n")
 
-        # ==========================================
-        # 7. 绘制极度平滑的连续敏感性曲线 (纯英文版)
-        # ==========================================
-        print("Drawing high-resolution sensitivity curve (English)...")
+    # ==========================================
+    # 7. 绘制极度平滑的连续敏感性曲线 (纯英文版)
+    # ==========================================
+    print("Drawing high-resolution sensitivity curve (English)...")
 
-        # 🌟 移除中文字体设置，让 matplotlib 使用系统默认的纯正英文字体 (如 DejaVu Sans)
-        # plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
-        # plt.rcParams['axes.unicode_minus'] = False
+    # 移除中文字体设置，使用系统原生英文矢量字体
+    fig, ax = plt.subplots(figsize=(10, 6.5))
 
-        fig, ax = plt.subplots(figsize=(10, 6.5))
+    # 绘制无散点 marker 的高级平滑折线
+    ax.plot(lambda_1_range, results_gain['weak'], linewidth=3.0,
+            color='#4A90E2', label='Weak Group ($p_{before} < 0.5$)', alpha=0.9)
+    ax.plot(lambda_1_range, results_gain['mid'], linewidth=3.0,
+            color='#F5A623', label='Intermediate Group ($0.5 \leq p_{before} < 0.8$)', alpha=0.9)
+    ax.plot(lambda_1_range, results_gain['strong'], linewidth=3.0,
+            color='#D0021B', label='Advanced Group ($p_{before} \geq 0.8$)', alpha=0.9)
 
-        # 绘制折线与纯英文图例
-        ax.plot(lambda_1_range, results_gain['weak'], linewidth=3.0,
-                color='#4A90E2', label='Weak Group ($p_{before} < 0.5$)', alpha=0.9)
-        ax.plot(lambda_1_range, results_gain['mid'], linewidth=3.0,
-                color='#F5A623', label='Intermediate Group ($0.5 \leq p_{before} < 0.8$)', alpha=0.9)
-        ax.plot(lambda_1_range, results_gain['strong'], linewidth=3.0,
-                color='#D0021B', label='Advanced Group ($p_{before} \geq 0.8$)', alpha=0.9)
+    ax.set_xlabel('Knowledge Gain Weight $\lambda_1$\n(Constraint: $\lambda_2 = 0.8 - \lambda_1, \lambda_3 = 0.2$)',
+                  fontsize=13)
+    ax.set_ylabel('Offline Migration Gain of Selected Path', fontsize=13)
+    ax.set_title('Fig 5.x Continuous Parameter Sensitivity Analysis on Migration Gain', fontsize=16, pad=15)
 
-        # 纯英文坐标轴标签
-        ax.set_xlabel('Knowledge Gain Weight $\lambda_1$\n(Constraint: $\lambda_2 = 0.8 - \lambda_1, \lambda_3 = 0.2$)',
-                      fontsize=13)
-        ax.set_ylabel('Offline Migration Gain of Selected Path', fontsize=13)
+    # X轴刻度保持干净，只显示 0.1, 0.2 ... 0.7
+    ax.set_xticks(np.round(np.arange(0.1, 0.8, 0.1), 1))
+    ax.grid(linestyle='--', alpha=0.4)
+    ax.legend(loc='best', fontsize=12, framealpha=0.9)
 
-        # 纯英文大标题
-        ax.set_title('Fig 5.x Continuous Parameter Sensitivity Analysis on Migration Gain', fontsize=16, pad=15)
-
-        # X轴刻度保持干净
-        ax.set_xticks(np.round(np.arange(0.1, 0.8, 0.1), 1))
-        ax.grid(linestyle='--', alpha=0.4)
-
-        # 调整图例位置
-        ax.legend(loc='best', fontsize=12, framealpha=0.9)
-
-        plt.tight_layout()
-        plt.savefig('Smooth_Migration_Gain_Sensitivity_EN.png', dpi=300)
-        print("English sensitivity curve generated: Smooth_Migration_Gain_Sensitivity_EN.png")
-        plt.show()
+    plt.tight_layout()
+    plt.savefig('Smooth_Migration_Gain_Sensitivity_EN.png', dpi=300)
+    print("English sensitivity curve generated: Smooth_Migration_Gain_Sensitivity_EN.png")
+    plt.show()
 
 
 # ==========================================
