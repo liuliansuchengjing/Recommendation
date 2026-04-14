@@ -51,6 +51,8 @@ def get_diff(idx):
         return difficulty_dict.get(real_id, 1)
     except (ValueError, IndexError):
         return 1
+
+
 # ==========================================
 # 0. 辅助函数：时间分箱 (从 run.py 中同步)
 # ==========================================
@@ -233,7 +235,7 @@ def main():
     # ==========================================
     # 0. 固定全局随机种子 (保证实验完美可复现)
     # ==========================================
-    seed_value = 42  # 🌟 这里的数字就是你的“盲盒编号”，你可以任意修改（如 0, 100, 2026 等）
+    seed_value = 41  # 🌟 这里的数字就是你的“盲盒编号”，你可以任意修改（如 0, 100, 2026 等）
     random.seed(seed_value)
     np.random.seed(seed_value)
     torch.manual_seed(seed_value)
@@ -334,6 +336,10 @@ def main():
     history_random = run_nsga2('Random', hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids,
                                model_kt, relation_graph, p_before)
 
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+
     print("Running NSGA-II Strategy B (Probability Screening)...")
     history_prob = run_nsga2('Prob', hist_seq, hist_ans, hist_time_bins, topK_candidates, valid_resource_ids, model_kt,
                              relation_graph, p_before)
@@ -396,8 +402,8 @@ def main():
     ax4.set_title('2D Projection: Smoothness vs. Diversity')
 
     plt.tight_layout()
-    plt.savefig('pareto_front_comparison.png', dpi=300)
-    print("Visualization saved as pareto_front_comparison.png")
+    plt.savefig('pareto_front_comparison41.png', dpi=300)
+    print("Visualization saved as pareto_front_comparison41.png")
 
     # ==========================================
     # 可视化 2: 种群收敛轨迹与移动方向图
@@ -464,8 +470,8 @@ def main():
                     '(c) Smoothness vs. Diversity Trajectory', show_zero_line=False)
 
     plt.tight_layout()
-    plt.savefig('Evolution_Trajectory_3Views.png', dpi=300)
-    print("Trajectory saved as Evolution_Trajectory_3Views.png")
+    plt.savefig('Evolution_Trajectory_3Views41.png', dpi=300)
+    print("Trajectory saved as Evolution_Trajectory_3Views41.png")
 
     plt.show()
 
