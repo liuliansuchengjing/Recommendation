@@ -76,26 +76,23 @@ def calc_time_bins(start_time, end_time):
 
 
 # ==========================================
-# 1. 核心适应度函数 (接入 DKT 模拟)
+# 1. 核心适应度函数 (严格对齐论文公式计算)
 # ==========================================
 def evaluate_path(path_ids, hist_seq, hist_ans, hist_time_bins, model_kt, graph, hidden_kt, p_before):
     L_TARGET = len(path_ids)
     path_tensor = torch.tensor([path_ids], device='cuda')
 
-    # # 模拟作答状态: 假设都作对(1)，时间分箱设为2(1-3分钟)
-    # ans_tensor = torch.ones((1, L_TARGET), device='cuda')
-    # time_bins_tensor = torch.full((1, L_TARGET), 2, device='cuda')
-    # ==========================================
-    # 核心修复：基于初始知识状态动态模拟作答表现
-    # ==========================================
+    # -----------------------------------------
+    # 细节 1：ZPD 模拟答题数据
+    # 基于学习者初始掌握度，预测其在推荐路径上的作答表现
+    # -----------------------------------------
     ans_list = []
     for idx in path_ids:
-        # 认知模拟：如果对该题相关知识的预测掌握度 >= 0.5，则有能力做对 (1)；否则做错 (0)
+        # 预测掌握度 >= 0.5 有能力做对记为 1.0；否则做错记为 0.0
         sim_ans = 1.0 if p_before[idx].item() >= 0.5 else 0.0
         ans_list.append(sim_ans)
 
     ans_tensor = torch.tensor([ans_list], device='cuda')
-    # 时间分箱依然设为 2 (代表 1-3 分钟的正常作答时间)
     time_bins_tensor = torch.full((1, L_TARGET), 2, device='cuda')
 
     # 拼接历史与生成的候选路径
@@ -103,42 +100,52 @@ def evaluate_path(path_ids, hist_seq, hist_ans, hist_time_bins, model_kt, graph,
     sim_ans = torch.cat([hist_ans, ans_tensor], dim=1)
     sim_time_bins = torch.cat([hist_time_bins, time_bins_tensor], dim=1)
 
-    # DKT 模拟预测未来的掌握状态 (注意 DKT.py forward 需要 4 个参数)
+    # DKT 模拟预测未来的掌握状态
     with torch.no_grad():
         _, _, yt_sim, _, _ = model_kt.ktmodel(hidden_kt, sim_seq, sim_ans, sim_time_bins)
-        p_after = yt_sim[0, -1, :]  # 获取路径学完后的最终状态
+        p_after = yt_sim[0, -1, :]
 
-    # ---- 目标1: 知识增益 (f_gain) ∈ [-1, 1] ----
+    # -----------------------------------------
+    # 细节 2：Expected Mastery Gain 知识增益
+    # -----------------------------------------
     f_gain = 0.0
     for idx in path_ids:
-        gain = p_after[idx].item() - p_before[idx].item()
-        room = max(1.0 - p_before[idx].item(), 0.1)  # 剩余提升空间
-        f_gain += max(-1.0, gain / room)
+        # 直接计算绝对期望掌握度增益
+        f_gain += (p_after[idx].item() - p_before[idx].item())
     f_gain /= L_TARGET
 
-    # ---- 目标2: 难度平滑度 (f_smooth) ∈ [0, 1] ----
+    # -----------------------------------------
+    # 细节 3：Difficulty Smoothness 难度平滑度 (关键修复：相邻难度差)
+    # -----------------------------------------
+    # 获取历史序列中最后一道做对的题的难度，作为平滑度计算的起点
     valid_hist = [get_diff(int(x)) for x, y in zip(hist_seq[0], hist_ans[0]) if int(x) > 1 and int(y) == 1]
-    delta = np.mean(valid_hist[-5:]) if len(valid_hist) > 0 else 1.0
+    prev_diff = valid_hist[-1] if len(valid_hist) > 0 else 1.0
 
     f_smooth = 0.0
     for idx in path_ids:
-        f_smooth += 1.0 - (abs(delta - get_diff(idx)) / 2.0)
+        curr_diff = get_diff(idx)
+        # 比较相邻步序的难度跳跃，除以极差 (3-1=2.0) 进行 [0, 1] 归一化
+        f_smooth += 1.0 - (abs(curr_diff - prev_diff) / 2.0)
+        prev_diff = curr_diff  # 关键：更新 prev_diff 为当前难度，实现步步连贯对比！
     f_smooth /= L_TARGET
 
-    # ---- 目标3: 资源多样性 (f_div) ∈ [0, 1] ----
+    # -----------------------------------------
+    # 细节 4：Resource Diversity 资源多样性 (严格对齐公式 5.4)
+    # -----------------------------------------
     f_div = 0.0
     pairs = 0
     embs = hidden_kt[path_ids]
     for i in range(L_TARGET):
         for j in range(i + 1, L_TARGET):
             sim = torch.cosine_similarity(embs[i].unsqueeze(0), embs[j].unsqueeze(0)).item()
-            f_div += (1.0 - sim) / 2.0
+            # 严格遵循公式(5.4): 分子为 (1 - sim)，绝不多余除以 2
+            f_div += (1.0 - sim)
             pairs += 1
 
-    if pairs > 0: f_div /= pairs
+    if pairs > 0:
+        f_div /= pairs
 
     return f_gain, f_smooth, f_div
-
 
 # ==========================================
 # 2. 简易 NSGA-II 框架 (修复演化迭代逻辑)
