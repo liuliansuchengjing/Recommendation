@@ -338,15 +338,21 @@ def main():
             group_strong.append(stu)
 
     print(
-        f"分组情况: 基础薄弱组 {len(group_weak)} 人, 能力巩固组 {len(group_mid)} 人, 进阶提升组 {len(group_strong)} 人")
+        f"全局分组情况: 基础薄弱组 {len(group_weak)} 人, 能力巩固组 {len(group_mid)} 人, 进阶提升组 {len(group_strong)} 人")
 
     if not (group_weak and group_mid and group_strong):
         print("警告：某一组人数为0，请检查数据分布！")
         return
 
-    rep_weak = random.choice(group_weak)
-    rep_mid = random.choice(group_mid)
-    rep_strong = random.choice(group_strong)
+    # 🌟 核心改进：设定每组的采样人数 (N)。建议平时测试设为 2，最终跑论文图设为 5 或 10
+    SAMPLE_N = 5
+
+    # 安全采样：如果该组总人数不足 N，则全量抽取
+    sample_weak = random.sample(group_weak, min(SAMPLE_N, len(group_weak)))
+    sample_mid = random.sample(group_mid, min(SAMPLE_N, len(group_mid)))
+    sample_strong = random.sample(group_strong, min(SAMPLE_N, len(group_strong)))
+
+    print(f"实际参与实验采样: 每组最多抽取 {SAMPLE_N} 人取平均值...")
 
     # 🌟 核心函数 1：从帕累托前沿中挑出最佳路径 (保留返回路径题号，而不仅是内部增益)
     def select_best_path(front_fitness, front_paths, w_gain, w_smooth, w_div=0.2):
@@ -402,99 +408,109 @@ def main():
     # 绘图粒度: 0.02 (0.10, 0.12, 0.14 ... 0.70)
     lambda_1_range = np.round(np.arange(0.10, 0.72, 0.02), 2)
     results_gain = {'weak': [], 'mid': [], 'strong': []}
-
-    # 专门为了表格保留的 0.1 粒度数据
     table_data = {'l1': [], 'weak': [], 'mid': [], 'strong': []}
 
-    print("开始执行高精度参数连续敏感性分析 (步长 0.02)...")
+    print("开始执行高精度参数连续敏感性分析 (多样本求平均)...")
 
-    for group_name, stu in zip(['weak', 'mid', 'strong'], [rep_weak, rep_mid, rep_strong]):
-        print(f"正在优化 {group_name} 组代表学生...")
-        # 改造 run_nsga2 让它既返回 fitness，也返回对应的 paths。因为篇幅限制，这里假定你用全局变量或字典存了
-        # (重要修改：为了不改你前面的 run_nsga2 结构，我们通过在原评估函数外再跑一遍提取路径)
-        # 实际上我们只需要把 run_nsga2 返回的第 30 代的所有人口和 fitness 对应起来即可。
-        # 此处调用假设 run_nsga2 内部我们加了一个隐藏的映射或我们重新计算。
-        # 但最简单的做法是在此处：
+    # 遍历三个组别，以及对应的样本列表
+    for group_name, sample_group in zip(['weak', 'mid', 'strong'], [sample_weak, sample_mid, sample_strong]):
+        print(f"\n正在处理 [{group_name}] 组, 共 {len(sample_group)} 名学生...")
 
-        hidden_kt = model_kt.gnn2(relation_graph)
-        history = run_nsga2('Prob', stu['hist_seq'], stu['hist_ans'], stu['hist_time_bins'],
-                            stu['topK_candidates'], valid_resource_ids, model_kt, relation_graph, stu['p_before'])
+        # 临时字典，用于累加该组内所有学生在各个参数下的得分
+        temp_group_results = {l1: [] for l1 in lambda_1_range}
 
-        # 为了获取 path，我们再生成 1000 个随机组合，然后筛选出非支配解（因为 run_nsga2 没直接回传 path）
-        # (为了确保你前面代码不用大改，我在这里做了一个绝妙的后处理重构前沿)
-        # ============ 提取前沿解的路径 ============
-        pop_pool = [random.sample(stu['topK_candidates'], 6) for _ in range(500)]
-        fits = [evaluate_path(p, stu['hist_seq'], stu['hist_ans'], stu['hist_time_bins'], model_kt, relation_graph,
-                              hidden_kt, stu['p_before']) for p in pop_pool]
-        f_idx = non_dominated_sort(fits)
-        final_front_fits = [fits[i] for i in f_idx]
-        final_front_paths = [pop_pool[i] for i in f_idx]
-        # ==========================================
+        for stu_idx, stu in enumerate(sample_group):
+            print(f"  -> 正在优化学生 {stu_idx + 1}/{len(sample_group)} (初始掌握度: {stu['p_mean']:.3f})")
 
+            hidden_kt = model_kt.gnn2(relation_graph)
+            history = run_nsga2('Prob', stu['hist_seq'], stu['hist_ans'], stu['hist_time_bins'],
+                                stu['topK_candidates'], valid_resource_ids, model_kt, relation_graph, stu['p_before'])
+
+            # 重构前沿路径 (与上版相同)
+            pop_pool = [random.sample(stu['topK_candidates'], 6) for _ in range(500)]
+            fits = [evaluate_path(p, stu['hist_seq'], stu['hist_ans'], stu['hist_time_bins'], model_kt, relation_graph,
+                                  hidden_kt, stu['p_before']) for p in pop_pool]
+            f_idx = non_dominated_sort(fits)
+            final_front_fits = [fits[i] for i in f_idx]
+            final_front_paths = [pop_pool[i] for i in f_idx]
+
+            # 遍历参数并打分
+            for l1 in lambda_1_range:
+                l2 = round(0.8 - l1, 2)
+                best_path = select_best_path(final_front_fits, final_front_paths, w_gain=l1, w_smooth=l2, w_div=0.2)
+                m_gain = eval_migration_gain(best_path, stu['future_seq'], stu['hist_seq'], stu['hist_ans'],
+                                             stu['hist_time_bins'], model_kt, relation_graph, hidden_kt,
+                                             stu['p_before'])
+                # 把该学生的得分存入临时列表
+                temp_group_results[l1].append(m_gain)
+
+        # 所有学生都跑完后，计算该组在各个参数下的平均值！
         for l1 in lambda_1_range:
-            l2 = round(0.8 - l1, 2)
-            # 1. 用内部效用函数挑出最佳路径
-            best_path = select_best_path(final_front_fits, final_front_paths, w_gain=l1, w_smooth=l2, w_div=0.2)
-            # 2. 考核它在真实 Ground Truth 上的迁移增益！
-            m_gain = eval_migration_gain(best_path, stu['future_seq'], stu['hist_seq'], stu['hist_ans'],
-                                         stu['hist_time_bins'], model_kt, relation_graph, hidden_kt, stu['p_before'])
-
-            results_gain[group_name].append(m_gain)
+            avg_gain = np.mean(temp_group_results[l1])  # 🌟 取均值
+            results_gain[group_name].append(avg_gain)
 
             # 记录用于表格的 0.1 粒度数据
-            if abs(l1 * 10 - round(l1 * 10)) < 1e-5:  # 命中 0.1, 0.2, 0.3 等
+            if abs(l1 * 10 - round(l1 * 10)) < 1e-5:
                 if group_name == 'weak':
                     table_data['l1'].append(l1)
-                table_data[group_name].append(m_gain)
+                table_data[group_name].append(avg_gain)
 
-    # ==========================================
-    # 6. 打印完美可复制的 Markdown 表格
-    # ==========================================
-    print("\n" + "=" * 50)
-    print("表 5.x 效用函数参数敏感性分析结果 (真实迁移增益)")
-    print("=" * 50)
-    print("| 知识增益权重 (λ1) | 平滑度权重 (λ2) | 基础薄弱组增益 | 能力巩固组增益 | 进阶提升组增益 |")
-    print("| :---: | :---: | :---: | :---: | :---: |")
-    for i in range(len(table_data['l1'])):
-        l1 = table_data['l1'][i]
-        l2 = round(0.8 - l1, 1)
-        w_val = table_data['weak'][i]
-        m_val = table_data['mid'][i]
-        s_val = table_data['strong'][i]
-        print(f"| {l1:.1f} | {l2:.1f} | {w_val:.4f} | {m_val:.4f} | {s_val:.4f} |")
-    print("=" * 50 + "\n")
+        # ==========================================
+        # 6. 打印完美可复制的 Markdown 表格 (纯英文)
+        # ==========================================
+        print("\n" + "=" * 60)
+        print("Table 5.x: Sensitivity Analysis of Utility Function Weights")
+        print("=" * 60)
+        print(
+            "| Gain Weight (λ1) | Smoothness Weight (λ2) | Weak Group Gain | Intermediate Group Gain | Advanced Group Gain |")
+        print("| :---: | :---: | :---: | :---: | :---: |")
+        for i in range(len(table_data['l1'])):
+            l1 = table_data['l1'][i]
+            l2 = round(0.8 - l1, 1)
+            w_val = table_data['weak'][i]
+            m_val = table_data['mid'][i]
+            s_val = table_data['strong'][i]
+            print(f"| {l1:.1f} | {l2:.1f} | {w_val:.4f} | {m_val:.4f} | {s_val:.4f} |")
+        print("=" * 60 + "\n")
 
-    # ==========================================
-    # 7. 绘制极度平滑的连续敏感性曲线 (0.02 精读)
-    # ==========================================
-    print("正在绘制高精度敏感性曲线...")
-    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
-    plt.rcParams['axes.unicode_minus'] = False
+        # ==========================================
+        # 7. 绘制极度平滑的连续敏感性曲线 (纯英文版)
+        # ==========================================
+        print("Drawing high-resolution sensitivity curve (English)...")
 
-    fig, ax = plt.subplots(figsize=(10, 6.5))
+        # 🌟 移除中文字体设置，让 matplotlib 使用系统默认的纯正英文字体 (如 DejaVu Sans)
+        # plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+        # plt.rcParams['axes.unicode_minus'] = False
 
-    # 使用 0.02 的密集点画线，去掉散点 marker 会更像真正的函数曲线
-    ax.plot(lambda_1_range, results_gain['weak'], linewidth=3.0,
-            color='#4A90E2', label='基础薄弱组 ($p_{before} < 0.5$)', alpha=0.9)
-    ax.plot(lambda_1_range, results_gain['mid'], linewidth=3.0,
-            color='#F5A623', label='能力巩固组 ($0.5 \leq p_{before} < 0.8$)', alpha=0.9)
-    ax.plot(lambda_1_range, results_gain['strong'], linewidth=3.0,
-            color='#D0021B', label='进阶提升组 ($p_{before} \geq 0.8$)', alpha=0.9)
+        fig, ax = plt.subplots(figsize=(10, 6.5))
 
-    ax.set_xlabel('知识增益权重参数 $\lambda_1$\n(约束条件: $\lambda_2 = 0.8 - \lambda_1, \lambda_3 = 0.2$)',
-                  fontsize=13)
-    ax.set_ylabel('真实交互序列的离线迁移增益 (Migration Gain)', fontsize=13)
-    ax.set_title('图 5.x 基于真实测试目标的权重连续敏感性分析', fontsize=16, pad=15)
+        # 绘制折线与纯英文图例
+        ax.plot(lambda_1_range, results_gain['weak'], linewidth=3.0,
+                color='#4A90E2', label='Weak Group ($p_{before} < 0.5$)', alpha=0.9)
+        ax.plot(lambda_1_range, results_gain['mid'], linewidth=3.0,
+                color='#F5A623', label='Intermediate Group ($0.5 \leq p_{before} < 0.8$)', alpha=0.9)
+        ax.plot(lambda_1_range, results_gain['strong'], linewidth=3.0,
+                color='#D0021B', label='Advanced Group ($p_{before} \geq 0.8$)', alpha=0.9)
 
-    # X轴刻度保持干净，只显示0.1, 0.2...0.7
-    ax.set_xticks(np.round(np.arange(0.1, 0.8, 0.1), 1))
-    ax.grid(linestyle='--', alpha=0.4)
-    ax.legend(loc='best', fontsize=12, framealpha=0.9)
+        # 纯英文坐标轴标签
+        ax.set_xlabel('Knowledge Gain Weight $\lambda_1$\n(Constraint: $\lambda_2 = 0.8 - \lambda_1, \lambda_3 = 0.2$)',
+                      fontsize=13)
+        ax.set_ylabel('Offline Migration Gain of Selected Path', fontsize=13)
 
-    plt.tight_layout()
-    plt.savefig('Smooth_Migration_Gain_Sensitivity.png', dpi=300)
-    print("高精度敏感性曲线图已生成: Smooth_Migration_Gain_Sensitivity.png")
-    plt.show()
+        # 纯英文大标题
+        ax.set_title('Fig 5.x Continuous Parameter Sensitivity Analysis on Migration Gain', fontsize=16, pad=15)
+
+        # X轴刻度保持干净
+        ax.set_xticks(np.round(np.arange(0.1, 0.8, 0.1), 1))
+        ax.grid(linestyle='--', alpha=0.4)
+
+        # 调整图例位置
+        ax.legend(loc='best', fontsize=12, framealpha=0.9)
+
+        plt.tight_layout()
+        plt.savefig('Smooth_Migration_Gain_Sensitivity_EN.png', dpi=300)
+        print("English sensitivity curve generated: Smooth_Migration_Gain_Sensitivity_EN.png")
+        plt.show()
 
 
 # ==========================================
