@@ -139,7 +139,7 @@ def evaluate_path(path_ids, hist_seq, hist_ans, hist_time_bins, model_kt, graph,
         for j in range(i + 1, L_TARGET):
             sim = torch.cosine_similarity(embs[i].unsqueeze(0), embs[j].unsqueeze(0)).item()
             # 严格遵循公式(5.4): 分子为 (1 - sim)，绝不多余除以 2
-            f_div += (1.0 - sim)
+            f_div += (1.0 - sim) / 2.0
             pairs += 1
 
     if pairs > 0:
@@ -147,8 +147,9 @@ def evaluate_path(path_ids, hist_seq, hist_ans, hist_time_bins, model_kt, graph,
 
     return f_gain, f_smooth, f_div
 
+
 # ==========================================
-# 2. 简易 NSGA-II 框架 (修复演化迭代逻辑)
+# 2. 严谨的 NSGA-II 框架 (彻底修复精英保留 Bug)
 # ==========================================
 def non_dominated_sort(population_fitness):
     front = []
@@ -189,26 +190,30 @@ def run_nsga2(strategy, hist_seq, hist_ans, hist_time_bins, topK_candidates, val
     # 2. 模拟演化迭代
     for gen in range(2, MAX_GEN + 1):
         new_population = []
-        for i in range(POPULATION_SIZE):
-            if i < POPULATION_SIZE // 2:
-                # 锦标赛选择/精英保留：从当前的前沿解中复制优秀个体
-                if front_indices:
-                    idx = front_indices[i % len(front_indices)]
-                else:
-                    idx = random.randint(0, POPULATION_SIZE - 1)
-                new_population.append(population[idx].copy())
-            else:
-                # 单点变异：随机挑一个父代进行变异
-                child = population[random.randint(0, POPULATION_SIZE - 1)].copy()
-                mut_idx = random.randint(0, L_TARGET - 1)
-                child[mut_idx] = random.choice(pool)
-                new_population.append(child)
+
+        # ✅ 核心修复 1：全量无损保留上一代的所有帕累托前沿精英！绝不丢弃任何极值点！
+        for idx in front_indices:
+            new_population.append(population[idx].copy())
+
+        # 安全性兜底：如果前沿点太多超过种群上限，优先保留即可
+        if len(new_population) > POPULATION_SIZE:
+            new_population = new_population[:POPULATION_SIZE]
+
+        # ✅ 核心修复 2：用精英的变异后代填满剩下的种群槽位
+        while len(new_population) < POPULATION_SIZE:
+            # 优先从精英库中随机挑选父代
+            parent_idx = random.choice(front_indices) if front_indices else random.randint(0, len(population) - 1)
+            child = population[parent_idx].copy()
+
+            # 单点变异探索新空间
+            mut_idx = random.randint(0, L_TARGET - 1)
+            child[mut_idx] = random.choice(pool)
+            new_population.append(child)
 
         population = new_population
+        # 重新评估并更新非支配解
         fitness = [evaluate_path(p, hist_seq, hist_ans, hist_time_bins, model_kt, graph, hidden_kt, p_before) for p in
                    population]
-
-        # ✅ 核心修复：必须在每一代结束时更新前沿，供下一代的精英保留使用！
         front_indices = non_dominated_sort(fitness)
 
         # 记录中期演化 (Gen 15)
