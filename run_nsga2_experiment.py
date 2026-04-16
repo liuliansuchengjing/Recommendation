@@ -292,7 +292,8 @@ def main():
                     model_kt,
                     relation_graph,
                     hidden_kt,
-                    stu['p_before']
+                    stu['p_before'],
+                    stu['target_ids']
                 )
 
                 g_gains.append(e_g)
