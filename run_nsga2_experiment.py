@@ -330,9 +330,9 @@ def main():
     group_weak, group_mid, group_strong = [], [], []
     for stu in candidate_students:
         p_mean = stu['p_mean']
-        if p_mean < 0.5:
+        if p_mean < 0.65:
             group_weak.append(stu)
-        elif 0.5 <= p_mean < 0.8:
+        elif 0.65 <= p_mean < 0.8:
             group_mid.append(stu)
         else:
             group_strong.append(stu)
@@ -343,7 +343,7 @@ def main():
         print("警告：某一组人数为0，请检查数据分布！")
         return
 
-    SAMPLE_N = 5  # 每组采样人数
+    SAMPLE_N = 50  # 每组采样人数
     sample_weak = random.sample(group_weak, min(SAMPLE_N, len(group_weak)))
     sample_mid = random.sample(group_mid, min(SAMPLE_N, len(group_mid)))
     sample_strong = random.sample(group_strong, min(SAMPLE_N, len(group_strong)))
@@ -434,6 +434,55 @@ def main():
             m_gain /= len(future_ids)
 
         return max_exp_gain, f_smooth, f_div, m_gain
+
+    def calculate_ground_truth_baseline(model_kt, sample_weak, sample_mid, sample_strong, L_TARGET=6):
+        """
+        极速计算各认知群体的真实无干预学习增益（基准线）
+        """
+        print("\n" + "=" * 50)
+        print("开始计算各组学生【真实原始路径】的实际知识增益...")
+
+        groups_dict = {
+            'Low-level (<0.65)': sample_weak,
+            'Mid-level (0.65~0.8)': sample_mid,
+            'High-level (>=0.8)': sample_strong
+        }
+
+        for group_name, students in groups_dict.items():
+            group_actual_gains = []
+
+            for stu in students:
+                hist_seq = stu['hist_seq']
+                actual_future = stu['future_seq'][:L_TARGET]
+
+                # 将历史和真实未来拼接，送入模拟器
+                sim_seq = torch.cat([hist_seq, actual_future], dim=1)
+                sim_ans = torch.cat([stu['hist_ans'], stu['future_ans'][:L_TARGET]], dim=1)
+                sim_time = torch.cat([stu['hist_time_bins'], stu['future_time_bins'][:L_TARGET]], dim=1)
+
+                with torch.no_grad():
+                    _, _, yt_sim, _, _ = model_kt.ktmodel(stu['hidden_kt'], sim_seq, sim_ans, sim_time)
+
+                yt_sim_len = yt_sim.size(1)
+
+                # 1. 计算 p_before
+                idx_before = yt_sim_len - L_TARGET - 1
+                p_before_state = yt_sim[0, idx_before, :]
+                p_before = p_before_state[actual_future[0].tolist()].mean().item()
+
+                # 2. 计算 p_after
+                idx_after = yt_sim_len - 1
+                p_after_state = yt_sim[0, idx_after, :]
+                p_after = p_after_state[actual_future[0].tolist()].mean().item()
+
+                # 3. 计算真实路径的增益
+                gain = p_after - p_before
+                group_actual_gains.append(gain)
+
+            avg_gain = np.mean(group_actual_gains)
+            print(f"[{group_name}] 样本数: {len(students)} 人 | 真实路径平均增益: {avg_gain:.4f}")
+
+        print("=" * 50 + "\n")
 
     # ==========================================
     # 5. 执行全指标敏感性分析 (细粒度 0.02)
