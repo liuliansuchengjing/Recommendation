@@ -172,8 +172,7 @@ def run_nsga2(strategy, hist_seq, hist_ans, hist_time_bins, topK_candidates, val
             new_population.append(child)
 
         population = new_population
-        fitness = [evaluate_path(p, hist_seq, hist_ans, hist_time_bins, model_kt, graph, hidden_kt, p_before) for p in
-                   population]
+        fitness = [evaluate_path(p, hist_seq, hist_ans, hist_time_bins, model_kt, graph, hidden_kt, p_before, target_ids) for p in population]
         front_indices = non_dominated_sort(fitness)
 
         if gen == 15: history_fronts[15] = [fitness[i] for i in front_indices]
