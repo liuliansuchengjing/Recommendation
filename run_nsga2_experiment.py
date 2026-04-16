@@ -435,54 +435,45 @@ def main():
 
         return max_exp_gain, f_smooth, f_div, m_gain
 
-    def calculate_ground_truth_baseline(model_kt, sample_weak, sample_mid, sample_strong, L_TARGET=6):
-        """
-        极速计算各认知群体的真实无干预学习增益（基准线）
-        """
-        print("\n" + "=" * 50)
-        print("开始计算各组学生【真实原始路径】的实际知识增益...")
+    print("\n" + "=" * 60)
+    print("开始计算各组学生【真实原始路径】的综合三指标 (Gain, Smoothness, Diversity)...")
 
-        groups_dict = {
-            'Low-level (<0.65)': sample_weak,
-            'Mid-level (0.65~0.8)': sample_mid,
-            'High-level (>=0.8)': sample_strong
-        }
+    groups_dict = {
+        'Low-level (<0.65)': sample_weak,
+        'Mid-level (0.65~0.8)': sample_mid,
+        'High-level (>=0.8)': sample_strong
+    }
 
-        for group_name, students in groups_dict.items():
-            group_actual_gains = []
+    for group_name, students in groups_dict.items():
+        g_gains, g_smooths, g_divs = [], [], []
 
-            for stu in students:
-                hist_seq = stu['hist_seq']
-                actual_future = stu['future_seq'][:L_TARGET]
+        for stu in students:
+            # 1. 精准截取真实发生的未来交互序列
+            # 注意：将它转换为你的评估函数所要求的格式（如普通 list 或 1D tensor）
+            actual_path = stu['future_seq'][0][:L_TARGET].tolist()
 
-                # 将历史和真实未来拼接，送入模拟器
-                sim_seq = torch.cat([hist_seq, actual_future], dim=1)
-                sim_ans = torch.cat([stu['hist_ans'], stu['future_ans'][:L_TARGET]], dim=1)
-                sim_time = torch.cat([stu['hist_time_bins'], stu['future_time_bins'][:L_TARGET]], dim=1)
+            # 2. 核心思维转换：把真实的 actual_path 当作系统推荐的 best_path 传进去！
+            # 🌟 这里的 evaluate_adaptive_metrics 是你现成的三合一评估函数
+            e_g, s_m, d_v, m_g = evaluate_adaptive_metrics(
+                actual_path,
+                stu['future_seq'],
+                stu['hist_seq'],
+                model_kt,  # 把需要传给 DKT 模拟器的参数补齐
+                stu  # 以及其他你在该函数里需要的参数
+            )
 
-                with torch.no_grad():
-                    _, _, yt_sim, _, _ = model_kt.ktmodel(stu['hidden_kt'], sim_seq, sim_ans, sim_time)
+            # 收集这三个基准指标
+            g_gains.append(e_g)
+            g_smooths.append(s_m)
+            g_divs.append(d_v)
 
-                yt_sim_len = yt_sim.size(1)
+        print(f"[{group_name}] 样本数: {len(students)} 人")
+        print(f"    -> 真实 Target-Oriented Gain : {np.mean(g_gains):.4f}")
+        print(f"    -> 真实 Difficulty Smoothness: {np.mean(g_smooths):.4f}")
+        print(f"    -> 真实 Resource Diversity   : {np.mean(g_divs):.4f}")
+        print("-" * 50)
 
-                # 1. 计算 p_before
-                idx_before = yt_sim_len - L_TARGET - 1
-                p_before_state = yt_sim[0, idx_before, :]
-                p_before = p_before_state[actual_future[0].tolist()].mean().item()
-
-                # 2. 计算 p_after
-                idx_after = yt_sim_len - 1
-                p_after_state = yt_sim[0, idx_after, :]
-                p_after = p_after_state[actual_future[0].tolist()].mean().item()
-
-                # 3. 计算真实路径的增益
-                gain = p_after - p_before
-                group_actual_gains.append(gain)
-
-            avg_gain = np.mean(group_actual_gains)
-            print(f"[{group_name}] 样本数: {len(students)} 人 | 真实路径平均增益: {avg_gain:.4f}")
-
-        print("=" * 50 + "\n")
+    print("=" * 60 + "\n")
 
     # ==========================================
     # 5. 执行全指标敏感性分析 (细粒度 0.02)
