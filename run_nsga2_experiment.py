@@ -11,6 +11,7 @@ from run import opt
 import pickle
 from dataLoader import Options
 import csv # 确保文件开头导入了 csv
+
 # ==========================================
 # 提取与映射难度字典 (与 Metrics.py 逻辑对齐)
 # ==========================================
@@ -232,6 +233,52 @@ def run_nsga2(strategy, hist_seq, hist_ans, hist_time_bins, topK_candidates, val
 # 3. 主函数缝合执行
 # ==========================================
 def main():
+
+
+    def calculate_ground_truth_all_metrics(model_kt, sample_weak, sample_mid, sample_strong, L_TARGET=6):
+        """
+        极速计算各认知群体的真实无干预学习综合三指标（基准线）
+        """
+        print("\n" + "=" * 60)
+        print("开始计算各组学生【真实原始路径】的综合三指标 (Gain, Smoothness, Diversity)...")
+
+        groups_dict = {
+            'Low-level (<0.65)': sample_weak,
+            'Mid-level (0.65~0.8)': sample_mid,
+            'High-level (>=0.8)': sample_strong
+        }
+
+        for group_name, students in groups_dict.items():
+            g_gains, g_smooths, g_divs = [], [], []
+
+            for stu in students:
+                # 1. 精准截取真实发生的未来交互序列
+                # 注意：将它转换为你的评估函数所要求的格式（如普通 list 或 1D tensor）
+                actual_path = stu['future_seq'][0][:L_TARGET].tolist()
+
+                # 2. 核心思维转换：把真实的 actual_path 当作系统推荐的 best_path 传进去！
+                # 🌟 这里的 evaluate_adaptive_metrics 是你现成的三合一评估函数
+                e_g, s_m, d_v, m_g = evaluate_adaptive_metrics(
+                    actual_path,
+                    stu['future_seq'],
+                    stu['hist_seq'],
+                    model_kt,  # 把需要传给 DKT 模拟器的参数补齐
+                    stu  # 以及其他你在该函数里需要的参数
+                )
+
+                # 收集这三个基准指标
+                g_gains.append(e_g)
+                g_smooths.append(s_m)
+                g_divs.append(d_v)
+
+            print(f"[{group_name}] 样本数: {len(students)} 人")
+            print(f"    -> 真实 Target-Oriented Gain : {np.mean(g_gains):.4f}")
+            print(f"    -> 真实 Difficulty Smoothness: {np.mean(g_smooths):.4f}")
+            print(f"    -> 真实 Resource Diversity   : {np.mean(g_divs):.4f}")
+            print("-" * 50)
+
+        print("=" * 60 + "\n")
+
     # ==========================================
     # 0. 固定全局随机种子 (保证实验完美可复现)
     # ==========================================
@@ -344,9 +391,16 @@ def main():
         return
 
     SAMPLE_N = 50  # 每组采样人数
+    L_TARGET = 6
     sample_weak = random.sample(group_weak, min(SAMPLE_N, len(group_weak)))
     sample_mid = random.sample(group_mid, min(SAMPLE_N, len(group_mid)))
     sample_strong = random.sample(group_strong, min(SAMPLE_N, len(group_strong)))
+
+    # 打印完采样人数后，直接调用基准计算函数
+    calculate_ground_truth_all_metrics(model_kt, sample_weak, sample_mid, sample_strong, L_TARGET)
+
+    # === 如果你想节省时间，直接在这里加个 return 提前结束程序 ===
+    return  # 加上这一行，后面的遗传算法多目标优化就不会跑了！
 
     # 🌟 核心函数 1：选出最优路径 (基于 6 道题的整体适应度)
     def select_best_path(front_fitness, front_paths, w_gain, w_smooth, w_div=0.2):
@@ -435,45 +489,7 @@ def main():
 
         return max_exp_gain, f_smooth, f_div, m_gain
 
-    print("\n" + "=" * 60)
-    print("开始计算各组学生【真实原始路径】的综合三指标 (Gain, Smoothness, Diversity)...")
 
-    groups_dict = {
-        'Low-level (<0.65)': sample_weak,
-        'Mid-level (0.65~0.8)': sample_mid,
-        'High-level (>=0.8)': sample_strong
-    }
-
-    for group_name, students in groups_dict.items():
-        g_gains, g_smooths, g_divs = [], [], []
-
-        for stu in students:
-            # 1. 精准截取真实发生的未来交互序列
-            # 注意：将它转换为你的评估函数所要求的格式（如普通 list 或 1D tensor）
-            actual_path = stu['future_seq'][0][:L_TARGET].tolist()
-
-            # 2. 核心思维转换：把真实的 actual_path 当作系统推荐的 best_path 传进去！
-            # 🌟 这里的 evaluate_adaptive_metrics 是你现成的三合一评估函数
-            e_g, s_m, d_v, m_g = evaluate_adaptive_metrics(
-                actual_path,
-                stu['future_seq'],
-                stu['hist_seq'],
-                model_kt,  # 把需要传给 DKT 模拟器的参数补齐
-                stu  # 以及其他你在该函数里需要的参数
-            )
-
-            # 收集这三个基准指标
-            g_gains.append(e_g)
-            g_smooths.append(s_m)
-            g_divs.append(d_v)
-
-        print(f"[{group_name}] 样本数: {len(students)} 人")
-        print(f"    -> 真实 Target-Oriented Gain : {np.mean(g_gains):.4f}")
-        print(f"    -> 真实 Difficulty Smoothness: {np.mean(g_smooths):.4f}")
-        print(f"    -> 真实 Resource Diversity   : {np.mean(g_divs):.4f}")
-        print("-" * 50)
-
-    print("=" * 60 + "\n")
 
     # ==========================================
     # 5. 执行全指标敏感性分析 (细粒度 0.02)
