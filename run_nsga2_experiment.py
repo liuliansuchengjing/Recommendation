@@ -422,7 +422,7 @@ def main():
 
     # 🌟 工程化开关断点：如果只是想看基准数据，在这里直接停止程序
     if QUICK_BASELINE_ONLY:
-        print("\n[系统提示] QUICK_BASELINE_ONLY = True, 极速基准评估结束。如需运行完整实验请将其改为 False。")
+        print("\n[系统提示] QUICK_BASELINE_ONLY = False, 极速基准评估结束。如需运行完整实验请将其改为 False。")
         return
 
     # 🌟 核心函数 1：选出最优路径
