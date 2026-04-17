@@ -209,57 +209,119 @@ class MultiHopHGNN(nn.Module):
         out = self.act(self.theta(aggregated_x))
         return self.dropout(out)
 
+
 class MSHGAT(nn.Module):
-    super(MSHGAT, self).__init__()
-    self.hidden_size = opt.d_word_vec
-    self.n_node = opt.resource_size
-    self.dropout = nn.Dropout(dropout)
-    self.initial_feature = opt.initialFeatureSize
+    def __init__(self, opt, dropout=0.3):
+        super(MSHGAT, self).__init__()
+        self.hidden_size = opt.d_word_vec
+        self.n_node = opt.resource_size
+        self.dropout = nn.Dropout(dropout)
+        self.initial_feature = opt.initialFeatureSize
 
-    # 空间图卷积模块
-    self.gnn = GraphNN(self.n_node, self.initial_feature, dropout=dropout)
-    self.gnn2 = GraphNN(self.n_node, self.initial_feature, dropout=dropout)
+        # 空间图卷积模块
+        self.gnn = GraphNN(self.n_node, self.initial_feature, dropout=dropout)
+        self.gnn2 = GraphNN(self.n_node, self.initial_feature, dropout=dropout)
 
-    # 引入多跳超图卷积网络
-    self.hgnn_hop1 = MultiHopHGNN(self.initial_feature, self.initial_feature, dropout=dropout)
-    self.hgnn_hop2 = MultiHopHGNN(self.initial_feature, self.initial_feature, dropout=dropout)
+        # 引入多跳超图卷积网络
+        self.hgnn_hop1 = MultiHopHGNN(self.initial_feature, self.initial_feature, dropout=dropout)
+        self.hgnn_hop2 = MultiHopHGNN(self.initial_feature, self.initial_feature, dropout=dropout)
 
-    self.embedding = nn.Embedding(self.n_node, self.initial_feature, padding_idx=0)
-    self.readout = MLPReadout(self.hidden_size, self.n_node, None)
+        self.embedding = nn.Embedding(self.n_node, self.initial_feature, padding_idx=0)
+        self.readout = MLPReadout(self.hidden_size, self.n_node, None)
 
-    # 时序建模模块 (Transformer)
-    self.n_layers = 1
-    self.n_heads = 2
-    self.inner_size = 64
-    self.hidden_dropout_prob = 0.3
-    self.attn_dropout_prob = 0.3
-    self.layer_norm_eps = 1e-12
-    self.hidden_act = 'gelu'
+        # 时序建模模块 (Transformer)
+        self.n_layers = 1
+        self.n_heads = 2
+        self.inner_size = 64
+        self.hidden_dropout_prob = 0.3
+        self.attn_dropout_prob = 0.3
+        self.layer_norm_eps = 1e-12
+        self.hidden_act = 'gelu'
 
-    self.item_embedding = nn.Embedding(self.n_node + 1, self.hidden_size, padding_idx=0)
-    self.position_embedding = nn.Embedding(500, self.hidden_size)
-    self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
+        self.item_embedding = nn.Embedding(self.n_node + 1, self.hidden_size, padding_idx=0)
+        self.position_embedding = nn.Embedding(500, self.hidden_size)
+        self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
 
-    self.trm_encoder = TransformerEncoder(
-        n_layers=self.n_layers,
-        n_heads=self.n_heads,
-        hidden_size=self.hidden_size,
-        inner_size=self.inner_size,
-        hidden_dropout_prob=self.hidden_dropout_prob,
-        attn_dropout_prob=self.attn_dropout_prob,
-        hidden_act=self.hidden_act,
-        layer_norm_eps=self.layer_norm_eps,
-        multiscale=False
-    )
+        self.trm_encoder = TransformerEncoder(
+            n_layers=self.n_layers,
+            n_heads=self.n_heads,
+            hidden_size=self.hidden_size,
+            inner_size=self.inner_size,
+            hidden_dropout_prob=self.hidden_dropout_prob,
+            attn_dropout_prob=self.attn_dropout_prob,
+            hidden_act=self.hidden_act,
+            layer_norm_eps=self.layer_norm_eps,
+            multiscale=False
+        )
 
-    self.num_skills = opt.resource_size
-    self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
+        self.num_skills = opt.resource_size
+        self.ktmodel = DKT(self.hidden_size, self.hidden_size, self.num_skills)
 
-    self.log_var_rec = nn.Parameter(torch.zeros(1))
-    self.log_var_kt = nn.Parameter(torch.zeros(1))
+        self.log_var_rec = nn.Parameter(torch.zeros(1))
+        self.log_var_kt = nn.Parameter(torch.zeros(1))
 
-    self.reset_parameters()
+        self.reset_parameters()
 
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.hidden_size)
+        for weight in self.parameters():
+            if weight.dim() > 1:
+                weight.data.uniform_(-stdv, stdv)
+
+    def get_attention_mask(self, item_seq):
+        batch_size, seq_len = item_seq.size()
+        padding_mask = (item_seq > 0).long()
+        extended_padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)
+
+        causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=item_seq.device))
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+
+        extended_attention_mask = extended_padding_mask * causal_mask
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        return extended_attention_mask
+
+    def pred(self, pred_logits):
+        predictions = self.readout(pred_logits)
+        return predictions
+
+    def forward(self, input, input_timestamp, input_idx, ans, graph, H_norm_weighted):
+        original_input = input
+        input = input[:, :-1]
+
+        # 获取底层拓扑特征
+        X_0 = self.dropout(self.gnn(graph))
+
+        # 执行加权多跳特征传播
+        X_1 = self.hgnn_hop1(X_0, H_norm_weighted)
+        X_2 = self.hgnn_hop2(X_1, H_norm_weighted)
+
+        # 等权重残差融合
+        X_final = X_0 + X_1 + X_2
+
+        # 序列查表与位置编码叠加
+        seq_emb = F.embedding(input.cuda(), X_final)
+
+        position_ids = torch.arange(input.size(1), dtype=torch.long, device=input.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(input)
+        pos_emb = self.position_embedding(position_ids.cuda())
+
+        input_emb = seq_emb + pos_emb
+        input_emb = self.LayerNorm(input_emb)
+        input_emb = self.dropout(input_emb)
+
+        extended_attention_mask = self.get_attention_mask(input)
+        trm_output = self.trm_encoder(
+            input_emb,
+            extended_attention_mask,
+            output_all_encoded_layers=False
+        )
+
+        pred = self.pred(trm_output)
+        mask = get_previous_user_mask(input.cpu(), self.n_node)
+        pre = (pred + mask).view(-1, pred.size(-1)).cuda()
+
+        return pre
 
 def reset_parameters(self):
     stdv = 1.0 / math.sqrt(self.hidden_size)
